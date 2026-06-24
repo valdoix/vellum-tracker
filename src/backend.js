@@ -420,7 +420,7 @@ function upsertTrack(map, name, status, turn, day) {
   const last = t.history[t.history.length - 1];
   if (!last || last.status !== st) {
     t.history.push({ turn, day, status: st });
-    if (t.history.length > 14) t.history.shift();
+    // No cap — full status history retained (file-backed storage).
   }
   t.status = st || t.status;
   t.title = title;
@@ -431,7 +431,7 @@ function pushLog(arr, entry, cap) {
   const last = arr[arr.length - 1];
   if (last && last.text === entry.text) return;
   arr.push(entry);
-  if (arr.length > cap) arr.shift();
+  if (cap && arr.length > cap) arr.shift(); // cap falsy = unlimited
 }
 
 // Record a deleted-entry signature so re-imports / future scans don't resurrect
@@ -471,7 +471,7 @@ function foldTurn(ch, turn, day, led, bts) {
   }
   // Parallel events <- ledger [under]
   if (led && led.offscreen) {
-    chronicleLines(led.offscreen).forEach((text) => pushLog(ch.events, { turn, day, text }, 60));
+    chronicleLines(led.offscreen).forEach((text) => pushLog(ch.events, { turn, day, text }, 0));
   }
   // Cast presence <- ledger [present]. Free auto-tracking, no LLM needed.
   if (ch.cast) {
@@ -494,10 +494,10 @@ function foldTurn(ch, turn, day, led, bts) {
         const th = parseThreadLine(line);
         upsertTrack(ch.threads, th.name, th.detail, turn, day);
       } else if (/^rel→/i.test(line)) {
-        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel→\s*/i, '').trim(), kind: 'rel' }, 50);
+        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel→\s*/i, '').trim(), kind: 'rel' }, 0);
       } else if (/^world\b/i.test(line)) {
         const t = line.replace(/^world[:\s]*/i, '').trim();
-        if (t) pushLog(ch.events, { turn, day, text: t }, 60);
+        if (t) pushLog(ch.events, { turn, day, text: t }, 0);
       } else {
         // Off-screen / present cast mentioned in BTS actor lines: ":: Name ::" or ":: OFF :: Name"
         const off = line.match(/^::\s*OFF\s*::\s*([^|>]+)/i);
@@ -631,23 +631,32 @@ function touchCast(ch, name, turn, day, status) {
 
 function sigOf(led, bts) { return (led ? led.raw : '') + '|' + (bts || ''); }
 
-function pruneChronicle(ch) {
-  for (const grp of ['arcs', 'threads']) {
-    const keys = Object.keys(ch[grp]);
-    if (keys.length > 60) {
-      keys.sort((a, b) => (ch[grp][a].lastTurn || 0) - (ch[grp][b].lastTurn || 0));
-      keys.slice(0, keys.length - 60).forEach((k) => delete ch[grp][k]);
-    }
-  }
-}
+// No structural prune: the chronicle now lives on the per-extension virtual
+// disk (spindle.storage), which has no 90KB chat-var ceiling, so arcs/threads/
+// events/etc. are unbounded. Kept as a no-op hook for clarity.
+function pruneChronicle(ch) { /* unlimited — file-backed storage */ }
+
+// Per-extension file path for a chat's chronicle (unlimited, free-tier disk).
+function chroniclePath(chatId) { return 'chronicles/' + String(chatId).replace(/[^a-zA-Z0-9_-]/g, '_') + '.json'; }
 
 async function loadChronicle(chatId) {
   if (chronicleByChat.has(chatId)) return chronicleByChat.get(chatId);
   let ch = freshChronicle();
+  let loaded = false;
+  // 1) Primary store: per-extension virtual disk (no size limit).
   try {
-    const stored = spindle.variables.chat.get ? await spindle.variables.chat.get(chatId, 'vellum_chronicle') : null;
-    if (stored) { const p = JSON.parse(stored); if (p && p.arcs) ch = p; }
-  } catch (e) { /* fall back to fresh */ }
+    if (spindle.storage && spindle.storage.exists && await spindle.storage.exists(chroniclePath(chatId))) {
+      const raw = await spindle.storage.read(chroniclePath(chatId));
+      if (raw) { const p = JSON.parse(raw); if (p && p.arcs) { ch = p; loaded = true; } }
+    }
+  } catch (e) { spindle.log.warn(`[vellum_tracker] storage load: ${e?.message || e}`); }
+  // 2) Migration fallback: older chronicles persisted in the 90KB chat-var.
+  if (!loaded) {
+    try {
+      const stored = spindle.variables.chat.get ? await spindle.variables.chat.get(chatId, 'vellum_chronicle') : null;
+      if (stored) { const p = JSON.parse(stored); if (p && p.arcs) { ch = p; ch._migrateToStorage = true; } }
+    } catch (e) { /* fall back to fresh */ }
+  }
   // migrate older chronicles missing the memory fields
   if (!Array.isArray(ch.memories)) ch.memories = [];
   if (typeof ch.covered !== 'number') ch.covered = 0;
@@ -676,41 +685,49 @@ async function loadChronicle(chatId) {
 
 async function saveChronicle(chatId, ch) {
   ch.updatedAt = Date.now();
-  pruneChronicle(ch);
   chronicleByChat.set(chatId, ch);
-  // NEVER store truncated JSON — a sliced blob is invalid and makes the next
-  // load throw and reset the whole chronicle (this is what made summaries
-  // vanish). Instead, shrink the heaviest arrays until the JSON fits whole.
-  const LIMIT = 90000;
+  // Persist to the per-extension virtual disk (spindle.storage) — file-backed,
+  // free-tier, NO 90KB chat-var ceiling, so the chronicle is effectively
+  // unlimited (arcs, threads, events, memories, etc. are never trimmed).
+  let persisted = false;
   try {
-    let json = JSON.stringify(ch);
-    if (json.length > LIMIT) {
-      const slim = JSON.parse(json); // structured-clone copy to trim safely
-      // 1) drop bulky raw text first
-      delete slim.vellum_ledger_raw;
-      for (const k of Object.keys(slim.arcs || {})) { delete slim.arcs[k].rawHistory; }
-      // 2) progressively trim arrays until it fits
-      const trims = [
-        () => { if (slim.events && slim.events.length > 40) slim.events = slim.events.slice(-40); },
-        () => { if (slim.shifts && slim.shifts.length > 30) slim.shifts = slim.shifts.slice(-30); },
-        () => { for (const k of Object.keys(slim.arcs || {})) if (slim.arcs[k].history && slim.arcs[k].history.length > 6) slim.arcs[k].history = slim.arcs[k].history.slice(-6); },
-        () => { for (const k of Object.keys(slim.threads || {})) if (slim.threads[k].history && slim.threads[k].history.length > 6) slim.threads[k].history = slim.threads[k].history.slice(-6); },
-        () => { if (slim.memories && slim.memories.length > 40) slim.memories = slim.memories.slice(-40); },
-        () => { if (slim.events) slim.events = slim.events.slice(-20); if (slim.shifts) slim.shifts = slim.shifts.slice(-20); },
-        () => { if (slim.memories && slim.memories.length > 20) slim.memories = slim.memories.slice(-20); },
-      ];
-      for (const t of trims) { json = JSON.stringify(slim); if (json.length <= LIMIT) break; t(); }
-      json = JSON.stringify(slim);
-      if (json.length <= LIMIT) {
-        // keep the in-memory copy authoritative; only the persisted blob is slimmed
-      } else {
-        // last resort: keep memories + cast, drop logs, but still valid JSON
-        slim.events = []; slim.shifts = [];
-        json = JSON.stringify(slim);
+    const json = JSON.stringify(ch);
+    if (spindle.storage && spindle.storage.write) {
+      await spindle.storage.write(chroniclePath(chatId), json);
+      persisted = true;
+      // One-time migration cleanup: drop the legacy oversized chat-var blob.
+      if (ch._migrateToStorage) {
+        delete ch._migrateToStorage;
+        try { await spindle.variables.chat.set(chatId, 'vellum_chronicle', ''); } catch (e2) {}
       }
     }
-    await spindle.variables.chat.set(chatId, 'vellum_chronicle', json);
-  } catch (e) { spindle.log.warn(`[vellum_tracker] saveChronicle persist: ${e?.message || e}`); }
+  } catch (e) { spindle.log.warn(`[vellum_tracker] storage persist: ${e?.message || e}`); }
+  // Fallback for hosts without storage: keep the old size-safe chat-var path so
+  // we never store invalid (truncated) JSON that would reset the chronicle.
+  if (!persisted) {
+    const LIMIT = 90000;
+    try {
+      let json = JSON.stringify(ch);
+      if (json.length > LIMIT) {
+        const slim = JSON.parse(json);
+        delete slim.vellum_ledger_raw;
+        for (const k of Object.keys(slim.arcs || {})) { delete slim.arcs[k].rawHistory; }
+        const trims = [
+          () => { if (slim.events && slim.events.length > 200) slim.events = slim.events.slice(-200); },
+          () => { if (slim.shifts && slim.shifts.length > 150) slim.shifts = slim.shifts.slice(-150); },
+          () => { for (const k of Object.keys(slim.arcs || {})) if (slim.arcs[k].history && slim.arcs[k].history.length > 12) slim.arcs[k].history = slim.arcs[k].history.slice(-12); },
+          () => { for (const k of Object.keys(slim.threads || {})) if (slim.threads[k].history && slim.threads[k].history.length > 12) slim.threads[k].history = slim.threads[k].history.slice(-12); },
+          () => { if (slim.memories && slim.memories.length > 60) slim.memories = slim.memories.slice(-60); },
+          () => { if (slim.events) slim.events = slim.events.slice(-40); if (slim.shifts) slim.shifts = slim.shifts.slice(-40); },
+          () => { if (slim.memories && slim.memories.length > 30) slim.memories = slim.memories.slice(-30); },
+        ];
+        for (const t of trims) { json = JSON.stringify(slim); if (json.length <= LIMIT) break; t(); }
+        json = JSON.stringify(slim);
+        if (json.length > LIMIT) { slim.events = []; slim.shifts = []; json = JSON.stringify(slim); }
+      }
+      await spindle.variables.chat.set(chatId, 'vellum_chronicle', json);
+    } catch (e) { spindle.log.warn(`[vellum_tracker] saveChronicle persist: ${e?.message || e}`); }
+  }
   // Compact prose digest the preset injects for LLM recall.
   try { await spindle.variables.chat.set(chatId, 'vellum_chronicle_digest', buildDigest(ch)); } catch (e) { /* memory only */ }
 }
@@ -1351,7 +1368,7 @@ const SUMMARY = {
   windowTurns: 8,     // summarize this many uncovered assistant-turns at once
   triggerLead: 4,     // only summarize turns this far behind the newest (keep recent raw)
   maxChars: 1600,     // cap on a single memory's prose (compact but complete)
-  maxMemories: 80,    // ring-buffer cap
+  maxMemories: 0,     // ring-buffer cap (0 = unlimited; file-backed storage)
   minToSummarize: 6,  // need at least this many uncovered turns to bother
 };
 
@@ -1462,7 +1479,7 @@ async function summarizeOneWindow(chatId, opts, userId) {
     text: parsed.summary,
     keywords: parsed.keywords,
   });
-  if (ch.memories.length > SUMMARY.maxMemories) ch.memories.shift();
+  if (SUMMARY.maxMemories && ch.memories.length > SUMMARY.maxMemories) ch.memories.shift();
   ch.covered = toTurn;
   await saveChronicle(chatId, ch);
   broadcastChronicle(chatId, ch);
@@ -1853,7 +1870,7 @@ function applyMemList(ch, list, nc) {
     if (isTombstoned(ch, 'mem', sig)) continue; // user deleted this — never re-add
     if (arr.some((x) => mjSig(key, x.memory) === sig)) continue; // dedupe
     arr.push({ id: 'mj' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), about: e.about, memory: e.memory, kind: e.kind, weight: e.weight, sentiment: e.sentiment, day: e.day, turn: turnNow });
-    if (arr.length > 40) arr.shift();
+    // No cap — per-character memory journal is unlimited (file-backed storage).
     added++;
   }
   return added;
@@ -1968,8 +1985,7 @@ function applyKnowResult(ch, res, nc) {
     ch.secrets.push(Object.assign({ turn: turnNow, lastTurn: turnNow, revealed: false }, s));
     addedS++;
   }
-  if (ch.knowledge.length > 60) ch.knowledge = ch.knowledge.slice(-60);
-  if (ch.secrets.length > 40) ch.secrets = ch.secrets.slice(-40);
+  // No cap — knowledge & secrets are unlimited (file-backed storage).
   return { addedK, addedS };
 }
 
@@ -2275,8 +2291,7 @@ function mergeEnrich(base, extra) {
   for (const s of extra.shifts) if (!seenS.has(s.day + '|' + s.text)) base.shifts.push(s);
   base.events.sort((a, b) => (a.turn || 0) - (b.turn || 0));
   base.shifts.sort((a, b) => (a.turn || 0) - (b.turn || 0));
-  if (base.events.length > 60) base.events = base.events.slice(-60);
-  if (base.shifts.length > 50) base.shifts = base.shifts.slice(-50);
+  // No cap — events & shifts are unlimited (file-backed storage).
   base.turns = Math.max(base.turns, extra.turns);
   // Preserve auto-summary memories and the coverage marker (a rescan rebuilds the
   // structured tracker from raw turns, but must never discard distilled memories).
