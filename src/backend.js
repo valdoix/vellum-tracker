@@ -321,6 +321,23 @@ function applyNamesToText(s, nc) {
   return out;
 }
 
+// Detect an unnamed / incidental "character": a generic role or descriptor
+// ("a servant", "the guard", "a maid with linens", "the crowd", "someone")
+// rather than a proper name. Such figures should never anchor a knowledge fact,
+// secret, or cast card. Returns true when the value is NOT a usable name.
+function isIncidentalName(raw) {
+  const n = String(raw == null ? '' : raw).trim();
+  if (!n) return true;
+  // Strip a leading article/possessive so "the crowd"/"a servant" are caught.
+  const stripped = n.toLowerCase().replace(/^(the|a|an|some|one|that|this|his|her|their|my|your)\s+/i, '').trim();
+  const GENERIC = /^(servants?|guards?|maids?|soldiers?|knights?|squires?|handmaidens?|attendants?|stewards?|cooks?|grooms?|smiths?|septons?|septas?|maesters?|whores?|prostitutes?|crowd|mob|people|peasants?|smallfolk|commoners?|villagers?|townsfolk|onlookers?|bystanders?|courtiers?|nobles?|lords?|ladies|men|women|boys?|girls?|children|someone|somebody|anyone|everyone|nobody|no one|stranger|strangers?|figures?|others?)\b/i;
+  if (GENERIC.test(stripped)) return true;
+  // A multiword descriptor with no capitalized proper-name token is incidental
+  // ("a woman with linens"); a single lowercase word is too ("guard").
+  if (!/[A-Z]/.test(n)) return true;
+  return false;
+}
+
 // Canonicalize a name the LLM produced: turn "{{user}}"/"user"/"you" into the
 // real persona name, "{{char}}" into the real character name. Leaves other
 // names untouched. Used on every who/about/keeper/from field the scanners emit.
@@ -1283,6 +1300,9 @@ function applyCastList(ch, list, nc) {
     c.name = canonName(c.name, nc);
     if (Array.isArray(c.aka)) c.aka = c.aka.map((a) => canonName(a, nc)).filter(Boolean);
     if (!c.name || castKey(c.name).length < 2) continue;
+    // Skip unnamed / incidental figures ("a servant", "the guard") unless they
+    // resolve to the player or main character.
+    if (isIncidentalName(c.name) && !(nc && (c.name === nc.user || c.name === nc.char))) continue;
     let m = findCastMember(ch, c.name);
     if (!m) {
       const key = castKey(c.name);
@@ -1468,7 +1488,7 @@ function applyMemList(ch, list, nc) {
 }
 
 // ---- KNOWLEDGE / SECRETS: who knows / believes / suspects what (dramatic irony) ----
-const KNOW_SYS = 'You are a continuity analyst mapping the INFORMATION STATE of a roleplay \u2014 the engine of dramatic irony. From the whole transcript, extract (a) notable knowledge each character holds and (b) secrets being kept. Output STRICT JSON only: {"knowledge":[{"who":"exact character name","fact":"the thing, one clause","reliability":"knows|believes|suspects|wrong|unaware","truth":"true|false|unknown","source":"how they got it, brief"}],"secrets":[{"secret":"the concealed thing, one clause","keeper":"exact name of who hides it","from":"exact name(s) of who it is hidden from","method":"lie|omission|misdirection|disguise","exposure":"how it might surface, brief","danger":"minor|major|explosive"}]}. Rules: ALWAYS use the real character names given to you \u2014 never write "{{user}}", "User", "{{char}}", or "you"; focus on facts that create tension or irony (someone believes something false, someone hides something, asymmetric knowledge); reliability=wrong means they believe something untrue; truth is the actual state regardless of belief; never invent \u2014 only what the text supports; up to ~12 knowledge + ~8 secrets, the most dramatically charged. No prose outside the JSON.';
+const KNOW_SYS = 'You are a continuity analyst mapping the INFORMATION STATE of a roleplay \u2014 the engine of dramatic irony. From the whole transcript, extract (a) notable knowledge each character holds and (b) secrets being kept. Output STRICT JSON only: {"knowledge":[{"who":"exact character name","fact":"the thing, one clause","reliability":"knows|believes|suspects|wrong|unaware","truth":"true|false|unknown","source":"how they got it, brief"}],"secrets":[{"secret":"the concealed thing, one clause","keeper":"exact name of who hides it","from":"exact name(s) of who it is hidden from","method":"lie|omission|misdirection|disguise","exposure":"how it might surface, brief","danger":"minor|major|explosive"}]}. Rules: ALWAYS use the real character names given to you \u2014 never write "{{user}}", "User", "{{char}}", or "you". ONLY attribute knowledge or secrets to NAMED, significant characters (named persons or clearly recurring figures). NEVER use an unnamed/incidental figure as a who/keeper/from \u2014 skip descriptions like "a servant", "a guard", "a maid with linens", "the crowd", "someone", "a stranger"; if the only holder of a fact is unnamed and incidental, omit that entry entirely. Focus on facts that create tension or irony (someone believes something false, someone hides something, asymmetric knowledge); reliability=wrong means they believe something untrue; truth is the actual state regardless of belief; never invent \u2014 only what the text supports; up to ~12 knowledge + ~8 secrets, the most dramatically charged. No prose outside the JSON.';
 
 function parseKnowJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1554,6 +1574,7 @@ function applyKnowResult(ch, res, nc) {
     k.who = canonName(k.who, nc);
     k.fact = applyNamesToText(k.fact, nc);
     if (!k.who || !k.fact) continue;
+    if (isIncidentalName(k.who) && !(nc && (k.who === nc.user || k.who === nc.char))) continue; // skip unnamed/incidental holders
     const sig = knowSig(k);
     if (isTombstoned(ch, 'know', sig)) continue; // user deleted — don't resurrect
     const ex = ch.knowledge.find((x) => knowSig(x) === sig);
@@ -1567,6 +1588,7 @@ function applyKnowResult(ch, res, nc) {
     s.secret = applyNamesToText(s.secret, nc);
     if (s.exposure) s.exposure = applyNamesToText(s.exposure, nc);
     if (!s.secret) continue;
+    if (isIncidentalName(s.keeper) && !(nc && (s.keeper === nc.user || s.keeper === nc.char))) continue; // skip unnamed/incidental keepers
     const sig = secSig(s);
     if (isTombstoned(ch, 'sec', sig)) continue; // user deleted — don't resurrect
     const ex = ch.secrets.find((x) => secSig(x) === sig);
