@@ -82,7 +82,7 @@ function _setupImpl(ctx) {
     if (scanK) {
       scanK.disabled = true; scanK.textContent = '⏳ Scanning…';
       ctx.sendToBackend({ type: 'scan_knowledge', chatId: currentChatId });
-      clearTimeout(scanK._t); scanK._t = setTimeout(() => { scanK.disabled = false; scanK.textContent = '🔑 Scan knowledge'; }, 60000);
+      clearTimeout(scanK._t); scanK._t = setTimeout(() => { scanK.disabled = false; scanK.textContent = '🔑 Scan knowledge'; }, 300000);
       return;
     }
     const delK = e.target.closest('[data-know-del]');
@@ -115,7 +115,7 @@ function _setupImpl(ctx) {
     if (scanM) {
       scanM.disabled = true; scanM.textContent = '⏳ Scanning…';
       ctx.sendToBackend({ type: 'scan_memjournal', chatId: currentChatId });
-      clearTimeout(scanM._t); scanM._t = setTimeout(() => { scanM.disabled = false; scanM.textContent = '📖 Scan memories'; }, 60000);
+      clearTimeout(scanM._t); scanM._t = setTimeout(() => { scanM.disabled = false; scanM.textContent = '📖 Scan memories'; }, 300000);
       return;
     }
     const delM = e.target.closest('[data-mj-del]');
@@ -290,9 +290,15 @@ function _setupImpl(ctx) {
       if (castBody && !castData) renderCast(castBody, null);
     } else if (p?.type === 'vellum_cast_done') {
       handleCastDone(castRoot, p);
+    } else if (p?.type === 'vellum_mem_progress') {
+      const b = castBody && castBody.querySelector('[data-scan-mem]');
+      if (b && p.chunks > 1) b.textContent = '⏳ Scanning ' + p.chunk + '/' + p.chunks + '…';
     } else if (p?.type === 'vellum_mem_done') {
       const b = castBody && castBody.querySelector('[data-scan-mem]');
       if (b) { clearTimeout(b._t); b.disabled = false; b.textContent = p.ok ? ('✓ +' + (p.added || 0) + ' memories') : ('⚠ ' + (p.reason || 'error')); setTimeout(() => { b.textContent = '📖 Scan memories'; }, 4000); }
+    } else if (p?.type === 'vellum_know_progress') {
+      const b = chronicleBody && chronicleBody.querySelector('[data-scan-knowledge]');
+      if (b && p.chunks > 1) b.textContent = '⏳ Scanning ' + p.chunk + '/' + p.chunks + '…';
     } else if (p?.type === 'vellum_know_done') {
       const b = chronicleBody && chronicleBody.querySelector('[data-scan-knowledge]');
       if (b) { clearTimeout(b._t); b.disabled = false; b.textContent = p.ok ? ('✓ +' + (p.addedK || 0) + 'k/' + (p.addedS || 0) + 's') : ('⚠ ' + (p.reason || 'error')); setTimeout(() => { b.textContent = '🔑 Scan knowledge'; }, 4000); }
@@ -812,7 +818,7 @@ function render(body, dot, data) {
 // ---- Chronicle render: paginated sections + uniform date timeline ----
 let _chronHost = null, _chronCh = null;
 const _chronPage = {};
-const PER_TRACK = 6, PER_LOG = 12, PER_DATE = 6;
+const PER_TRACK = 12, PER_LOG = 30, PER_DATE = 12;
 
 function dayLabel(d) { return d ? 'Day ' + d : '—'; }
 
@@ -1086,7 +1092,15 @@ function logJaccard(a, b) {
 }
 function logSubject(text) {
   const c = String(text).indexOf(':');
-  if (c > 0 && c < 40) return String(text).slice(0, c).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (c > 0 && c < 40) {
+    const head = String(text).slice(0, c).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    // Relationship shifts name two parties ("Alice-Bob" / "Bob & Alice"). After
+    // normalization the separator is a space, so treat the subject as an
+    // UNORDERED set of tokens — sort them so "A B" and "B A" produce the same
+    // key and group together as one evolving bond.
+    const toks = head.split(/\s+/).filter(Boolean);
+    return toks.slice().sort().join(' ');
+  }
   return null;
 }
 function logGroup(items) {

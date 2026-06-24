@@ -347,7 +347,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], covered: 0, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], covered: 0, tombstones: { mem: [], know: [], sec: [] }, _sig: '' };
 }
 
 function normKey(s) {
@@ -380,6 +380,18 @@ function pushLog(arr, entry, cap) {
   if (last && last.text === entry.text) return;
   arr.push(entry);
   if (arr.length > cap) arr.shift();
+}
+
+// Record a deleted-entry signature so re-imports / future scans don't resurrect
+// it. Bounded ring buffer per kind.
+function addTombstone(ch, kind, sig) {
+  if (!sig) return;
+  if (!ch.tombstones) ch.tombstones = { mem: [], know: [], sec: [] };
+  const arr = ch.tombstones[kind] || (ch.tombstones[kind] = []);
+  if (!arr.includes(sig)) { arr.push(sig); if (arr.length > 400) arr.shift(); }
+}
+function isTombstoned(ch, kind, sig) {
+  return !!(ch.tombstones && Array.isArray(ch.tombstones[kind]) && ch.tombstones[kind].includes(sig));
 }
 
 function parseArcLine(line) {
@@ -560,6 +572,12 @@ async function loadChronicle(chatId) {
   if (!ch.memJournal || typeof ch.memJournal !== 'object') ch.memJournal = {};
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
+  // Tombstones: signatures of entries the user deleted, so a re-import or a
+  // future scan never resurrects them. Capped to stay bounded.
+  if (!ch.tombstones || typeof ch.tombstones !== 'object') ch.tombstones = { mem: [], know: [], sec: [] };
+  if (!Array.isArray(ch.tombstones.mem)) ch.tombstones.mem = [];
+  if (!Array.isArray(ch.tombstones.know)) ch.tombstones.know = [];
+  if (!Array.isArray(ch.tombstones.sec)) ch.tombstones.sec = [];
   // ensure every cast member has an aka (also-known-as) list
   for (const k of Object.keys(ch.cast)) { if (!Array.isArray(ch.cast[k].aka)) ch.cast[k].aka = []; }
   chronicleByChat.set(chatId, ch);
@@ -943,7 +961,7 @@ function nameSignal(c, qtokens, qphrase) {
 const SUMMARY = {
   windowTurns: 8,     // summarize this many uncovered assistant-turns at once
   triggerLead: 4,     // only summarize turns this far behind the newest (keep recent raw)
-  maxChars: 1100,     // cap on a single memory's prose
+  maxChars: 1600,     // cap on a single memory's prose (compact but complete)
   maxMemories: 80,    // ring-buffer cap
   minToSummarize: 6,  // need at least this many uncovered turns to bother
 };
@@ -975,7 +993,7 @@ function cleanForSummary(s) {
   return stripVtk(stripBts(stripLedger(stripReverie(String(s || ''))))).replace(/\n{3,}/g, '\n\n').trim();
 }
 
-const SUMMARY_SYS = 'You are a story archivist. Compress the given roleplay excerpt into a dense factual memory for long-term recall. Output STRICT JSON only, no prose outside it, matching: {"summary":"2-4 sentences, past tense, naming characters/places/decisions/outcomes","keywords":["6-12 lowercase nouns/names a future scene might key on"],"day":<integer story-day if stated else null>}. Capture what happened and what changed, not vibes. No commentary.';
+const SUMMARY_SYS = 'You are a story archivist compressing a roleplay excerpt into one dense, factual chapter-memory for long-term recall. Output STRICT JSON only, no prose outside it: {"summary":"3-6 tight past-tense sentences covering EVERYTHING that matters from the excerpt — who was involved, where, key actions, decisions, revelations, emotional turns, and what changed by the end; pack facts, drop atmosphere and filler","keywords":["8-14 lowercase names/places/objects/topics a future scene might key on"],"day":<integer story-day if stated else null>}. Rules: ALWAYS use the real character names provided — never write "{{user}}", "User", "{{char}}", or "you"; be comprehensive but compact (no repetition, no vibes, no commentary); every distinct beat in the excerpt should be recoverable from the summary.';
 
 function parseSummaryJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1016,16 +1034,19 @@ async function summarizeOneWindow(chatId, opts, userId) {
   const windowTurns = turns.slice(covered, covered + Math.min(SUMMARY.windowTurns, uncovered));
   if (!windowTurns.length) return 'none';
 
+  const nc = await resolveNameContext(chatId, msgs);
   const excerpt = windowTurns.map((t) => {
-    const u = cleanForSummary(t.user);
-    const a = cleanForSummary(t.ai);
-    return (u ? 'USER: ' + u + '\n' : '') + 'STORY: ' + a;
-  }).join('\n\n').slice(0, 12000);
+    const uName = (t.userName && t.userName.trim()) || (nc && nc.user) || 'USER';
+    const aName = (t.aiName && t.aiName.trim()) || (nc && nc.char) || 'STORY';
+    const u = applyNamesToText(cleanForSummary(t.user), nc);
+    const a = applyNamesToText(cleanForSummary(t.ai), nc);
+    return (u ? uName + ': ' + u + '\n' : '') + aName + ': ' + a;
+  }).join('\n\n').slice(0, 16000);
 
   let content = '';
   try {
     content = await internalGenerate([
-      { role: 'system', content: SUMMARY_SYS },
+      { role: 'system', content: SUMMARY_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '') },
       { role: 'user', content: 'Excerpt to archive:\n\n' + excerpt },
     ], { temperature: 0.3, max_tokens: 2000 }, userId);
   } catch (e) {
@@ -1359,6 +1380,10 @@ function parseMemJson(text) {
 }
 
 function memSig(e) { return (e.who + '|' + e.memory).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 120); }
+// Bucket-scoped signature (journal entries are keyed by character, and stored
+// entries don't carry `who`), used for dedupe + tombstones so re-scans/imports
+// never duplicate or resurrect a memory.
+function mjSig(key, memory) { return (String(key) + '|' + String(memory || '')).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 140); }
 
 async function scanMemJournal(chatId, userId) {
   const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_mem_done', ok }, extra || {}), userId);
@@ -1373,15 +1398,24 @@ async function scanMemJournal(chatId, userId) {
     let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { if (e && e.permDenied) { done(false, { reason: 'no_chat_mutation_permission' }); return; } throw e; }
     if (!msgs || !msgs.length) { done(false, { reason: 'no_history' }); return; }
     const nc = await resolveNameContext(chatId, msgs);
-    let list;
-    try { list = await memExtract(assistantTurns(msgs), nc, userId); }
-    catch (e) { done(false, { reason: (e && e.permDenied) ? 'no_generation_permission' : 'error' }); return; }
-    if (!list) { done(false, { reason: 'parse' }); return; }
-    added = applyMemList(ch, list, nc);
+    const turns = assistantTurns(msgs);
+    // Scan the WHOLE transcript in windows so early days are covered too, not
+    // just a recency-biased sample. applyMemList dedupes across windows.
+    const wins = scanWindows(turns, 14);
+    let got = false, permErr = false;
+    for (let wi = 0; wi < wins.length; wi++) {
+      let list;
+      try { list = await memExtract(wins[wi], nc, userId); }
+      catch (e) { if (e && e.permDenied) { permErr = true; break; } spindle.log.warn('[vellum_tracker] mem window ' + wi + ': ' + (e && e.message)); continue; }
+      if (list) { got = true; added += applyMemList(ch, list, nc); }
+      if (wins.length > 1) spindle.sendToFrontend({ type: 'vellum_mem_progress', chunk: wi + 1, chunks: wins.length }, userId);
+    }
+    if (permErr) { done(false, { reason: 'no_generation_permission' }); return; }
+    if (!got) { done(false, { reason: 'parse' }); return; }
     await saveChronicle(chatId, ch);
     broadcastChronicle(chatId, ch);
     done(true, { added, characters: Object.keys(ch.memJournal).length });
-    spindle.log.info('[vellum_tracker] memory journal: +' + added + ' entries');
+    spindle.log.info('[vellum_tracker] memory journal: +' + added + ' entries (' + wins.length + ' windows)');
   } catch (err) {
     spindle.log.warn('[vellum_tracker] scanMemJournal: ' + (err && err.message));
     done(false, { reason: 'error' });
@@ -1394,6 +1428,17 @@ async function memExtract(turns, nc, userId) {
   const sys = MEM_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
   const raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Transcript excerpt:\n\n' + excerpt }], { temperature: 0.2, max_tokens: 2200 }, userId);
   return parseMemJson(raw);
+}
+
+// Split a turns array into sequential windows so a scan covers the WHOLE story
+// (early days included), not just a recency-biased sample. Returns array of
+// turn-slices; a short story yields a single window (behaves like before).
+function scanWindows(turns, size) {
+  const w = size || 14;
+  if (turns.length <= w) return [turns];
+  const out = [];
+  for (let i = 0; i < turns.length; i += w) out.push(turns.slice(i, i + w));
+  return out;
 }
 
 // Fold a parsed memory list into the chronicle. Returns count added.
@@ -1412,8 +1457,9 @@ function applyMemList(ch, list, nc) {
     if (!key) continue;
     if (!ch.memJournal[key]) ch.memJournal[key] = { name: m ? m.name : e.who, entries: [] };
     const arr = ch.memJournal[key].entries;
-    const sig = memSig(e);
-    if (arr.some((x) => memSig(x) === sig)) continue; // dedupe
+    const sig = mjSig(key, e.memory);
+    if (isTombstoned(ch, 'mem', sig)) continue; // user deleted this — never re-add
+    if (arr.some((x) => mjSig(key, x.memory) === sig)) continue; // dedupe
     arr.push({ id: 'mj' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), about: e.about, memory: e.memory, kind: e.kind, weight: e.weight, sentiment: e.sentiment, day: e.day, turn: turnNow });
     if (arr.length > 40) arr.shift();
     added++;
@@ -1466,16 +1512,24 @@ async function scanKnowledge(chatId, userId) {
     let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { if (e && e.permDenied) { done(false, { reason: 'no_chat_mutation_permission' }); return; } throw e; }
     if (!msgs || !msgs.length) { done(false, { reason: 'no_history' }); return; }
     const nc = await resolveNameContext(chatId, msgs);
-    let res;
-    try { res = await knowExtract(assistantTurns(msgs), nc, userId); }
-    catch (e) { done(false, { reason: (e && e.permDenied) ? 'no_generation_permission' : 'error' }); return; }
-    if (!res) { done(false, { reason: 'parse' }); return; }
-    const r = applyKnowResult(ch, res, nc);
-    addedK = r.addedK; addedS = r.addedS;
+    const turns = assistantTurns(msgs);
+    // Window the whole transcript so early-day knowledge/secrets are captured
+    // too. applyKnowResult dedupes + honors tombstones across windows.
+    const wins = scanWindows(turns, 14);
+    let got = false, permErr = false;
+    for (let wi = 0; wi < wins.length; wi++) {
+      let res;
+      try { res = await knowExtract(wins[wi], nc, userId); }
+      catch (e) { if (e && e.permDenied) { permErr = true; break; } spindle.log.warn('[vellum_tracker] know window ' + wi + ': ' + (e && e.message)); continue; }
+      if (res) { got = true; const r = applyKnowResult(ch, res, nc); addedK += r.addedK; addedS += r.addedS; }
+      if (wins.length > 1) spindle.sendToFrontend({ type: 'vellum_know_progress', chunk: wi + 1, chunks: wins.length }, userId);
+    }
+    if (permErr) { done(false, { reason: 'no_generation_permission' }); return; }
+    if (!got) { done(false, { reason: 'parse' }); return; }
     await saveChronicle(chatId, ch);
     broadcastChronicle(chatId, ch);
     done(true, { addedK, addedS, totalK: ch.knowledge.length, totalS: ch.secrets.length });
-    spindle.log.info('[vellum_tracker] knowledge scan: +' + addedK + ' facts, +' + addedS + ' secrets');
+    spindle.log.info('[vellum_tracker] knowledge scan: +' + addedK + ' facts, +' + addedS + ' secrets (' + wins.length + ' windows)');
   } catch (err) {
     spindle.log.warn('[vellum_tracker] scanKnowledge: ' + (err && err.message));
     done(false, { reason: 'error' });
@@ -1501,8 +1555,9 @@ function applyKnowResult(ch, res, nc) {
     k.fact = applyNamesToText(k.fact, nc);
     if (!k.who || !k.fact) continue;
     const sig = knowSig(k);
+    if (isTombstoned(ch, 'know', sig)) continue; // user deleted — don't resurrect
     const ex = ch.knowledge.find((x) => knowSig(x) === sig);
-    if (ex) { ex.reliability = k.reliability; ex.truth = k.truth; if (k.source) ex.source = k.source; ex.lastTurn = turnNow; continue; }
+    if (ex) { if (ex.userEdited) continue; ex.reliability = k.reliability; ex.truth = k.truth; if (k.source) ex.source = k.source; ex.lastTurn = turnNow; continue; }
     ch.knowledge.push(Object.assign({ turn: turnNow, lastTurn: turnNow }, k));
     addedK++;
   }
@@ -1513,8 +1568,9 @@ function applyKnowResult(ch, res, nc) {
     if (s.exposure) s.exposure = applyNamesToText(s.exposure, nc);
     if (!s.secret) continue;
     const sig = secSig(s);
+    if (isTombstoned(ch, 'sec', sig)) continue; // user deleted — don't resurrect
     const ex = ch.secrets.find((x) => secSig(x) === sig);
-    if (ex) { ex.danger = s.danger; if (s.exposure) ex.exposure = s.exposure; ex.lastTurn = turnNow; continue; }
+    if (ex) { if (ex.userEdited) continue; ex.danger = s.danger; if (s.exposure) ex.exposure = s.exposure; ex.lastTurn = turnNow; continue; }
     ch.secrets.push(Object.assign({ turn: turnNow, lastTurn: turnNow, revealed: false }, s));
     addedS++;
   }
@@ -1742,20 +1798,12 @@ async function importHistory(chatId, rawText, userId) {
     const useGen = hasPerm('generation') && spindle.generate && (spindle.generate.raw || spindle.generate.quiet);
     let castN = 0, memN = 0, knowK = 0, knowS = 0, genFailed = false;
     if (useGen && turns.length) {
-      // Scan the WHOLE imported transcript, not just a sample: split it into
-      // sequential windows and run every extractor over each window. The
+      // Scan the WHOLE imported transcript: split it into sequential windows and
+      // run every extractor over each one. No cap — every turn is covered. The
       // apply* folders dedupe, so overlapping/foreign data merges cleanly.
       const WINDOW = 24;          // turns per extraction window
-      const MAX_WINDOWS = 12;     // hard cap so a giant import can't run forever
       const chunks = [];
       for (let i = 0; i < turns.length; i += WINDOW) chunks.push(turns.slice(i, i + WINDOW));
-      if (chunks.length > MAX_WINDOWS) {
-        // Too many windows — coalesce by taking evenly-spaced ones plus the last.
-        const picked = [];
-        const step = chunks.length / MAX_WINDOWS;
-        for (let k = 0; k < MAX_WINDOWS; k++) picked.push(chunks[Math.min(chunks.length - 1, Math.floor(k * step))]);
-        chunks.length = 0; chunks.push(...picked);
-      }
       const total = chunks.length;
       for (let ci = 0; ci < chunks.length; ci++) {
         const part = chunks[ci];
@@ -2127,13 +2175,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (payload.charKey && ch.memJournal && ch.memJournal[payload.charKey]) {
         const bucket = ch.memJournal[payload.charKey];
         if (payload.all) {
+          (bucket.entries || []).forEach((e) => addTombstone(ch, 'mem', mjSig(payload.charKey, e.memory)));
           delete ch.memJournal[payload.charKey];
         } else if (typeof payload.id === 'string' && payload.id) {
           // Stable-id delete (preferred): immune to sort/filter index drift.
           const idx = bucket.entries.findIndex((e) => e.id === payload.id);
-          if (idx >= 0) bucket.entries.splice(idx, 1);
+          if (idx >= 0) { addTombstone(ch, 'mem', mjSig(payload.charKey, bucket.entries[idx].memory)); bucket.entries.splice(idx, 1); }
         } else if (typeof payload.index === 'number') {
           // Legacy fallback for entries saved before ids existed.
+          const e = bucket.entries[payload.index];
+          if (e) addTombstone(ch, 'mem', mjSig(payload.charKey, e.memory));
           bucket.entries.splice(payload.index, 1);
         }
         if (ch.memJournal[payload.charKey] && !bucket.entries.length) delete ch.memJournal[payload.charKey];
@@ -2145,10 +2196,19 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const chatId = await resolveChatId(payload.chatId, userId);
       if (!chatId) return;
       const ch = await loadChronicle(chatId);
-      if (payload.kind === 'knowledge' && Array.isArray(ch.knowledge) && typeof payload.index === 'number') ch.knowledge.splice(payload.index, 1);
-      else if (payload.kind === 'secret' && Array.isArray(ch.secrets) && typeof payload.index === 'number') ch.secrets.splice(payload.index, 1);
-      else if (payload.kind === 'clear_knowledge') ch.knowledge = [];
-      else if (payload.kind === 'clear_secrets') ch.secrets = [];
+      if (payload.kind === 'knowledge' && Array.isArray(ch.knowledge) && typeof payload.index === 'number') {
+        const e = ch.knowledge[payload.index];
+        if (e) { addTombstone(ch, 'know', knowSig(e)); ch.knowledge.splice(payload.index, 1); }
+      } else if (payload.kind === 'secret' && Array.isArray(ch.secrets) && typeof payload.index === 'number') {
+        const e = ch.secrets[payload.index];
+        if (e) { addTombstone(ch, 'sec', secSig(e)); ch.secrets.splice(payload.index, 1); }
+      } else if (payload.kind === 'clear_knowledge') {
+        (ch.knowledge || []).forEach((e) => addTombstone(ch, 'know', knowSig(e)));
+        ch.knowledge = [];
+      } else if (payload.kind === 'clear_secrets') {
+        (ch.secrets || []).forEach((e) => addTombstone(ch, 'sec', secSig(e)));
+        ch.secrets = [];
+      }
       await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId);
       return;
     }
