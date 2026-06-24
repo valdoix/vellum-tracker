@@ -137,6 +137,41 @@ function stripHtml(s) {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/* ---------- retrieval-query hygiene (#6) ----------
+ * Strip preset jailbreak / narrative-protocol boilerplate from a message before
+ * it feeds the recall scorer, so system scaffolding doesn't dominate the query.
+ * Patterns are matched case-insensitively; the message is truncated at the first
+ * hit (the boilerplate is almost always a trailing block). Mirrors LoreRecall's
+ * sanitizeRetrievalMessage idea. */
+const QUERY_CUT_PATTERNS = [
+  /\bimportant\s*(?:note|reminder)\s*:/i,
+  /\byou\s+are\s+(?:forbidden|required|now)\b/i,
+  /\bnever\s+break\s+character\b/i,
+  /\b(?:system|assistant)\s+(?:prompt|instructions?)\b/i,
+  /\[\s*(?:narrative|emotional|strict|system|ooc)\b/i,
+  /<\s*(?:system|instructions?|guidelines?)\b/i,
+  /\bthe\s+human\s+never\s+sees\b/i,
+  /\bprivate\s+workspace\b/i,
+  /\btreat\s+.{0,30}\bas\s+a\s+black\s+box\b/i,
+  /\bactive\s+personality\s+matrix\b/i,
+  /\bweave\s+planning\b/i,
+];
+const QUERY_MSG_LIMIT = 800; // per-message char cap before scoring
+
+function sanitizeQueryText(s) {
+  let t = String(s || '');
+  if (!t) return '';
+  let cut = t.length;
+  for (const re of QUERY_CUT_PATTERNS) {
+    const m = t.match(re);
+    if (m && m.index !== undefined && m.index < cut) cut = m.index;
+  }
+  if (cut < t.length) t = t.slice(0, cut);
+  t = t.trim();
+  if (t.length > QUERY_MSG_LIMIT) t = t.slice(0, QUERY_MSG_LIMIT);
+  return t;
+}
+
 function applyDepthFilters(content, assistantDepth) {
   let out = content;
   if (assistantDepth > KEEP.reverie) out = stripReverie(out);
@@ -364,7 +399,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], covered: 0, tombstones: { mem: [], know: [], sec: [] }, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], covered: 0, tombstones: { mem: [], know: [], sec: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
 }
 
 function normKey(s) {
@@ -528,6 +563,40 @@ function addAlias(c, name) {
   if (c.aka.length > 8) c.aka.shift();
 }
 
+// Content-derived alias keys (#5, TunnelVision deriveAliasKeys idea): mine a
+// character's role/appearance/note for role-descriptors and proper-noun phrases
+// the scene might use instead of the name ("the kingslayer", "her twin", "the
+// queen"). Stored in c.derivedAka (separate from user-facing aka) and used only
+// to strengthen scene name-matching, never shown in the UI.
+const ROLE_STOP = new Set(['the','a','an','and','or','of','to','in','on','at','with','her','his','their','its','who','that','which','is','was','are','were','as','for','from','by','this','these','those','very','more','most','some','such']);
+function deriveAliasKeys(c) {
+  const out = new Set();
+  const src = [c.role || '', c.appearance || '', c.note || ''].join('. ');
+  if (!src.trim()) return [];
+  // 1) role descriptors: "<article> <word(s)> who/that ..." or a leading noun phrase
+  const roleRe = /\b(?:the|a|an|her|his|their)\s+([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})\b/gi;
+  let m;
+  while ((m = roleRe.exec(src)) !== null) {
+    const phrase = m[1].trim().toLowerCase();
+    const toks = phrase.split(/\s+/).filter((w) => w.length > 2 && !ROLE_STOP.has(w));
+    if (toks.length) out.add(toks.join(' '));
+    if (out.size > 10) break;
+  }
+  // 2) capitalized proper-noun phrases (titles, epithets) e.g. "Prince of Harrenhal"
+  const propRe = /\b([A-Z][a-z]{2,}(?:\s+(?:of|the)\s+[A-Z][a-z]{2,}|\s+[A-Z][a-z]{2,}){0,2})\b/g;
+  while ((m = propRe.exec(src)) !== null) {
+    const phrase = m[1].trim();
+    if (castKey(phrase) !== castKey(c.name)) out.add(phrase.toLowerCase());
+    if (out.size > 16) break;
+  }
+  return Array.from(out).slice(0, 12);
+}
+
+// Refresh c.derivedAka from its current fields (call after enrich/edit).
+function refreshDerivedAliases(c) {
+  try { c.derivedAka = deriveAliasKeys(c); } catch (e) { /* best effort */ }
+}
+
 // Create or update a cast member's presence bookkeeping (never overwrites stats).
 function touchCast(ch, name, turn, day, status) {
   const title = String(name || '').trim();
@@ -595,6 +664,10 @@ async function loadChronicle(chatId) {
   if (!Array.isArray(ch.tombstones.mem)) ch.tombstones.mem = [];
   if (!Array.isArray(ch.tombstones.know)) ch.tombstones.know = [];
   if (!Array.isArray(ch.tombstones.sec)) ch.tombstones.sec = [];
+  // Injector state (persisted so it survives worker idle-unload):
+  if (!Array.isArray(ch.injLog)) ch.injLog = [];            // cooldown ring (#2)
+  if (!ch.fb || typeof ch.fb !== 'object') ch.fb = {};      // per-id feedback (#1): {inj,ref,miss}
+  if (!ch.tune || typeof ch.tune !== 'object') ch.tune = { minScore: RECALL.minScore, samples: 0 }; // (#16)
   // ensure every cast member has an aka (also-known-as) list
   for (const k of Object.keys(ch.cast)) { if (!Array.isArray(ch.cast[k].aka)) ch.cast[k].aka = []; }
   chronicleByChat.set(chatId, ch);
@@ -667,11 +740,25 @@ function buildDigest(ch) {
  * old events, and past shifts precisely when the scene calls for them.
  * ------------------------------------------------------------------------- */
 const RECALL = {
-  queryMessages: 4,   // how many recent messages form the retrieval query
-  budgetChars: 1400,  // max chars of scene-relevant recall injected per turn
+  queryMessages: 5,   // how many recent messages form the retrieval query
+  budgetChars: 2600,  // max chars of scene-relevant recall injected per turn
   minScore: 3,        // min scene-weighted score to inject (newest-turn hit or phrase, or 2+ shared tokens)
-  maxItems: 12,
+  maxItems: 18,
 };
+
+// Global injection budget allocator (#4.5). One ceiling for the whole VELLUM
+// recall block, split across sub-blocks by priority. Sub-block caps are upper
+// bounds; the allocator hands leftover budget down the priority chain so a quiet
+// scene still fills with the most relevant material.
+const INJECT_BUDGET = {
+  total: 5200,        // hard ceiling for the entire injected recall system message
+  cast: 1400,         // cast roster digest
+  knowledge: 1100,    // knowledge + secrets digest
+  recall: 2600,       // scene-relevant chronicle recall (mirrors RECALL.budgetChars)
+  graph: 900,         // entity-graph multi-hop additions (#12)
+};
+// Conversation-phase budget multipliers (#7) applied to the recall slice.
+const PHASE_BUDGET_MULT = { action: 1.15, dialogue: 1.0, intro: 0.85, transition: 0.7, unknown: 1.0 };
 
 const RECALL_STOP = new Set(['the','and','for','with','that','this','her','his','him','she','they','them','their','was','were','are','you','your','from','into','but','not','had','has','have','will','would','could','should','what','when','where','who','why','how','all','any','out','off','over','then','there','about','said','says','like','just','its','also','been','being','because','around','before','after','still','than','too','very','more','most','some','such','only','even','onto','upon','while','here','now','one','two']);
 
@@ -694,7 +781,7 @@ function queryFromMessages(messages, n) {
     const m = messages[i];
     let c = typeof m.content === 'string' ? m.content : '';
     if (!c) continue;
-    c = stripReverie(stripLedger(stripBts(c)));
+    c = sanitizeQueryText(stripReverie(stripLedger(stripBts(c))));
     if (c.trim()) { parts.push(c); taken++; }
   }
   return parts.join('\n');
@@ -709,7 +796,7 @@ function sceneSignals(messages, n) {
     const m = messages[i];
     let c = typeof m.content === 'string' ? m.content : '';
     if (!c) continue;
-    c = stripReverie(stripLedger(stripBts(c))).trim();
+    c = sanitizeQueryText(stripReverie(stripLedger(stripBts(c))).trim());
     if (!c) continue;
     // newest message ×3, second ×2, the rest ×1 — recency-weighted scene focus
     const weight = taken === 0 ? 3 : (taken === 1 ? 2 : 1);
@@ -767,28 +854,69 @@ function overlapScore(entryText, qtokens) {
 }
 
 // Select scene-relevant entries, excluding the arcs/threads already pinned.
+// Score-density packing (#4): once gated, order by score/length so the budget
+// surfaces the most distinct relevant items rather than one long entry. A
+// scene-named entry (mention boost) is always allowed through regardless of the
+// minScore gate. Returns { lines, trace, ids } — ids feed the cooldown ring.
 function selectRelevant(ch, queryText, pinnedArcIds, pinnedThreadIds, opts) {
   const o = Object.assign({}, RECALL, opts || {});
   const qtokens = uniqTokens(recallTokens(queryText));
-  if (qtokens.length < 2) return { lines: [], trace: [] };
+  if (qtokens.length < 2) return { lines: [], trace: [], ids: [] };
   const cands = gatherCandidates(ch, queryText, pinnedArcIds, pinnedThreadIds);
+  // Deep Recall is now a RERANKER (#9), not a gate: approved entries get a strong
+  // additive boost (and carry the controller's reason), but lexical scoring still
+  // runs so recall works instantly with no controller and never empties out.
   const approved = o.approved instanceof Map ? o.approved : null;
-  const lines = [];
-  const trace = [];
+  if (approved) {
+    for (const c of cands) {
+      if (approved.has(c.id)) { c.score += 50; c.approvedWhy = approved.get(c.id) || 'LLM judged relevant'; }
+    }
+    cands.sort((a, b) => (b.score - a.score) || (b.recency - a.recency));
+  }
+  const minScore = Number.isFinite(o.minScore) ? o.minScore : RECALL.minScore;
+  const budget = Number.isFinite(o.budgetChars) ? o.budgetChars : RECALL.budgetChars;
+
+  // Gate first, then re-order survivors by score-density for packing.
+  const gated = cands.filter((c) => {
+    if (c.mention > 0) return true;          // named in latest message → always eligible
+    if (c.approvedWhy) return true;          // controller-approved → always eligible
+    return c.score >= minScore;
+  });
+  gated.sort((a, b) => {
+    // scene-named entries first, then density, then raw score
+    if ((b.mention > 0) !== (a.mention > 0)) return (b.mention > 0) ? 1 : -1;
+    const da = a.score / Math.max(20, a.len), db = b.score / Math.max(20, b.len);
+    return (db - da) || (b.score - a.score);
+  });
+
+  const lines = [], trace = [], ids = [];
+  const seenShingles = []; // for near-duplicate suppression
   let used = 0;
-  for (const c of cands) {
-    // Deep Recall mode: inject only what the controller-LLM approved (with its
-    // reason). Lexical mode: gate by score. Either way honor budget + cap.
-    if (approved) { if (!approved.has(c.id)) continue; }
-    else if (c.score < o.minScore) continue;
+  for (const c of gated) {
     if (lines.length >= o.maxItems) break;
-    if (used + c.line.length + 1 > o.budgetChars) continue;
+    if (used + c.line.length + 1 > budget) continue;
+    // Near-duplicate suppression: long chronicles fold a near-identical event/
+    // shift every turn ("Perzys sleeping in vault" ×15). Skip a candidate whose
+    // body strongly overlaps one already selected, unless it's scene-named.
+    if (c.mention < 100) {
+      const toks = new Set(recallTokens(c.line).filter((t) => t.length >= 4 && !RECALL_STOP.has(t)));
+      let dup = false;
+      for (const prev of seenShingles) {
+        if (!toks.size || !prev.size) continue;
+        let inter = 0; for (const t of toks) if (prev.has(t)) inter++;
+        const sim = inter / Math.min(toks.size, prev.size);
+        if (sim >= 0.6) { dup = true; break; }
+      }
+      if (dup) continue;
+      seenShingles.push(toks);
+    }
     lines.push(c.line);
-    const why = approved ? (approved.get(c.id) || 'LLM judged relevant') : (c.why || 'relevance ' + Math.round(c.score));
-    trace.push({ kind: c.kind, label: c.label, score: approved ? '✓' : Math.round(c.score * 10) / 10, why });
+    ids.push(c.id);
+    const why = c.approvedWhy || c.why || ('relevance ' + Math.round(c.score));
+    trace.push({ id: c.id, kind: c.kind, label: c.label, score: c.approvedWhy ? '✓' : Math.round(c.score * 10) / 10, why });
     used += c.line.length + 1;
   }
-  return { lines, trace };
+  return { lines, trace, ids };
 }
 
 // Stable id for a candidate so the controller can approve specific entries.
@@ -807,23 +935,41 @@ function gatherCandidates(ch, queryText, pinnedArcIds, pinnedThreadIds) {
     return { score: tok + ph, why: why.join('; ') };
   };
   const cands = [];
+  // Shared finisher: apply scene-mention boost (#3) + cooldown penalty (#2),
+  // record components for the trace, and push.
+  const push = (id, baseScore, recency, kind, label, why, line, mentionTitle) => {
+    const mention = sceneMentionBoost(mentionTitle, layers);
+    const cool = cooldownPenalty(ch, id);
+    const fb = feedbackAdjust(ch, id);
+    const finalScore = baseScore + mention - cool + fb;
+    const why2 = [];
+    if (mention >= 100) why2.push('named in the latest message');
+    else if (mention > 0) why2.push('referenced in the latest message');
+    if (why) why2.push(why);
+    if (fb > 0) why2.push('model uses this (+' + fb + ')');
+    else if (fb < 0) why2.push('injected but ignored (' + fb + ')');
+    if (cool > 0) why2.push('recently shown (−' + cool + ')');
+    cands.push({ id, score: finalScore, base: baseScore, mention, cool, fb, recency, kind, label, why: why2.join('; '), line, len: line.length });
+  };
   Object.values(ch.arcs || {}).forEach((t) => {
     if (pinnedArcIds.has(t.id)) return;
     const r = rate(t.title, t.status, '');
-    if (r.score > 0) cands.push({ id: 'arc:' + t.id, score: r.score + 0.5, recency: t.lastTurn || 0, kind: 'arc', label: t.title, why: r.why, line: '◉ ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '') });
+    const line = '◉ ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '');
+    if (r.score > 0 || sceneMentionBoost(t.title, layers) > 0) push('arc:' + t.id, r.score + 0.5, t.lastTurn || 0, 'arc', t.title, r.why, line, t.title);
   });
   Object.values(ch.threads || {}).forEach((t) => {
     if (pinnedThreadIds.has(t.id)) return;
     const r = rate(t.title, t.status, '');
-    if (r.score > 0) cands.push({ id: 'thread:' + t.id, score: r.score + 0.5, recency: t.lastTurn || 0, kind: 'thread', label: t.title, why: r.why, line: '🧵 ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '') });
+    const line = '🧵 ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '');
+    if (r.score > 0 || sceneMentionBoost(t.title, layers) > 0) push('thread:' + t.id, r.score + 0.5, t.lastTurn || 0, 'thread', t.title, r.why, line, t.title);
   });
   (ch.events || []).forEach((e, i) => {
     const r = rate(e.text, '', '');
-    if (r.score > 0) cands.push({ id: 'event:' + vhash(e.text), score: r.score, recency: i, kind: 'event', label: e.text.slice(0, 48), why: r.why, line: '▸ ' + dl(e.day) + ': ' + e.text });
+    if (r.score > 0) push('event:' + vhash(e.text), r.score, i, 'event', e.text.slice(0, 48), r.why, '▸ ' + dl(e.day) + ': ' + e.text, e.text);
   });
   (ch.shifts || []).forEach((s, i) => {
     const r = rate(s.text, '', '');
-    if (r.score > 0) cands.push({ id: 'shift:' + vhash(s.text), score: r.score, recency: i, kind: 'shift', label: s.text.slice(0, 48), why: r.why, line: '⚲ ' + dl(s.day) + ': ' + s.text });
+    if (r.score > 0) push('shift:' + vhash(s.text), r.score, i, 'shift', s.text.slice(0, 48), r.why, '⚲ ' + dl(s.day) + ': ' + s.text, s.text);
   });
   (ch.memories || []).forEach((m, i) => {
     const kw = (m.keywords || []).join(' ');
@@ -836,7 +982,7 @@ function gatherCandidates(ch, queryText, pinnedArcIds, pinnedThreadIds) {
       if (kwScore > 0) why.push('memory keyword match');
       if (ph > 0) why.push('keyword phrase in scene');
       if (bodyScore > 0 && !why.length) why.push('summary keyword hit');
-      cands.push({ id: 'mem:' + (m.id || ('t' + m.fromTurn)), score: score + 0.25, recency: 1000 + i, kind: 'memory', label: 't' + m.fromTurn + '-' + m.toTurn, why: why.join('; '), line: '✦ ' + dl(m.day) + ' (t' + m.fromTurn + '-' + m.toTurn + '): ' + m.text });
+      push('mem:' + (m.id || ('t' + m.fromTurn)), score + 0.25, 1000 + i, 'memory', 't' + m.fromTurn + '-' + m.toTurn, why.join('; '), '✦ ' + dl(m.day) + ' (t' + m.fromTurn + '-' + m.toTurn + '): ' + m.text, kw);
     }
   });
   cands.sort((a, b) => (b.score - a.score) || (b.recency - a.recency));
@@ -854,6 +1000,138 @@ function buildLayersFromQuery(queryText) {
     text: normForPhrase(b),
     weight: idx === 0 ? 3 : (idx === 1 ? 2 : 1),
   }));
+}
+
+// --- Conversation phase detection (#7). Coarse regex classifier over the
+// newest scene text; reweights the recall budget. Gentle by design. ---
+function detectPhase(queryText) {
+  const t = String(queryText || '').toLowerCase();
+  if (!t.trim()) return 'unknown';
+  const action = (t.match(/\b(grab|strike|hit|slash|sword|blade|run|ran|lunge|blood|fight|attack|dodge|shout|scream|blow|punch|kick|fell|threw|charge|clash)\w*/g) || []).length;
+  const dialogue = (t.match(/"[^"]{3,}"|“[^”]{3,}”|\b(said|asked|replied|whispered|murmured|answered)\b/g) || []).length;
+  const intro = (t.match(/\b(enters?|arriv\w+|approach\w+|appears?|new|first time|stranger|door opens?)\b/g) || []).length;
+  const transition = (t.match(/\b(later|next (morning|day|night)|hours? (later|passed)|meanwhile|elsewhere|the following|by (dawn|dusk|nightfall))\b/g) || []).length;
+  const scores = { action, dialogue, intro, transition };
+  let best = 'unknown', bv = 0;
+  for (const k of Object.keys(scores)) if (scores[k] > bv) { bv = scores[k]; best = k; }
+  return bv >= 1 ? best : 'unknown';
+}
+
+// --- Injection cooldown ring buffer (#2). Persisted in the chronicle so it
+// survives worker idle-unload. Records the ids injected over the last few turns
+// and yields a decaying penalty so the same entries don't dominate every turn.
+const COOLDOWN = { window: 3, penaltyByAge: [5, 3, 1] };
+
+function cooldownPenalty(ch, id) {
+  const log = (ch && ch.injLog) || [];
+  // log is newest-last; age 0 = most recent turn that injected it
+  for (let i = log.length - 1; i >= 0; i--) {
+    if (Array.isArray(log[i]) && log[i].includes(id)) {
+      const age = (log.length - 1) - i;
+      if (age < COOLDOWN.penaltyByAge.length) return COOLDOWN.penaltyByAge[age];
+      return 0;
+    }
+  }
+  return 0;
+}
+
+// Record the ids injected this turn into the cooldown ring (bounded).
+function recordInjection(ch, ids) {
+  if (!ch.injLog) ch.injLog = [];
+  ch.injLog.push(Array.from(new Set(ids)).slice(0, 40));
+  while (ch.injLog.length > COOLDOWN.window) ch.injLog.shift();
+}
+
+/* --- Relevance feedback loop (#1) + threshold auto-tune (#16) ---
+ * After a turn is injected we note the ids; after the model responds we scan the
+ * new assistant text for references to those entries. Entries the model actually
+ * uses get a positive boost; entries injected repeatedly and never referenced go
+ * stale (penalty). All counters live on ch.fb (persisted, bounded). */
+const FB = { boostCap: 8, stalePenalty: 4, staleAfter: 3, maxEntries: 200 };
+
+// Mark these ids as injected this turn (pending a reference check next turn).
+function noteInjectedForFeedback(ch, ids) {
+  if (!ch.fb) ch.fb = {};
+  ch._pendingFb = Array.from(new Set(ids)).slice(0, 40);
+  for (const id of ch._pendingFb) {
+    const e = ch.fb[id] || (ch.fb[id] = { inj: 0, ref: 0, miss: 0 });
+    e.inj++;
+  }
+  // bound the table: drop least-active ids if it grows too big
+  const keys = Object.keys(ch.fb);
+  if (keys.length > FB.maxEntries) {
+    keys.sort((a, b) => (ch.fb[a].inj + ch.fb[a].ref) - (ch.fb[b].inj + ch.fb[b].ref));
+    for (let i = 0; i < keys.length - FB.maxEntries; i++) delete ch.fb[keys[i]];
+  }
+}
+
+// After the model's reply, check which injected entries it actually referenced.
+// `referencedText` is the new assistant turn; `lastInj` is what we injected.
+function applyFeedback(ch, referencedText, injectedTrace) {
+  if (!ch.fb || !injectedTrace || !injectedTrace.length) return;
+  const refTokens = new Set(recallTokens(referencedText || ''));
+  const refPhrase = normForPhrase(referencedText || '');
+  let used = 0, missed = 0;
+  for (const t of injectedTrace) {
+    const id = t.id;
+    if (!id || !ch.fb[id]) continue;
+    // referenced if a distinctive label token or the label phrase appears in the reply
+    const label = String(t.label || '');
+    const lblPhrase = normForPhrase(label).trim();
+    const toks = recallTokens(label).filter((w) => w.length >= 4 && !RECALL_STOP.has(w));
+    let hit = (lblPhrase.length >= 4 && refPhrase.includes(' ' + lblPhrase + ' '));
+    if (!hit) for (const w of toks) if (refTokens.has(w)) { hit = true; break; }
+    const e = ch.fb[id];
+    if (hit) { e.ref++; e.miss = 0; used++; } else { e.miss++; missed++; }
+  }
+  // Threshold auto-tune (#16), heavily clamped + slow: if we're injecting lots
+  // that never gets referenced, nudge minScore up; if almost everything is used,
+  // nudge down. Stays within ±2 of the default and moves at most 0.25/turn.
+  if (ch.tune) {
+    const total = used + missed;
+    if (total >= 3) {
+      const precision = used / total;
+      const target = precision < 0.25 ? RECALL.minScore + 2 : precision > 0.75 ? RECALL.minScore - 1 : RECALL.minScore;
+      const cur = Number.isFinite(ch.tune.minScore) ? ch.tune.minScore : RECALL.minScore;
+      const next = cur + Math.max(-0.25, Math.min(0.25, target - cur));
+      ch.tune.minScore = Math.max(RECALL.minScore - 2, Math.min(RECALL.minScore + 2, next));
+      ch.tune.samples = (ch.tune.samples || 0) + 1;
+      ch.tune.lastPrecision = Math.round(precision * 100) / 100;
+    }
+  }
+  ch._pendingFb = null;
+}
+
+// Per-id feedback adjustment folded into scoring: + when referenced often,
+// − when injected repeatedly but ignored (stale).
+function feedbackAdjust(ch, id) {
+  const e = ch.fb && ch.fb[id];
+  if (!e) return 0;
+  let adj = 0;
+  if (e.ref > 0) adj += Math.min(FB.boostCap, e.ref * 2);
+  if (e.inj >= FB.staleAfter && e.ref === 0) adj -= FB.stalePenalty;
+  if (e.miss >= FB.staleAfter && e.ref === 0) adj -= 1;
+  return adj;
+}
+
+// Current (possibly auto-tuned) minScore gate.
+function tunedMinScore(ch) {
+  const v = ch && ch.tune && Number.isFinite(ch.tune.minScore) ? ch.tune.minScore : RECALL.minScore;
+  return Math.max(1, v);
+}
+
+// Does the LATEST scene layer (weight 3, the newest message) name this entry?
+// A strong, cooldown-overriding signal (#3): what's happening NOW wins a slot.
+function sceneMentionBoost(title, layers) {
+  if (!layers || !layers.length) return 0;
+  const top = layers[0];
+  if (!top || top.weight < 3) return 0;
+  const name = normForPhrase(title).trim();
+  if (name.length >= 4 && top.text.includes(' ' + name + ' ')) return 100; // exact name in newest msg
+  // distinctive single token of the title present in the newest message
+  const toks = recallTokens(title).filter((w) => w.length >= 4 && !RECALL_STOP.has(w));
+  for (const t of toks) if (top.tokens.includes(t)) return 40;
+  return 0;
 }
 
 function pinnedIdSets(ch) {
@@ -929,25 +1207,112 @@ function buildCastDigest(ch, query) {
 
 // Scene-relevant knowledge/secrets for injection (dramatic irony). Surfaces the
 // facts and secrets whose subjects/keepers/content the current scene touches.
-function buildKnowledgeDigest(ch, query) {
+// Scene-gated (#11): a fact whose holder is NAMED in the scene outranks a mere
+// shared-word hit, and high-irony entries (wrong beliefs, explosive secrets) get
+// a priority bump when their subject is present.
+function buildKnowledgeDigest(ch, query, opts) {
+  const o = opts || {};
+  const budget = Number.isFinite(o.budgetChars) ? o.budgetChars : 700;
   const qtokens = uniqTokens(recallTokens(query || ''));
+  const qphrase = normForPhrase(query || '');
   if (qtokens.length < 2) return '';
-  const score = (txt) => { const e = new Set(recallTokens(txt)); let n = 0; for (const t of qtokens) if (e.has(t)) n++; return n; };
+  const tokOverlap = (txt) => { const e = new Set(recallTokens(txt)); let n = 0; for (const t of qtokens) if (e.has(t)) n++; return n; };
+  // Bonus when a NAME phrase appears verbatim in the recent scene.
+  const namedInScene = (name) => {
+    const n = normForPhrase(name || '').trim();
+    if (n.length >= 3 && qphrase.includes(' ' + n + ' ')) return 6;
+    const toks = recallTokens(name || '').filter((t) => t.length >= 3 && !RECALL_STOP.has(t));
+    for (const t of toks) if (qtokens.includes(t)) return 3;
+    return 0;
+  };
   const out = [];
-  const kn = (ch.knowledge || []).map((k) => ({ k, s: score(k.who + ' ' + k.fact) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 5);
+  const kn = (ch.knowledge || []).map((k) => {
+    let s = tokOverlap(k.who + ' ' + k.fact) + namedInScene(k.who);
+    if (k.reliability === 'wrong' && namedInScene(k.who) > 0) s += 3; // dramatic irony: present + wrong belief
+    return { k, s };
+  }).filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 7);
   for (const { k } of kn) {
     let tag = k.reliability;
     if (k.reliability === 'wrong') tag = 'WRONGLY believes';
     else if (k.reliability === 'unaware') tag = 'does NOT know';
     out.push('\u25C7 ' + k.who + ' ' + tag + ': ' + k.fact + (k.reliability === 'wrong' && k.truth === 'false' ? ' (it is not true)' : ''));
   }
-  const sc = (ch.secrets || []).filter((x) => !x.revealed).map((x) => ({ x, s: score(x.secret + ' ' + x.keeper + ' ' + (x.from || '')) })).filter((y) => y.s > 0).sort((a, b) => b.s - a.s).slice(0, 4);
+  const sc = (ch.secrets || []).filter((x) => !x.revealed).map((x) => {
+    let s = tokOverlap(x.secret + ' ' + x.keeper + ' ' + (x.from || '')) + namedInScene(x.keeper) + (namedInScene(x.from) > 0 ? 2 : 0);
+    if (x.danger === 'explosive' && (namedInScene(x.keeper) > 0 || namedInScene(x.from) > 0)) s += 3;
+    return { x, s };
+  }).filter((y) => y.s > 0).sort((a, b) => b.s - a.s).slice(0, 6);
   for (const { x } of sc) {
     out.push('\u26BF ' + x.keeper + ' hides from ' + (x.from || 'others') + ': ' + x.secret + ' [' + x.danger + ']');
   }
   let used = 0; const kept = [];
-  for (const line of out) { if (used + line.length + 1 > 700) continue; kept.push(line); used += line.length + 1; }
+  for (const line of out) { if (used + line.length + 1 > budget) continue; kept.push(line); used += line.length + 1; }
   return kept.join('\n');
+}
+
+/* --- Entity-graph multi-hop recall (#12) ---
+ * vellum's structured edge: the chronicle already ties characters to arcs,
+ * threads, secrets and knowledge by name. When a character is NAMED in the scene
+ * (or marked present), pull the connected entries that DIDN'T already match
+ * lexically — surfacing "what this person is entangled in" even when the scene
+ * text doesn't mention it. One hop, bounded, lowest priority (leftover budget).
+ * `excludeIds` are the ids already injected by lexical recall (no dupes). */
+function buildGraphRecall(ch, query, excludeIds, opts) {
+  const o = opts || {};
+  const budget = Number.isFinite(o.budgetChars) ? o.budgetChars : INJECT_BUDGET.graph;
+  const exclude = new Set(excludeIds || []);
+  const qtokens = uniqTokens(recallTokens(query || ''));
+  const qphrase = normForPhrase(query || '');
+  if (qtokens.length < 2) return { lines: [], trace: [], ids: [] };
+
+  // Anchor characters: present + scene-named (cap a few so the hop stays tight).
+  const cast = ch.cast || {};
+  const presentIds = new Set(ch.presentIds || []);
+  const anchors = [];
+  for (const k of Object.keys(cast)) {
+    const c = cast[k];
+    const present = presentIds.has(c.id);
+    const sig = nameSignal(c, qtokens, qphrase);
+    if (present || sig >= 6) anchors.push({ c, strength: present ? 100 : sig });
+  }
+  anchors.sort((a, b) => b.strength - a.strength);
+  const top = anchors.slice(0, 3);
+  if (!top.length) return { lines: [], trace: [], ids: [] };
+
+  // Does an entry's text reference an anchor by name/alias?
+  const mentionsAnchor = (text, c) => {
+    const p = normForPhrase(text || '');
+    const full = normForPhrase(c.name).trim();
+    if (full.length >= 3 && p.includes(' ' + full + ' ')) return true;
+    const toks = recallTokens(c.name).filter((t) => t.length >= 3 && !new Set(['the','a','ser','lord','lady','king','queen','prince','princess']).has(t));
+    const pset = new Set(recallTokens(text || ''));
+    for (const t of toks) if (pset.has(t)) return true;
+    for (const a of (c.aka || [])) { const at = normForPhrase(a).trim(); if (at.length >= 3 && p.includes(' ' + at + ' ')) return true; }
+    return false;
+  };
+  const dl = (d) => (d ? 'D' + d : '—');
+  const cands = [];
+  for (const { c } of top) {
+    Object.values(ch.arcs || {}).forEach((t) => { const id = 'arc:' + t.id; if (!exclude.has(id) && mentionsAnchor(t.title + ' ' + (t.status || ''), c)) cands.push({ id, kind: 'arc', label: t.title, recent: t.lastTurn || 0, anchor: c.name, line: '◉ ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '') }); });
+    Object.values(ch.threads || {}).forEach((t) => { const id = 'thread:' + t.id; if (!exclude.has(id) && mentionsAnchor(t.title + ' ' + (t.status || ''), c)) cands.push({ id, kind: 'thread', label: t.title, recent: t.lastTurn || 0, anchor: c.name, line: '🧵 ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '') }); });
+    (ch.secrets || []).forEach((s) => { if (s.revealed) return; const id = 'secret:' + vhash(s.secret); if (exclude.has(id)) return; if (castKey(s.keeper) === castKey(c.name) || mentionsAnchor(s.keeper + ' ' + (s.from || ''), c)) cands.push({ id, kind: 'secret', label: s.secret.slice(0, 40), recent: s.lastTurn || 0, anchor: c.name, line: '⚿ ' + s.keeper + ' hides from ' + (s.from || 'others') + ': ' + s.secret + ' [' + s.danger + ']' }); });
+    (ch.knowledge || []).forEach((k) => { const id = 'know:' + vhash(k.who + k.fact); if (exclude.has(id)) return; if (castKey(k.who) === castKey(c.name)) { let tag = k.reliability === 'wrong' ? 'WRONGLY believes' : k.reliability === 'unaware' ? 'does NOT know' : k.reliability; cands.push({ id, kind: 'knowledge', label: k.fact.slice(0, 40), recent: k.lastTurn || 0, anchor: c.name, line: '◇ ' + k.who + ' ' + tag + ': ' + k.fact }); } });
+  }
+  // dedupe by id, prefer most-recent, then pack to budget
+  const seen = new Set();
+  const uniq = [];
+  cands.sort((a, b) => (b.recent || 0) - (a.recent || 0));
+  for (const c of cands) { if (seen.has(c.id)) continue; seen.add(c.id); uniq.push(c); }
+  const lines = [], trace = [], ids = [];
+  let used = 0;
+  for (const c of uniq) {
+    if (lines.length >= 6) break;
+    if (used + c.line.length + 1 > budget) continue;
+    lines.push(c.line); ids.push(c.id);
+    trace.push({ id: c.id, kind: c.kind, label: c.label, score: '↔', why: 'connected to ' + c.anchor + ' (in scene)' });
+    used += c.line.length + 1;
+  }
+  return { lines, trace, ids };
 }
 
 // How strongly the SCENE names this character (not just shares a common word).
@@ -964,6 +1329,13 @@ function nameSignal(c, qtokens, qphrase) {
   for (const a of (c.aka || [])) {
     const at = normForPhrase(a).trim();
     if (at.length >= 3 && qphrase.includes(' ' + at + ' ')) { s += 4; break; }
+  }
+  // Content-derived aliases (#5): role descriptors / epithets mined from the
+  // character's role/appearance. A weaker signal than an explicit aka, but
+  // catches "the kingslayer" / "her twin" when the name itself isn't said.
+  for (const a of (c.derivedAka || [])) {
+    const at = normForPhrase(a).trim();
+    if (at.length >= 4 && qphrase.includes(' ' + at + ' ')) { s += 3; break; }
   }
   return s;
 }
@@ -1318,7 +1690,7 @@ function applyCastList(ch, list, nc) {
     if (c.appearance && (!m.appearance || m.appearance.length < c.appearance.length)) { m.appearance = c.appearance; touched = true; }
     if (c.role && (!m.role || m.role.length < c.role.length)) { m.role = c.role; touched = true; }
     if (m.status !== 'active' && !c.mentionedOnly) m.status = 'active';
-    if (touched) enriched++;
+    if (touched) { refreshDerivedAliases(m); enriched++; }
   }
   return { added, enriched };
 }
@@ -1627,6 +1999,7 @@ function applyCastEdit(ch, input) {
     m.aka = list.map((a) => String(a).trim()).filter((a) => a && castKey(a) !== castKey(m.name)).slice(0, 8);
   }
   if (input.source === 'user' && m.status !== 'active') m.status = 'user';
+  refreshDerivedAliases(m);
   return m;
 }
 
@@ -1918,6 +2291,11 @@ function mergeEnrich(base, extra) {
 /* ---------- interceptor: lean the older context + inject scene-relevant recall ---------- */
 let lastInterceptedMessages = null;
 const lastInjectionByChat = new Map();
+// Pre-warm cache (#10): reuse the assembled injection when the scene query is
+// unchanged (swipes / regenerations / rapid retries hit the same fingerprint),
+// so the heavy scoring pass doesn't re-run on the hot path.
+const _prewarmCache = new Map(); // chatId -> { fp, content, ids, recall, recallTrace, castBlock, castCount, castTrace, phase }
+function sceneFingerprint(query) { return vhash(String(query || '').slice(-1400)); }
 let _interceptorFiredOnce = false;
 const vellumInterceptor = async (messages, context) => {
   if (!_interceptorFiredOnce) {
@@ -1951,33 +2329,72 @@ const vellumInterceptor = async (messages, context) => {
       const ch = await loadChronicle(chatId);
       if (chronicleHasContent(ch)) {
         const query = queryFromMessages(out, RECALL.queryMessages);
+        // Pre-warm reuse (#10): identical scene query (swipe/regeneration) → reuse
+        // the already-assembled injection without re-scoring or re-recording.
+        const fp = sceneFingerprint(query);
+        const warm = _prewarmCache.get(chatId);
+        if (warm && warm.fp === fp && warm.content) {
+          injectedContent = warm.content;
+          lastInjectionByChat.set(chatId, { at: Date.now(), phase: warm.phase, cast: warm.castBlock || '', castCount: warm.castCount || 0, castTrace: warm.castTrace || [], recall: warm.recall || [], recallTrace: warm.recallTrace || [], chars: warm.content.length, cached: true });
+          try { await spindle.variables.chat.set(chatId, 'vellum_injection_json', JSON.stringify(lastInjectionByChat.get(chatId)).slice(0, 40000)); } catch (eW) {}
+          spindle.log.info('[vellum_tracker] reused pre-warmed injection (' + warm.content.length + ' chars)');
+        } else {
         const { arcIds, threadIds } = pinnedIdSets(ch);
-        const sel = selectRelevant(ch, query, arcIds, threadIds, (function () { const ap = deepApproved(chatId, ch); return ap ? { approved: ap } : null; })());
-        const lines = sel.lines;
+        // Budget allocator (#4.5): one ceiling split across sub-blocks. Phase
+        // (#7) scales the recall slice. Cast/knowledge keep their caps; recall
+        // gets the remainder up to its cap.
+        const phase = detectPhase(query);
+        const phaseMult = PHASE_BUDGET_MULT[phase] || 1.0;
+        const castBudget = INJECT_BUDGET.cast;
+        const knowBudget = INJECT_BUDGET.knowledge;
+        const recallBudget = Math.round(Math.min(INJECT_BUDGET.recall, RECALL.budgetChars) * phaseMult);
+
         const cast = buildCastDigest(ch, query);
         const castBlock = cast.text;
-        const knowBlock = buildKnowledgeDigest(ch, query);
+        const knowBlock = buildKnowledgeDigest(ch, query, { budgetChars: knowBudget });
+        const ap = deepApproved(chatId, ch);
+        const tunedMin = tunedMinScore(ch);
+        const sel = selectRelevant(ch, query, arcIds, threadIds, Object.assign({ budgetChars: recallBudget, minScore: tunedMin }, ap ? { approved: ap } : {}));
+        const lines = sel.lines;
+
+        // Entity-graph multi-hop hook (#12) — fills only leftover global budget.
+        const usedSoFar = (castBlock ? castBlock.length : 0) + (knowBlock ? knowBlock.length : 0) + lines.join('\n').length;
+        const graphRoom = Math.min(INJECT_BUDGET.graph, Math.max(0, INJECT_BUDGET.total - usedSoFar));
+        const graph = graphRoom > 80 ? buildGraphRecall(ch, query, sel.ids, { budgetChars: graphRoom }) : { lines: [], trace: [], ids: [] };
+
         let content = '';
         if (castBlock) content += '[CAST — established characters, for continuity. Keep ages, looks, and roles consistent; do not contradict these.]\n' + castBlock + '\n\n';
         if (knowBlock) content += '[KNOWLEDGE & SECRETS — the information state, for dramatic irony. Honor exactly who knows, believes, suspects, or is ignorant of what; never let a character act on knowledge they do not have, and never casually expose a secret unless the scene earns it.]\n' + knowBlock + '\n\n';
         if (lines.length) content += '[CHRONICLE RECALL — entries relevant to the current scene, retrieved from long-term memory. Honor them as established history; do not recite them in prose.]\n' + lines.join('\n');
+        if (graph.lines.length) content += (lines.length ? '\n' : '') + '\n[CONNECTED CONTEXT — tied to characters in the scene via the story graph.]\n' + graph.lines.join('\n');
         content = content.trim();
+        // Global ceiling safety clamp.
+        if (content.length > INJECT_BUDGET.total) content = content.slice(0, INJECT_BUDGET.total);
         if (content) {
           injectedContent = content;
+          // Record what we injected into the cooldown ring (#2) + feedback (#1).
+          const injIds = sel.ids.concat(graph.ids);
+          recordInjection(ch, injIds);
+          noteInjectedForFeedback(ch, injIds);
+          try { await saveChronicle(chatId, ch); } catch (eSave) {}
           lastInjectionByChat.set(chatId, {
             at: Date.now(),
+            phase,
             cast: castBlock || '',
             castCount: castBlock ? castBlock.split('\n').filter(Boolean).length : 0,
             castTrace: cast.trace || [],
-            recall: lines.slice(),
-            recallTrace: sel.trace || [],
+            recall: lines.concat(graph.lines),
+            recallTrace: (sel.trace || []).concat(graph.trace || []),
             chars: content.length,
           });
           try { await spindle.variables.chat.set(chatId, 'vellum_injection_json', JSON.stringify(lastInjectionByChat.get(chatId)).slice(0, 40000)); } catch (e3) {}
-          spindle.log.info(`[vellum_tracker] injected ${content.length} chars (${lines.length} recall, cast=${!!castBlock})`);
+          _prewarmCache.set(chatId, { fp, content, ids: injIds, recall: lines.concat(graph.lines), recallTrace: (sel.trace || []).concat(graph.trace || []), castBlock: castBlock || '', castCount: castBlock ? castBlock.split('\n').filter(Boolean).length : 0, castTrace: cast.trace || [], phase });
+          spindle.log.info(`[vellum_tracker] injected ${content.length} chars (${lines.length} recall +${graph.lines.length} graph, cast=${!!castBlock}, phase=${phase})`);
         } else {
           lastInjectionByChat.set(chatId, { at: Date.now(), cast: '', castCount: 0, recall: [], chars: 0 });
+          _prewarmCache.set(chatId, { fp, content: '', ids: [], recall: [], recallTrace: [], castBlock: '', castCount: 0, castTrace: [], phase });
           spindle.log.info('[vellum_tracker] nothing to inject this turn (no cast/recall matched)');
+        }
         }
       } else {
         spindle.log.info('[vellum_tracker] chronicle empty — nothing to inject yet');
@@ -2045,9 +2462,17 @@ async function handle(chatId, content, userId) {
     if (sig !== ch._sig) {
       ch._sig = sig;
       ch.turns = (ch.turns || 0) + 1;
+      // Relevance feedback (#1/#16): did THIS new turn reference what we injected
+      // before it? Scan against the last injection's trace, then update counters.
+      try {
+        const inj = lastInjectionByChat.get(chatId);
+        const trace = inj && Array.isArray(inj.recallTrace) ? inj.recallTrace : null;
+        if (trace && trace.length) applyFeedback(ch, content, trace);
+      } catch (eFb) { /* feedback is best-effort */ }
       const day = extractDay(ledger.time) || ch.lastDay || 1;
       foldTurn(ch, ch.turns, day, ledger, btsRaw);
       await saveChronicle(chatId, ch);
+      _prewarmCache.delete(chatId); // chronicle changed → next interceptor re-scores
       broadcastChronicle(chatId, ch);
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).

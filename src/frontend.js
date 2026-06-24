@@ -881,7 +881,7 @@ function injectionHtml(inj) {
   // Reasoning: WHY each entry was injected.
   const trace = (inj.castTrace || []).concat(inj.recallTrace || []);
   if (trace.length) {
-    const kindIcon = { cast: '\u25C8', arc: '\u25C9', thread: '\uD83E\uDDF5', event: '\u25B8', shift: '\u26B2', memory: '\u2756' };
+    const kindIcon = { cast: '\u25C8', arc: '\u25C9', thread: '\uD83E\uDDF5', event: '\u25B8', shift: '\u26B2', memory: '\u2756', secret: '\u26BF', knowledge: '\u25C7' };
     html += '<div class="vlc-inj"><div class="vlc-inj-h"><span>\uD83D\uDD0E Why these?</span><span>' + trace.length + '</span></div>'
       + '<div class="vlc-why">'
       + trace.map((t) => '<div class="vlc-why-row"><span class="vlc-why-i">' + (kindIcon[t.kind] || '\u2022') + '</span>'
@@ -891,7 +891,9 @@ function injectionHtml(inj) {
       + '</div></div>';
   }
   const when = inj.at ? new Date(inj.at).toLocaleTimeString() : '';
-  html += '<div class="vlc-inj-meta">~' + (inj.chars || 0) + ' chars injected before your last message' + (when ? ' \u00B7 ' + when : '') + '. This is added silently to the prompt, never shown in the story.</div>';
+  const phaseTag = inj.phase && inj.phase !== 'unknown' ? ' \u00B7 scene: ' + escapeHtml(inj.phase) : '';
+  const cachedTag = inj.cached ? ' \u00B7 reused' : '';
+  html += '<div class="vlc-inj-meta">~' + (inj.chars || 0) + ' chars injected before your last message' + (when ? ' \u00B7 ' + when : '') + phaseTag + cachedTag + '. This is added silently to the prompt, never shown in the story.</div>';
   return html;
 }
 
