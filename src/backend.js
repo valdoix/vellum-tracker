@@ -240,6 +240,103 @@ function broadcast(chatId, parsed, btsRaw) {
 }
 
 /* ============================================================================
+ * NAME CONTEXT — resolve the REAL persona ({{user}}) and character ({{char}})
+ * names for a chat, so the LLM scanners (cast / memory / knowledge) never have
+ * to guess who "{{user}}" is and never mislabel the user's persona.
+ *
+ * Two permission-free sources, combined:
+ *   1. spindle.macros.resolve('{{user}} | {{char}}', { chatId }) — the engine's
+ *      own resolution (free tier, needs no extra permission).
+ *   2. The `name` field already present on every stored message (persona name
+ *      on user turns, character name on assistant turns) — see readStoredMessages.
+ * The result is cached briefly per chat so repeated scans stay cheap.
+ * ========================================================================== */
+const _nameCtxCache = new Map(); // chatId -> { at, ctx }
+const NAME_CTX_TTL = 30000;
+
+function _cleanName(s) {
+  const n = String(s == null ? '' : s).trim();
+  if (!n) return '';
+  // Reject unresolved macro tokens and obvious non-names.
+  if (/\{\{|\}\}/.test(n)) return '';
+  if (n.length > 60) return n.slice(0, 60).trim();
+  return n;
+}
+
+async function resolveNameContext(chatId, messages) {
+  if (!chatId) return { user: '', char: '', userAliases: [], charAliases: [], names: [] };
+  const cached = _nameCtxCache.get(chatId);
+  if (cached && Date.now() - cached.at < NAME_CTX_TTL) return cached.ctx;
+
+  let user = '', char = '';
+  // 1) macro engine (authoritative for {{user}}/{{char}})
+  try {
+    if (spindle.macros && spindle.macros.resolve) {
+      const r = await spindle.macros.resolve('{{user}}\u0001{{char}}', { chatId, commit: false });
+      const txt = (r && (r.text || r.result || r)) || '';
+      const parts = String(txt).split('\u0001');
+      user = _cleanName(parts[0]);
+      char = _cleanName(parts[1]);
+    }
+  } catch (e) { /* fall back to message names */ }
+
+  // 2) message `name` fields — fill any gaps and gather observed speaker names.
+  const userNames = new Map(); // cleaned -> count
+  const charNames = new Map();
+  for (const m of (messages || [])) {
+    const nm = _cleanName(m && m.name);
+    if (!nm) continue;
+    const bucket = (m.isUser || m.role === 'user') ? userNames : charNames;
+    bucket.set(nm, (bucket.get(nm) || 0) + 1);
+  }
+  const topOf = (map) => { let best = '', n = -1; for (const [k, v] of map) if (v > n) { best = k; n = v; } return best; };
+  if (!user) user = topOf(userNames);
+  if (!char) char = topOf(charNames);
+
+  const userAliases = Array.from(userNames.keys()).filter((n) => n && n !== user);
+  const charAliases = Array.from(charNames.keys()).filter((n) => n && n !== char);
+  const names = Array.from(new Set([user, char, ...userNames.keys(), ...charNames.keys()].filter(Boolean)));
+
+  const ctx = { user, char, userAliases, charAliases, names };
+  _nameCtxCache.set(chatId, { at: Date.now(), ctx });
+  return ctx;
+}
+
+// Build the instruction block that tells a scanner who the speakers really are.
+function namesBlock(nc) {
+  if (!nc) return '';
+  const lines = [];
+  if (nc.user) lines.push('- The human player\u2019s character (referred to as {{user}}) is named: ' + nc.user + (nc.userAliases.length ? ' (also: ' + nc.userAliases.join(', ') + ')' : ''));
+  if (nc.char) lines.push('- The primary AI character ({{char}}) is named: ' + nc.char + (nc.charAliases.length ? ' (also: ' + nc.charAliases.join(', ') + ')' : ''));
+  if (!lines.length) return '';
+  return 'KNOWN SPEAKERS (authoritative \u2014 use these exact names, never the placeholders "{{user}}"/"User"/"{{char}}"):\n' + lines.join('\n') + '\nWhen a memory, fact, or secret concerns the player, write "' + (nc.user || 'the player') + '", not "{{user}}".\n\n';
+}
+
+// Substitute real names into the labels + any literal {{user}}/{{char}} in a
+// transcript line, so the model reads real names instead of role placeholders.
+function applyNamesToText(s, nc) {
+  let out = String(s == null ? '' : s);
+  if (nc && nc.user) out = out.replace(/\{\{\s*user\s*\}\}/gi, nc.user);
+  if (nc && nc.char) out = out.replace(/\{\{\s*char\s*\}\}/gi, nc.char);
+  return out;
+}
+
+// Canonicalize a name the LLM produced: turn "{{user}}"/"user"/"you" into the
+// real persona name, "{{char}}" into the real character name. Leaves other
+// names untouched. Used on every who/about/keeper/from field the scanners emit.
+function canonName(raw, nc) {
+  let n = String(raw == null ? '' : raw).trim();
+  if (!n) return n;
+  if (nc) {
+    if (/^\{\{\s*user\s*\}\}$/i.test(n) || /^(the\s+)?user$/i.test(n) || /^you$/i.test(n)) return nc.user || n;
+    if (/^\{\{\s*char\s*\}\}$/i.test(n)) return nc.char || n;
+  }
+  // Strip a stray surrounding macro if the model wrapped a real name.
+  n = n.replace(/\{\{\s*user\s*\}\}/gi, (nc && nc.user) || '').replace(/\{\{\s*char\s*\}\}/gi, (nc && nc.char) || '').trim();
+  return n || raw;
+}
+
+/* ============================================================================
  * CHRONICLE — long-term continuity ledger.
  * Catalogs every character arc, plot thread, parallel event, and narrative
  * shift across the whole chat, and records how each one evolves turn to turn.
@@ -856,10 +953,20 @@ const summarizing = new Set(); // chatIds with an in-flight summary (no overlap)
 function assistantTurns(messages) {
   // Flatten to ordered {role, content} keeping only ledger-bearing assistant turns
   // plus their preceding user turn, so a memory has both sides of the exchange.
+  // Also carry the real speaker `name` on each side when the host provides it.
   const turns = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    if (m.role === 'assistant') turns.push({ idx: i, user: i > 0 && messages[i - 1].role === 'user' ? messages[i - 1].content : '', ai: m.content });
+    if (m.role === 'assistant') {
+      const prev = i > 0 && messages[i - 1].role === 'user' ? messages[i - 1] : null;
+      turns.push({
+        idx: i,
+        user: prev ? prev.content : '',
+        userName: prev ? (prev.name || '') : '',
+        ai: m.content,
+        aiName: m.name || '',
+      });
+    }
   }
   return turns;
 }
@@ -1093,7 +1200,7 @@ async function summarizeAll(chatId, userId) {
  * ========================================================================== */
 const scanningCast = new Set();
 
-const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about). For each, infer their details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}]}. Rules: pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words; never invent unsupported details (use "unknown"); merge obvious duplicates into one entry. No prose outside the JSON.';
+const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about, and including the human player\u2019s own character). For each, infer their details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}]}. Rules: ALWAYS use the real names given to you \u2014 never output "{{user}}", "User", "{{char}}", or "you" as a name; pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words; never invent unsupported details (use "unknown"); merge obvious duplicates into one entry. No prose outside the JSON.';
 
 function parseCastJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1117,8 +1224,11 @@ function parseCastJson(text) {
 // walk the WHOLE transcript and pick evenly-spaced turns plus the opening and
 // the most recent ones, so a scan reflects the entire story, not just the ends.
 function sampleHistory(turns, opts) {
-  const o = Object.assign({ maxTurns: 22, headN: 3, tailN: 9, charBudget: 16000 }, opts || {});
+  const o = Object.assign({ maxTurns: 22, headN: 3, tailN: 9, charBudget: 16000, nameCtx: null }, opts || {});
   if (!turns.length) return '';
+  const nc = o.nameCtx;
+  const userLabel = (t) => _cleanName(t.userName) || (nc && nc.user) || 'USER';
+  const aiLabel = (t) => _cleanName(t.aiName) || (nc && nc.char) || 'STORY';
   const n = turns.length;
   const idx = new Set();
   for (let i = 0; i < Math.min(o.headN, n); i++) idx.add(i);
@@ -1133,13 +1243,53 @@ function sampleHistory(turns, opts) {
   const picked = Array.from(idx).filter((i) => i >= 0 && i < n).sort((a, b) => a - b);
   const parts = picked.map((i) => {
     const t = turns[i];
-    const u = cleanForSummary(t.user); const a = cleanForSummary(t.ai);
-    return '[turn ' + (i + 1) + '] ' + (u ? 'USER: ' + u + '\n' : '') + 'STORY: ' + a;
+    const u = applyNamesToText(cleanForSummary(t.user), nc);
+    const a = applyNamesToText(cleanForSummary(t.ai), nc);
+    return '[turn ' + (i + 1) + '] ' + (u ? userLabel(t) + ': ' + u + '\n' : '') + aiLabel(t) + ': ' + a;
   });
   // trim to budget from the FRONT (keep most recent if over)
   let out = parts.join('\n\n');
   if (out.length > o.charBudget) out = out.slice(out.length - o.charBudget);
   return out;
+}
+
+// Apply a parsed cast list to the chronicle (shared by live scan + import).
+// Returns { added, enriched }. Canonicalizes {{user}}/{{char}} via nameCtx.
+function applyCastList(ch, list, nc) {
+  let added = 0, enriched = 0;
+  const turnNow = ch.turns || 0;
+  for (const c of list) {
+    c.name = canonName(c.name, nc);
+    if (Array.isArray(c.aka)) c.aka = c.aka.map((a) => canonName(a, nc)).filter(Boolean);
+    if (!c.name || castKey(c.name).length < 2) continue;
+    let m = findCastMember(ch, c.name);
+    if (!m) {
+      const key = castKey(c.name);
+      m = ch.cast[key] = { id: key, name: c.name, aka: [], source: 'auto', status: c.mentionedOnly ? 'mentioned' : 'active', age: '', appearance: '', role: '', note: '', firstTurn: turnNow, lastTurn: turnNow, firstDay: ch.lastDay, lastDay: ch.lastDay };
+      added++;
+    } else {
+      addAlias(m, c.name); // record this spelling so it resolves to the same card
+    }
+    if (Array.isArray(c.aka)) c.aka.forEach((a) => addAlias(m, a));
+    if (m.source === 'user') continue; // never overwrite user-authored cards
+    let touched = false;
+    if (c.age && !m.age) { m.age = c.age; touched = true; }
+    if (c.appearance && (!m.appearance || m.appearance.length < c.appearance.length)) { m.appearance = c.appearance; touched = true; }
+    if (c.role && (!m.role || m.role.length < c.role.length)) { m.role = c.role; touched = true; }
+    if (m.status !== 'active' && !c.mentionedOnly) m.status = 'active';
+    if (touched) enriched++;
+  }
+  return { added, enriched };
+}
+
+// Run the cast LLM extraction over a turns array. Returns the parsed list or null.
+async function castExtract(turns, nc, userId) {
+  const excerpt = sampleHistory(turns, { maxTurns: 22, headN: 3, tailN: 9, charBudget: 15000, nameCtx: nc });
+  const sys = CAST_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
+  const castContent = await internalGenerate(
+    [{ role: 'system', content: sys }, { role: 'user', content: 'Excerpt:\n\n' + excerpt }],
+    { temperature: 0.2, max_tokens: 2200 }, userId);
+  return parseCastJson(castContent);
 }
 
 async function scanCast(chatId, userId) {
@@ -1155,44 +1305,19 @@ async function scanCast(chatId, userId) {
     try { msgs = await readStoredMessages(chatId); }
     catch (e) { if (e && e.permDenied) { spindle.sendToFrontend({ type: 'vellum_cast_done', ok: false, reason: 'no_chat_mutation_permission' }, userId); return; } throw e; }
     if (!msgs || !msgs.length) { spindle.sendToFrontend({ type: 'vellum_cast_done', ok: false, reason: 'no_history' }, userId); return; }
-    // Use a smart full-history sample so cast facts reflect the whole story.
+    const nc = await resolveNameContext(chatId, msgs);
     const turns = assistantTurns(msgs);
-    const excerpt = sampleHistory(turns, { maxTurns: 22, headN: 3, tailN: 9, charBudget: 15000 });
 
-    let castContent = '';
-    try {
-      castContent = await internalGenerate(
-        [{ role: 'system', content: CAST_SYS }, { role: 'user', content: 'Excerpt:\n\n' + excerpt }],
-        { temperature: 0.2, max_tokens: 2200 }, userId);
-    } catch (e) {
+    let list;
+    try { list = await castExtract(turns, nc, userId); }
+    catch (e) {
       spindle.log.warn(`[vellum_tracker] cast scan gen failed: ${e?.message || e}`);
       spindle.sendToFrontend({ type: 'vellum_cast_done', ok: false, reason: (e && e.permDenied) ? 'no_generation_permission' : 'error' }, userId); return;
     }
-    const list = parseCastJson(castContent);
     if (!list) { spindle.sendToFrontend({ type: 'vellum_cast_done', ok: false, reason: 'parse' }, userId); return; }
 
-    const turnNow = ch.turns || 0;
-    for (const c of list) {
-      if (!c.name || castKey(c.name).length < 2) continue;
-      let m = findCastMember(ch, c.name);
-      if (!m) {
-        const key = castKey(c.name);
-        m = ch.cast[key] = { id: key, name: c.name, aka: [], source: 'auto', status: c.mentionedOnly ? 'mentioned' : 'active', age: '', appearance: '', role: '', note: '', firstTurn: turnNow, lastTurn: turnNow, firstDay: ch.lastDay, lastDay: ch.lastDay };
-        added++;
-      } else {
-        addAlias(m, c.name); // record this spelling so it resolves to the same card
-      }
-      // record any aliases the scan found
-      if (Array.isArray(c.aka)) c.aka.forEach((a) => addAlias(m, a));
-      if (m.source === 'user') continue; // never overwrite user-authored cards
-      let touched = false;
-      if (c.age && !m.age) { m.age = c.age; touched = true; }
-      if (c.appearance && (!m.appearance || m.appearance.length < c.appearance.length)) { m.appearance = c.appearance; touched = true; }
-      if (c.role && (!m.role || m.role.length < c.role.length)) { m.role = c.role; touched = true; }
-      // a mentioned-only character that we've never seen present stays 'mentioned'
-      if (m.status !== 'active' && !c.mentionedOnly) m.status = 'active';
-      if (touched) enriched++;
-    }
+    const res = applyCastList(ch, list, nc);
+    added = res.added; enriched = res.enriched;
     await saveChronicle(chatId, ch);
     broadcastChronicle(chatId, ch);
     spindle.sendToFrontend({ type: 'vellum_cast_done', ok: true, added, enriched, total: Object.keys(ch.cast).length }, userId);
@@ -1212,7 +1337,7 @@ const scanningMem = new Set();
 const scanningKnow = new Set();
 
 // ---- MEMORY JOURNAL: what each character remembers about {{user}} & key moments ----
-const MEM_SYS = 'You are a story archivist building each character\u2019s MEMORY JOURNAL from a roleplay transcript \u2014 the moments they would personally remember about {{user}} and about each other. Read the whole excerpt and output STRICT JSON only: {"entries":[{"who":"the character who holds this memory","about":"who/what it concerns (usually {{user}} or another character)","memory":"one vivid sentence in the character\u2019s perspective of what happened","kind":"interaction|promise|betrayal|gift|shared|wound|observation","weight":"trivial|minor|significant|defining","sentiment":"positive|negative|neutral|complex","day":<story-day integer if known else null>}]}. Rules: only record moments a character would actually carry; favor turning points over small talk; one sentence per memory; never invent unsupported events; 6\u201318 entries max, the most meaningful. No prose outside the JSON.';
+const MEM_SYS = 'You are a story archivist building each character\u2019s MEMORY JOURNAL from a roleplay transcript \u2014 the moments they would personally remember about the player and about each other. Read the whole excerpt and output STRICT JSON only: {"entries":[{"who":"the exact name of the character who holds this memory","about":"the exact name of who/what it concerns","memory":"one vivid sentence in the character\u2019s perspective of what happened, using real names","kind":"interaction|promise|betrayal|gift|shared|wound|observation","weight":"trivial|minor|significant|defining","sentiment":"positive|negative|neutral|complex","day":<story-day integer if known else null>}]}. Rules: ALWAYS use the real character names given to you \u2014 never write "{{user}}", "User", "{{char}}", or "you"; only record moments a character would actually carry; favor turning points over small talk; one sentence per memory; never invent unsupported events; 6\u201318 entries max, the most meaningful. No prose outside the JSON.';
 
 function parseMemJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1247,27 +1372,12 @@ async function scanMemJournal(chatId, userId) {
     const ch = await loadChronicle(chatId);
     let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { if (e && e.permDenied) { done(false, { reason: 'no_chat_mutation_permission' }); return; } throw e; }
     if (!msgs || !msgs.length) { done(false, { reason: 'no_history' }); return; }
-    const excerpt = sampleHistory(assistantTurns(msgs), { maxTurns: 26, headN: 4, tailN: 10, charBudget: 17000 });
-    let raw = '';
-    try { raw = await internalGenerate([{ role: 'system', content: MEM_SYS }, { role: 'user', content: 'Transcript excerpt:\n\n' + excerpt }], { temperature: 0.2, max_tokens: 2200 }, userId); }
+    const nc = await resolveNameContext(chatId, msgs);
+    let list;
+    try { list = await memExtract(assistantTurns(msgs), nc, userId); }
     catch (e) { done(false, { reason: (e && e.permDenied) ? 'no_generation_permission' : 'error' }); return; }
-    const list = parseMemJson(raw);
     if (!list) { done(false, { reason: 'parse' }); return; }
-    if (!ch.memJournal) ch.memJournal = {};
-    const turnNow = ch.turns || 0;
-    for (const e of list) {
-      // resolve the holder to a cast member if possible, else key by name
-      const m = findCastMember(ch, e.who);
-      const key = m ? m.id : castKey(e.who);
-      if (!key) continue;
-      if (!ch.memJournal[key]) ch.memJournal[key] = { name: m ? m.name : e.who, entries: [] };
-      const arr = ch.memJournal[key].entries;
-      const sig = memSig(e);
-      if (arr.some((x) => memSig(x) === sig)) continue; // dedupe
-      arr.push({ about: e.about, memory: e.memory, kind: e.kind, weight: e.weight, sentiment: e.sentiment, day: e.day, turn: turnNow });
-      if (arr.length > 40) arr.shift();
-      added++;
-    }
+    added = applyMemList(ch, list, nc);
     await saveChronicle(chatId, ch);
     broadcastChronicle(chatId, ch);
     done(true, { added, characters: Object.keys(ch.memJournal).length });
@@ -1278,8 +1388,41 @@ async function scanMemJournal(chatId, userId) {
   } finally { scanningMem.delete(chatId); }
 }
 
+// Run the memory-journal LLM extraction over a turns array. Returns list or null.
+async function memExtract(turns, nc, userId) {
+  const excerpt = sampleHistory(turns, { maxTurns: 26, headN: 4, tailN: 10, charBudget: 17000, nameCtx: nc });
+  const sys = MEM_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
+  const raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Transcript excerpt:\n\n' + excerpt }], { temperature: 0.2, max_tokens: 2200 }, userId);
+  return parseMemJson(raw);
+}
+
+// Fold a parsed memory list into the chronicle. Returns count added.
+function applyMemList(ch, list, nc) {
+  if (!ch.memJournal) ch.memJournal = {};
+  const turnNow = ch.turns || 0;
+  let added = 0;
+  for (const e of list) {
+    e.who = canonName(e.who, nc);
+    e.about = canonName(e.about, nc);
+    e.memory = applyNamesToText(e.memory, nc);
+    if (!e.who || !e.memory) continue;
+    // resolve the holder to a cast member if possible, else key by name
+    const m = findCastMember(ch, e.who);
+    const key = m ? m.id : castKey(e.who);
+    if (!key) continue;
+    if (!ch.memJournal[key]) ch.memJournal[key] = { name: m ? m.name : e.who, entries: [] };
+    const arr = ch.memJournal[key].entries;
+    const sig = memSig(e);
+    if (arr.some((x) => memSig(x) === sig)) continue; // dedupe
+    arr.push({ id: 'mj' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), about: e.about, memory: e.memory, kind: e.kind, weight: e.weight, sentiment: e.sentiment, day: e.day, turn: turnNow });
+    if (arr.length > 40) arr.shift();
+    added++;
+  }
+  return added;
+}
+
 // ---- KNOWLEDGE / SECRETS: who knows / believes / suspects what (dramatic irony) ----
-const KNOW_SYS = 'You are a continuity analyst mapping the INFORMATION STATE of a roleplay \u2014 the engine of dramatic irony. From the whole transcript, extract (a) notable knowledge each character holds and (b) secrets being kept. Output STRICT JSON only: {"knowledge":[{"who":"character","fact":"the thing, one clause","reliability":"knows|believes|suspects|wrong|unaware","truth":"true|false|unknown","source":"how they got it, brief"}],"secrets":[{"secret":"the concealed thing, one clause","keeper":"who hides it","from":"who it is hidden from","method":"lie|omission|misdirection|disguise","exposure":"how it might surface, brief","danger":"minor|major|explosive"}]}. Rules: focus on facts that create tension or irony (someone believes something false, someone hides something, asymmetric knowledge); reliability=wrong means they believe something untrue; truth is the actual state regardless of belief; never invent \u2014 only what the text supports; up to ~12 knowledge + ~8 secrets, the most dramatically charged. No prose outside the JSON.';
+const KNOW_SYS = 'You are a continuity analyst mapping the INFORMATION STATE of a roleplay \u2014 the engine of dramatic irony. From the whole transcript, extract (a) notable knowledge each character holds and (b) secrets being kept. Output STRICT JSON only: {"knowledge":[{"who":"exact character name","fact":"the thing, one clause","reliability":"knows|believes|suspects|wrong|unaware","truth":"true|false|unknown","source":"how they got it, brief"}],"secrets":[{"secret":"the concealed thing, one clause","keeper":"exact name of who hides it","from":"exact name(s) of who it is hidden from","method":"lie|omission|misdirection|disguise","exposure":"how it might surface, brief","danger":"minor|major|explosive"}]}. Rules: ALWAYS use the real character names given to you \u2014 never write "{{user}}", "User", "{{char}}", or "you"; focus on facts that create tension or irony (someone believes something false, someone hides something, asymmetric knowledge); reliability=wrong means they believe something untrue; truth is the actual state regardless of belief; never invent \u2014 only what the text supports; up to ~12 knowledge + ~8 secrets, the most dramatically charged. No prose outside the JSON.';
 
 function parseKnowJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1322,31 +1465,13 @@ async function scanKnowledge(chatId, userId) {
     const ch = await loadChronicle(chatId);
     let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { if (e && e.permDenied) { done(false, { reason: 'no_chat_mutation_permission' }); return; } throw e; }
     if (!msgs || !msgs.length) { done(false, { reason: 'no_history' }); return; }
-    const excerpt = sampleHistory(assistantTurns(msgs), { maxTurns: 26, headN: 4, tailN: 10, charBudget: 17000 });
-    let raw = '';
-    try { raw = await internalGenerate([{ role: 'system', content: KNOW_SYS }, { role: 'user', content: 'Transcript excerpt:\n\n' + excerpt }], { temperature: 0.2, max_tokens: 2400 }, userId); }
+    const nc = await resolveNameContext(chatId, msgs);
+    let res;
+    try { res = await knowExtract(assistantTurns(msgs), nc, userId); }
     catch (e) { done(false, { reason: (e && e.permDenied) ? 'no_generation_permission' : 'error' }); return; }
-    const res = parseKnowJson(raw);
     if (!res) { done(false, { reason: 'parse' }); return; }
-    if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
-    if (!Array.isArray(ch.secrets)) ch.secrets = [];
-    const turnNow = ch.turns || 0;
-    for (const k of res.knowledge) {
-      const sig = knowSig(k);
-      const ex = ch.knowledge.find((x) => knowSig(x) === sig);
-      if (ex) { ex.reliability = k.reliability; ex.truth = k.truth; if (k.source) ex.source = k.source; ex.lastTurn = turnNow; continue; }
-      ch.knowledge.push(Object.assign({ turn: turnNow, lastTurn: turnNow }, k));
-      addedK++;
-    }
-    for (const s of res.secrets) {
-      const sig = secSig(s);
-      const ex = ch.secrets.find((x) => secSig(x) === sig);
-      if (ex) { ex.danger = s.danger; if (s.exposure) ex.exposure = s.exposure; ex.lastTurn = turnNow; continue; }
-      ch.secrets.push(Object.assign({ turn: turnNow, lastTurn: turnNow, revealed: false }, s));
-      addedS++;
-    }
-    if (ch.knowledge.length > 60) ch.knowledge = ch.knowledge.slice(-60);
-    if (ch.secrets.length > 40) ch.secrets = ch.secrets.slice(-40);
+    const r = applyKnowResult(ch, res, nc);
+    addedK = r.addedK; addedS = r.addedS;
     await saveChronicle(chatId, ch);
     broadcastChronicle(chatId, ch);
     done(true, { addedK, addedS, totalK: ch.knowledge.length, totalS: ch.secrets.length });
@@ -1355,6 +1480,47 @@ async function scanKnowledge(chatId, userId) {
     spindle.log.warn('[vellum_tracker] scanKnowledge: ' + (err && err.message));
     done(false, { reason: 'error' });
   } finally { scanningKnow.delete(chatId); }
+}
+
+// Run the knowledge/secrets LLM extraction over a turns array. Returns result or null.
+async function knowExtract(turns, nc, userId) {
+  const excerpt = sampleHistory(turns, { maxTurns: 26, headN: 4, tailN: 10, charBudget: 17000, nameCtx: nc });
+  const sys = KNOW_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
+  const raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Transcript excerpt:\n\n' + excerpt }], { temperature: 0.2, max_tokens: 2400 }, userId);
+  return parseKnowJson(raw);
+}
+
+// Fold a parsed knowledge/secrets result into the chronicle. Returns counts.
+function applyKnowResult(ch, res, nc) {
+  if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
+  if (!Array.isArray(ch.secrets)) ch.secrets = [];
+  const turnNow = ch.turns || 0;
+  let addedK = 0, addedS = 0;
+  for (const k of res.knowledge) {
+    k.who = canonName(k.who, nc);
+    k.fact = applyNamesToText(k.fact, nc);
+    if (!k.who || !k.fact) continue;
+    const sig = knowSig(k);
+    const ex = ch.knowledge.find((x) => knowSig(x) === sig);
+    if (ex) { ex.reliability = k.reliability; ex.truth = k.truth; if (k.source) ex.source = k.source; ex.lastTurn = turnNow; continue; }
+    ch.knowledge.push(Object.assign({ turn: turnNow, lastTurn: turnNow }, k));
+    addedK++;
+  }
+  for (const s of res.secrets) {
+    s.keeper = canonName(s.keeper, nc);
+    s.from = (s.from || '').split(/\s*(?:,|;|\band\b|\/)\s*/).map((p) => canonName(p, nc)).filter(Boolean).join(', ');
+    s.secret = applyNamesToText(s.secret, nc);
+    if (s.exposure) s.exposure = applyNamesToText(s.exposure, nc);
+    if (!s.secret) continue;
+    const sig = secSig(s);
+    const ex = ch.secrets.find((x) => secSig(x) === sig);
+    if (ex) { ex.danger = s.danger; if (s.exposure) ex.exposure = s.exposure; ex.lastTurn = turnNow; continue; }
+    ch.secrets.push(Object.assign({ turn: turnNow, lastTurn: turnNow, revealed: false }, s));
+    addedS++;
+  }
+  if (ch.knowledge.length > 60) ch.knowledge = ch.knowledge.slice(-60);
+  if (ch.secrets.length > 40) ch.secrets = ch.secrets.slice(-40);
+  return { addedK, addedS };
 }
 
 
@@ -1423,7 +1589,7 @@ async function readStoredMessages(chatId) {
             const cand = slot || m.swipes.find((s) => /<ledger>|\[BTS/i.test(String(s)));
             if (cand) content = String(cand);
           }
-          return { role: m.role, content };
+          return { role: m.role, content, name: (m.name || '').trim(), isUser: m.is_user === true || m.role === 'user' };
         });
       }
     }
@@ -1450,6 +1616,210 @@ function rebuildFromMessages(messages) {
   }
   ch.turns = turn; ch.lastDay = lastDay;
   return ch;
+}
+
+// ===== IMPORT CHAT HISTORY =====
+// Parse a user-supplied chat export into a normalized [{role, content, name}].
+// Supports: Lumiverse/array JSON, SillyTavern JSONL (one msg per line), a
+// {messages:[...]} object, and a plain-text "Name: line" transcript fallback.
+const importing = new Set();
+
+function normImportRole(m) {
+  if (m == null) return null;
+  if (typeof m.role === 'string') {
+    const r = m.role.toLowerCase();
+    if (r === 'user' || r === 'human') return 'user';
+    if (r === 'assistant' || r === 'ai' || r === 'char' || r === 'model') return 'assistant';
+    if (r === 'system') return 'system';
+  }
+  if (typeof m.is_user === 'boolean') return m.is_user ? 'user' : 'assistant';
+  if (typeof m.isUser === 'boolean') return m.isUser ? 'user' : 'assistant';
+  return null;
+}
+
+function normImportContent(m) {
+  if (typeof m.content === 'string') return m.content;
+  if (typeof m.mes === 'string') return m.mes;             // SillyTavern
+  if (typeof m.text === 'string') return m.text;
+  if (Array.isArray(m.swipes) && m.swipes.length) {
+    const slot = typeof m.swipe_id === 'number' ? m.swipes[m.swipe_id] : m.swipes[0];
+    if (typeof slot === 'string') return slot;
+  }
+  if (Array.isArray(m.content)) {
+    return m.content.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('');
+  }
+  return '';
+}
+
+function normImportMessage(m) {
+  if (!m || typeof m !== 'object') return null;
+  const role = normImportRole(m);
+  const content = String(normImportContent(m) || '');
+  if (!role || !content.trim()) return null;
+  const name = String(m.name || m.author || m.speaker || '').trim();
+  return { role, content, name, isUser: role === 'user' };
+}
+
+// Plain-text transcript fallback. Lines like "Alice: hello" start a new turn;
+// continuation lines append to the current speaker. A blank speaker name maps
+// to assistant. userHint marks which name is the player so roles are right.
+function parseTextTranscript(text, userHint) {
+  const lines = String(text || '').split(/\r?\n/);
+  const out = [];
+  let cur = null;
+  const uh = (userHint || '').trim().toLowerCase();
+  const speakerRe = /^\s*([A-Za-z0-9 ._'\-]{1,40}?)\s*:\s+(.*)$/;
+  const flush = () => { if (cur && cur.content.trim()) out.push(cur); cur = null; };
+  for (const ln of lines) {
+    const m = ln.match(speakerRe);
+    if (m) {
+      flush();
+      const nm = m[1].trim();
+      const role = (uh && nm.toLowerCase() === uh) ? 'user' : 'assistant';
+      cur = { role, content: m[2], name: nm, isUser: role === 'user' };
+    } else if (cur) {
+      cur.content += '\n' + ln;
+    }
+  }
+  flush();
+  return out;
+}
+
+// Top-level: turn raw file text into a normalized transcript array.
+function parseImportedTranscript(text, opts) {
+  const o = opts || {};
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  // 1) Try whole-file JSON (array, {messages:[]}, or {chat:[]}).
+  try {
+    const j = JSON.parse(raw);
+    let arr = null;
+    if (Array.isArray(j)) arr = j;
+    else if (j && Array.isArray(j.messages)) arr = j.messages;
+    else if (j && Array.isArray(j.chat)) arr = j.chat;
+    else if (j && Array.isArray(j.history)) arr = j.history;
+    if (arr) { const mapped = arr.map(normImportMessage).filter(Boolean); if (mapped.length) return mapped; }
+  } catch (e) { /* not whole-file JSON */ }
+  // 2) Try JSONL (SillyTavern: one JSON object per line; first line may be metadata).
+  if (/\n/.test(raw) && /^\s*\{/.test(raw)) {
+    const objs = [];
+    let any = false;
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t[0] !== '{') continue;
+      try { const obj = JSON.parse(t); any = true; const nm = normImportMessage(obj); if (nm) objs.push(nm); } catch (e) { /* skip non-JSON line */ }
+    }
+    if (any && objs.length) return objs;
+  }
+  // 3) Plain-text transcript fallback.
+  return parseTextTranscript(raw, o.userHint);
+}
+
+// Orchestrate a full import: fold ledgers/BTS, then run cast+memory+knowledge
+// extractors over the imported transcript with proper name context.
+async function importHistory(chatId, rawText, userId) {
+  const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_import_done', ok }, extra || {}), userId);
+  if (!chatId) { done(false, { reason: 'no_active_chat' }); return; }
+  if (!hasPerm('chat_mutation')) { done(false, { reason: 'no_chat_mutation_permission' }); return; }
+  if (importing.has(chatId)) { done(false, { reason: 'busy' }); return; }
+  importing.add(chatId);
+  try {
+    spindle.sendToFrontend({ type: 'vellum_import_progress', stage: 'parsing' }, userId);
+    const msgs = parseImportedTranscript(rawText, {});
+    if (!msgs.length) { done(false, { reason: 'empty' }); return; }
+
+    const ch = await loadChronicle(chatId);
+    // Resolve names from the chat first, then enrich with any names seen in the
+    // imported transcript (so a foreign export still gets sensible labels).
+    const nc = await resolveNameContext(chatId, msgs);
+
+    // 1) Fold any ledger/BTS blocks present in the import into the structured tracker.
+    const scanned = rebuildFromMessages(msgs);
+    let merged = ch;
+    if (scanned && scanned.turns > 0) { merged = mergeEnrich(ch, scanned); merged._sig = ch._sig; }
+
+    const turns = assistantTurns(msgs);
+    const useGen = hasPerm('generation') && spindle.generate && (spindle.generate.raw || spindle.generate.quiet);
+    let castN = 0, memN = 0, knowK = 0, knowS = 0, genFailed = false;
+    if (useGen && turns.length) {
+      // Scan the WHOLE imported transcript, not just a sample: split it into
+      // sequential windows and run every extractor over each window. The
+      // apply* folders dedupe, so overlapping/foreign data merges cleanly.
+      const WINDOW = 24;          // turns per extraction window
+      const MAX_WINDOWS = 12;     // hard cap so a giant import can't run forever
+      const chunks = [];
+      for (let i = 0; i < turns.length; i += WINDOW) chunks.push(turns.slice(i, i + WINDOW));
+      if (chunks.length > MAX_WINDOWS) {
+        // Too many windows — coalesce by taking evenly-spaced ones plus the last.
+        const picked = [];
+        const step = chunks.length / MAX_WINDOWS;
+        for (let k = 0; k < MAX_WINDOWS; k++) picked.push(chunks[Math.min(chunks.length - 1, Math.floor(k * step))]);
+        chunks.length = 0; chunks.push(...picked);
+      }
+      const total = chunks.length;
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const part = chunks[ci];
+        const prog = (stage) => spindle.sendToFrontend({ type: 'vellum_import_progress', stage, chunk: ci + 1, chunks: total }, userId);
+        try {
+          prog('cast');
+          const cl = await castExtract(part, nc, userId);
+          if (cl) { const r = applyCastList(merged, cl, nc); castN += r.added; }
+        } catch (e) { genFailed = genFailed || !!(e && e.permDenied); spindle.log.warn('[vellum_tracker] import cast: ' + (e && e.message)); if (e && e.permDenied) break; }
+        try {
+          prog('memory');
+          const ml = await memExtract(part, nc, userId);
+          if (ml) memN += applyMemList(merged, ml, nc);
+        } catch (e) { spindle.log.warn('[vellum_tracker] import memory: ' + (e && e.message)); }
+        try {
+          prog('knowledge');
+          const kr = await knowExtract(part, nc, userId);
+          if (kr) { const r = applyKnowResult(merged, kr, nc); knowK += r.addedK; knowS += r.addedS; }
+        } catch (e) { spindle.log.warn('[vellum_tracker] import knowledge: ' + (e && e.message)); }
+        // Persist incrementally so a long import survives an interruption.
+        if (ci % 3 === 2) { try { await saveChronicle(chatId, merged); broadcastChronicle(chatId, merged, userId); } catch (e) {} }
+      }
+    }
+
+    await saveChronicle(chatId, merged);
+    broadcastChronicle(chatId, merged, userId);
+    done(true, {
+      messages: msgs.length,
+      foldedTurns: scanned ? scanned.turns : 0,
+      cast: castN, memories: memN, knowledge: knowK, secrets: knowS,
+      generated: !!useGen, genFailed,
+    });
+    spindle.log.info('[vellum_tracker] import: ' + msgs.length + ' msgs, +' + castN + ' cast, +' + memN + ' mem, +' + knowK + 'k/' + knowS + 's');
+  } catch (err) {
+    spindle.log.warn('[vellum_tracker] importHistory: ' + (err && err.message));
+    done(false, { reason: 'error' });
+  } finally { importing.delete(chatId); }
+}
+
+// Wipe ALL tracked data for a chat back to a fresh chronicle (start over).
+async function clearAllData(chatId, userId) {
+  const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_cleared', ok }, extra || {}), userId);
+  if (!chatId) { done(false, { reason: 'no_active_chat' }); return; }
+  try {
+    const fresh = freshChronicle();
+    chronicleByChat.set(chatId, fresh);
+    await saveChronicle(chatId, fresh);
+    // Drop cached live state + injection so the UI fully resets.
+    lastStateByChat.delete(chatId);
+    lastInjectionByChat.delete(chatId);
+    deepCacheByChat.delete(chatId);
+    _nameCtxCache.delete(chatId);
+    try {
+      await spindle.variables.chat.set(chatId, 'vellum_state_json', '');
+      await spindle.variables.chat.set(chatId, 'vellum_injection_json', '');
+    } catch (e) { /* best effort */ }
+    broadcastChronicle(chatId, fresh, userId);
+    spindle.sendToFrontend({ type: 'vellum_tracker_empty' }, userId);
+    done(true, {});
+    spindle.log.info('[vellum_tracker] cleared all data for chat ' + chatId);
+  } catch (err) {
+    spindle.log.warn('[vellum_tracker] clearAllData: ' + (err && err.message));
+    done(false, { reason: 'error' });
+  }
 }
 
 // Union-enrich: add anything from `extra` that `base` is missing; never remove.
@@ -1755,8 +2125,18 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!chatId) return;
       const ch = await loadChronicle(chatId);
       if (payload.charKey && ch.memJournal && ch.memJournal[payload.charKey]) {
-        if (typeof payload.index === 'number') ch.memJournal[payload.charKey].entries.splice(payload.index, 1);
-        if (!ch.memJournal[payload.charKey].entries.length || payload.all) delete ch.memJournal[payload.charKey];
+        const bucket = ch.memJournal[payload.charKey];
+        if (payload.all) {
+          delete ch.memJournal[payload.charKey];
+        } else if (typeof payload.id === 'string' && payload.id) {
+          // Stable-id delete (preferred): immune to sort/filter index drift.
+          const idx = bucket.entries.findIndex((e) => e.id === payload.id);
+          if (idx >= 0) bucket.entries.splice(idx, 1);
+        } else if (typeof payload.index === 'number') {
+          // Legacy fallback for entries saved before ids existed.
+          bucket.entries.splice(payload.index, 1);
+        }
+        if (ch.memJournal[payload.charKey] && !bucket.entries.length) delete ch.memJournal[payload.charKey];
         await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId);
       }
       return;
@@ -1853,6 +2233,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
         else { c.appeared = true; c.status = (to === 'mentioned') ? 'mentioned' : 'active'; if (to === 'present') c.lastTurn = ch.turns || c.lastTurn; }
         await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId);
       }
+      return;
+    }
+    if (payload?.type === 'import_history') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      await importHistory(chatId, payload.text || '', userId);
+      return;
+    }
+    if (payload?.type === 'clear_all') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      await clearAllData(chatId, userId);
       return;
     }
     if (payload?.type === 'rebuild_chronicle') {

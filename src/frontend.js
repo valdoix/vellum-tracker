@@ -120,7 +120,13 @@ function _setupImpl(ctx) {
     }
     const delM = e.target.closest('[data-mj-del]');
     if (delM) {
-      ctx.sendToBackend({ type: 'mem_delete', chatId: currentChatId, charKey: delM.getAttribute('data-mj-del'), index: parseInt(delM.getAttribute('data-i'), 10) });
+      ctx.sendToBackend({ type: 'mem_delete', chatId: currentChatId, charKey: delM.getAttribute('data-mj-del'), id: delM.getAttribute('data-id') || undefined, index: parseInt(delM.getAttribute('data-i'), 10) });
+      return;
+    }
+    const mjF = e.target.closest('[data-mj-filter]');
+    if (mjF) {
+      _mjFilter[mjF.getAttribute('data-mj-filter')] = mjF.getAttribute('data-w') || 'all';
+      if (castData) renderCast(castBody, castData);
       return;
     }
   });
@@ -158,6 +164,46 @@ function _setupImpl(ctx) {
       b.classList.add('on');
       tabPanel.setAttribute('data-view', b.getAttribute('data-vlc-filter'));
     });
+  });
+
+  // Import chat history: pick a file, read it, ship the raw text to the backend.
+  const importBtn = tabPanel.querySelector('[data-vlc-import]');
+  const importFile = tabPanel.querySelector('[data-vlc-import-file]');
+  if (importBtn && importFile) {
+    importBtn.addEventListener('click', () => { importFile.value = ''; importFile.click(); });
+    importFile.addEventListener('change', () => {
+      const f = importFile.files && importFile.files[0];
+      if (!f) return;
+      if (f.size > 8 * 1024 * 1024) { importBtn.textContent = '⚠ File too large (max 8MB)'; setTimeout(() => { importBtn.textContent = '⬆ Import chat history'; }, 4000); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        importBtn.disabled = true;
+        importBtn.textContent = '⏳ Importing…';
+        ctx.sendToBackend({ type: 'import_history', chatId: currentChatId, text: String(reader.result || '') });
+        clearTimeout(importBtn._t);
+        importBtn._t = setTimeout(() => { importBtn.disabled = false; importBtn.textContent = '⬆ Import chat history'; }, 180000);
+      };
+      reader.onerror = () => { importBtn.textContent = '⚠ Could not read file'; setTimeout(() => { importBtn.textContent = '⬆ Import chat history'; }, 4000); };
+      reader.readAsText(f);
+    });
+  }
+
+  // Clear all data: two-click confirm, then wipe the chronicle for this chat.
+  const clearAllBtn = tabPanel.querySelector('[data-vlc-clear-all]');
+  if (clearAllBtn) clearAllBtn.addEventListener('click', () => {
+    if (clearAllBtn._armed) {
+      clearAllBtn._armed = false;
+      clearTimeout(clearAllBtn._t);
+      clearAllBtn.disabled = true;
+      clearAllBtn.textContent = '⏳ Clearing…';
+      ctx.sendToBackend({ type: 'clear_all', chatId: currentChatId });
+      clearAllBtn._t2 = setTimeout(() => { clearAllBtn.disabled = false; clearAllBtn.textContent = '🗑 Clear all data'; }, 8000);
+    } else {
+      clearAllBtn._armed = true;
+      clearAllBtn.classList.add('armed');
+      clearAllBtn.textContent = '⚠ Click again to erase everything';
+      clearAllBtn._t = setTimeout(() => { clearAllBtn._armed = false; clearAllBtn.classList.remove('armed'); clearAllBtn.textContent = '🗑 Clear all data'; }, 4000);
+    }
   });
 
   function requestChronicle() { ctx.sendToBackend({ type: 'get_chronicle', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_injection', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_deep_recall', chatId: currentChatId }); }
@@ -253,6 +299,44 @@ function _setupImpl(ctx) {
     } else if (p?.type === 'vellum_perms') {
       applyPermBanner(tabPanel, p.granted || []);
       applyPermBanner(castRoot, p.granted || []);
+    } else if (p?.type === 'vellum_import_progress') {
+      const b = tabPanel.querySelector('[data-vlc-import]');
+      if (b) { const stage = { parsing: 'Reading', cast: 'Cast', memory: 'Memories', knowledge: 'Knowledge' }[p.stage] || 'Working'; const prog = (p.chunks && p.chunks > 1) ? (' ' + p.chunk + '/' + p.chunks) : ''; b.textContent = '⏳ ' + stage + prog + '…'; }
+    } else if (p?.type === 'vellum_import_done') {
+      const b = tabPanel.querySelector('[data-vlc-import]');
+      if (b) {
+        clearTimeout(b._t);
+        b.disabled = false;
+        let label = '⬆ Import chat history';
+        if (!p.ok) {
+          if (p.reason === 'no_active_chat') label = '⚠ No active chat';
+          else if (p.reason === 'no_chat_mutation_permission') label = '⚠ Grant "chat_mutation"';
+          else if (p.reason === 'empty') label = '⚠ No messages found in file';
+          else if (p.reason === 'busy') label = '⏳ Already importing…';
+          else label = '⚠ Import failed';
+        } else {
+          const bits = [];
+          if (p.foldedTurns) bits.push(p.foldedTurns + ' turns');
+          if (p.cast) bits.push('+' + p.cast + ' cast');
+          if (p.memories) bits.push('+' + p.memories + ' mem');
+          if (p.knowledge || p.secrets) bits.push('+' + (p.knowledge || 0) + 'k/' + (p.secrets || 0) + 's');
+          label = '✓ Imported ' + p.messages + ' msgs' + (bits.length ? ' (' + bits.join(', ') + ')' : '');
+          if (p.generated === false) label += ' — enable "generation" for full extraction';
+          requestChronicle();
+        }
+        b.textContent = label;
+        setTimeout(() => { b.textContent = '⬆ Import chat history'; }, 6000);
+      }
+    } else if (p?.type === 'vellum_cleared') {
+      const b = tabPanel.querySelector('[data-vlc-clear-all]');
+      if (b) {
+        clearTimeout(b._t2);
+        b.disabled = false;
+        b.classList.remove('armed');
+        b.textContent = p.ok ? '✓ Cleared' : '⚠ Clear failed';
+        setTimeout(() => { b.textContent = '🗑 Clear all data'; }, 3500);
+      }
+      if (p.ok) { chronicleData = null; castData = null; requestChronicle(); }
     } else if (p?.type === 'vellum_chronicle_rebuilt') {
       if (rebuildBtn) {
         clearTimeout(rebuildBtn._t);
@@ -764,6 +848,10 @@ function sortTracks(map) {
 // Last injection snapshot pushed from the backend (what VELLUM put in the prompt).
 let _lastInjection = null;
 let _deepOn = false;
+// Active category filters (persist across re-renders).
+let _knowFilter = 'all';   // all | knows | believes | suspects | wrong | unaware
+let _secFilter = 'all';    // all | minor | major | explosive
+const _mjFilter = {};      // per-character key -> weight filter (all|defining|significant|minor|trivial)
 // Module refs so render helpers can message the backend (set once in setup()).
 let _ctx = null;
 let _getChatId = () => null;
@@ -804,38 +892,58 @@ function injectionHtml(inj) {
 // Auto-summary chapter memories — newest first, with keyword chips.
 // Knowledge & Secrets render (dramatic-irony surface).
 function knowledgeHtml(ch) {
-  const kn = ch.knowledge || [];
-  const sec = ch.secrets || [];
-  if (!kn.length && !sec.length) {
+  const knAll = ch.knowledge || [];
+  const secAll = ch.secrets || [];
+  if (!knAll.length && !secAll.length) {
     return '<div class="vlc-empty">No knowledge mapped yet.<br><span style="opacity:.7;font-size:10px">Click \u201cScan knowledge\u201d to extract who knows, believes, suspects, or is ignorant of what \u2014 and what secrets are being kept.</span></div>';
   }
+  // Count helper for filter chips.
+  const countBy = (arr, field) => arr.reduce((acc, x) => { const v = x[field] || ''; acc[v] = (acc[v] || 0) + 1; return acc; }, {});
   let html = '';
-  if (kn.length) {
+  if (knAll.length) {
     const relCls = { knows: 'k-knows', believes: 'k-believes', suspects: 'k-suspects', wrong: 'k-wrong', unaware: 'k-unaware' };
     const relLbl = { knows: 'knows', believes: 'believes', suspects: 'suspects', wrong: 'WRONGLY believes', unaware: 'unaware of' };
+    const cnt = countBy(knAll, 'reliability');
+    const order = ['knows', 'believes', 'suspects', 'wrong', 'unaware'];
+    const chips = ['all'].concat(order.filter((r) => cnt[r])).map((r) =>
+      '<button class="vlc-fchip' + (_knowFilter === r ? ' on' : '') + '" data-know-filter="' + r + '">'
+      + (r === 'all' ? 'All' : escapeHtml(relLbl[r] || r)) + ' <span class="vlc-fchip-n">' + (r === 'all' ? knAll.length : cnt[r]) + '</span></button>'
+    ).join('');
+    const kn = _knowFilter === 'all' ? knAll : knAll.filter((k) => k.reliability === _knowFilter);
     html += '<div class="vlc-know-h">What characters know</div>';
-    html += kn.map((k, i) =>
-      '<div class="vlc-know" data-know-i="' + i + '">'
+    html += '<div class="vlc-fbar" data-know-fbar>' + chips + '</div>';
+    html += kn.length ? kn.map((k) => {
+      const i = knAll.indexOf(k);
+      return '<div class="vlc-know" data-know-i="' + i + '">'
       + '<span class="vlc-know-rel ' + (relCls[k.reliability] || 'k-knows') + '">' + escapeHtml(relLbl[k.reliability] || k.reliability) + '</span>'
       + '<span class="vlc-know-who">' + escapeHtml(k.who) + '</span>'
       + '<span class="vlc-know-fact">' + escapeHtml(k.fact) + (k.reliability === 'wrong' && k.truth === 'false' ? ' <em class="vlc-know-x">(untrue)</em>' : '') + '</span>'
       + '<button class="vlc-mini-del" data-know-del="knowledge" data-i="' + i + '" title="Delete">\u2715</button>'
-      + '</div>'
-    ).join('');
+      + '</div>';
+    }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(relLbl[_knowFilter] || _knowFilter) + '\u201d entries.</div>';
   }
-  if (sec.length) {
+  if (secAll.length) {
     const dCls = { minor: 's-minor', major: 's-major', explosive: 's-explosive' };
+    const cnt = countBy(secAll, 'danger');
+    const order = ['minor', 'major', 'explosive'];
+    const chips = ['all'].concat(order.filter((d) => cnt[d])).map((d) =>
+      '<button class="vlc-fchip' + (_secFilter === d ? ' on' : '') + '" data-sec-filter="' + d + '">'
+      + (d === 'all' ? 'All' : escapeHtml(d)) + ' <span class="vlc-fchip-n">' + (d === 'all' ? secAll.length : cnt[d]) + '</span></button>'
+    ).join('');
+    const sec = _secFilter === 'all' ? secAll : secAll.filter((x) => x.danger === _secFilter);
     html += '<div class="vlc-know-h" style="margin-top:12px">Secrets in play</div>';
-    html += sec.map((x, i) =>
-      '<div class="vlc-secret ' + (dCls[x.danger] || 's-major') + '" data-secret-i="' + i + '">'
+    html += '<div class="vlc-fbar" data-sec-fbar>' + chips + '</div>';
+    html += sec.length ? sec.map((x) => {
+      const i = secAll.indexOf(x);
+      return '<div class="vlc-secret ' + (dCls[x.danger] || 's-major') + '" data-secret-i="' + i + '">'
       + '<div class="vlc-secret-top"><span class="vlc-secret-keeper">' + escapeHtml(x.keeper) + '</span>'
       + '<span class="vlc-secret-arrow">hides from</span><span class="vlc-secret-from">' + escapeHtml(x.from || 'others') + '</span>'
       + '<span class="vlc-secret-danger">' + escapeHtml(x.danger) + '</span>'
       + '<button class="vlc-mini-del" data-know-del="secret" data-i="' + i + '" title="Delete">\u2715</button></div>'
       + '<div class="vlc-secret-body">' + escapeHtml(x.secret) + '</div>'
       + (x.exposure ? '<div class="vlc-secret-exp">may surface: ' + escapeHtml(x.exposure) + '</div>' : '')
-      + '</div>'
-    ).join('');
+      + '</div>';
+    }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_secFilter) + '\u201d secrets.</div>';
   }
   return html;
 }
@@ -855,17 +963,27 @@ function memJournalHtml(ch) {
   });
   const wCls = { trivial: 'w-trivial', minor: 'w-minor', significant: 'w-sig', defining: 'w-def' };
   const sCls = { positive: 's-pos', negative: 's-neg', neutral: 's-neu', complex: 's-cx' };
+  const W_ORDER = ['defining', 'significant', 'minor', 'trivial'];
   return keys.map((k) => {
     const c = mj[k];
-    const ents = (c.entries || []).slice().sort((a, b) => (b.turn || 0) - (a.turn || 0));
-    const rows = ents.map((e, i) =>
-      '<div class="vlc-mj-row ' + (sCls[e.sentiment] || 's-neu') + '">'
+    const all = (c.entries || []).slice().sort((a, b) => (b.turn || 0) - (a.turn || 0));
+    const cnt = all.reduce((acc, e) => { const w = e.weight || 'minor'; acc[w] = (acc[w] || 0) + 1; return acc; }, {});
+    const active = _mjFilter[k] || 'all';
+    const chips = ['all'].concat(W_ORDER.filter((w) => cnt[w])).map((w) =>
+      '<button class="vlc-fchip' + (active === w ? ' on' : '') + '" data-mj-filter="' + escapeHtml(k) + '" data-w="' + w + '">'
+      + (w === 'all' ? 'All' : escapeHtml(w)) + ' <span class="vlc-fchip-n">' + (w === 'all' ? all.length : cnt[w]) + '</span></button>'
+    ).join('');
+    const ents = active === 'all' ? all : all.filter((e) => (e.weight || 'minor') === active);
+    const rows = ents.length ? ents.map((e) => {
+      const i = all.indexOf(e);
+      return '<div class="vlc-mj-row ' + (sCls[e.sentiment] || 's-neu') + '">'
       + '<span class="vlc-mj-w ' + (wCls[e.weight] || 'w-minor') + '">' + escapeHtml(e.weight) + '</span>'
       + '<span class="vlc-mj-t">' + escapeHtml(e.memory) + (e.about ? ' <em class="vlc-mj-about">\u2014 ' + escapeHtml(e.about) + '</em>' : '') + '</span>'
-      + '<button class="vlc-mini-del" data-mj-del="' + escapeHtml(k) + '" data-i="' + i + '" title="Delete">\u2715</button>'
-      + '</div>'
-    ).join('');
-    return '<details class="vlc-mj" open><summary class="vlc-mj-sum"><span class="vlc-mj-name">' + escapeHtml(c.name || k) + '</span><span class="vlc-h-n">' + ents.length + '</span></summary><div class="vlc-mj-body">' + rows + '</div></details>';
+      + '<button class="vlc-mini-del" data-mj-del="' + escapeHtml(k) + '" data-id="' + escapeHtml(e.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button>'
+      + '</div>';
+    }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(active) + '\u201d memories.</div>';
+    const bar = (W_ORDER.filter((w) => cnt[w]).length > 1) ? ('<div class="vlc-fbar" data-mj-fbar>' + chips + '</div>') : '';
+    return '<details class="vlc-mj" open><summary class="vlc-mj-sum"><span class="vlc-mj-name">' + escapeHtml(c.name || k) + '</span><span class="vlc-h-n">' + all.length + '</span></summary><div class="vlc-mj-body">' + bar + rows + '</div></details>';
   }).join('');
 }
 
@@ -1135,6 +1253,14 @@ function wireChronicleControls(host) {
       renderChronicle();
     });
   });
+  // Knowledge reliability filter chips.
+  host.querySelectorAll('[data-know-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => { _knowFilter = btn.getAttribute('data-know-filter') || 'all'; renderChronicle(); });
+  });
+  // Secret danger filter chips.
+  host.querySelectorAll('[data-sec-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => { _secFilter = btn.getAttribute('data-sec-filter') || 'all'; renderChronicle(); });
+  });
 }
 // Group every dated entry (arc beats, thread beats, events, shifts) by story day.
 function groupByDate(ch) {
@@ -1199,7 +1325,12 @@ const CHRONICLE_HTML =
   + '</div>'
   + '<div class="vlc-actions vlc-actions-2">'
   + '<button class="vlc-open" data-vlc-open>✦ Open live ledger window</button>'
-  + '</div>';
+  + '</div>'
+  + '<div class="vlc-actions vlc-actions-2">'
+  + '<button class="vlc-import" data-vlc-import>⬆ Import chat history</button>'
+  + '<button class="vlc-clear-all" data-vlc-clear-all>🗑 Clear all data</button>'
+  + '</div>'
+  + '<input type="file" data-vlc-import-file accept=".json,.jsonl,.txt,.md,.log,application/json,text/plain" style="display:none">';
 
 const CAST_ICON_SVG = '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="7" cy="6.5" r="3" stroke="#cda84e" stroke-width="1.4"/><path d="M2 17c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="#cda84e" stroke-width="1.4" stroke-linecap="round"/><circle cx="14" cy="7" r="2.3" stroke="#cda84e" stroke-width="1.2" opacity=".7"/><path d="M12.5 16.5c0-2 1.4-3.7 3.3-4.1" stroke="#cda84e" stroke-width="1.2" stroke-linecap="round" opacity=".7"/></svg>';
 
@@ -1724,6 +1855,22 @@ const VELLUM_CSS = [
   ".vlc-cf-cancel{color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.12);border:1px solid rgba(var(--vacc,205,168,78),.3)}",
   ".vlc-perm{margin:0 16px 10px;padding:9px 12px;background:rgba(201,138,138,.12);border:1px solid rgba(201,138,138,.4);border-radius:8px;font-size:10.5px;line-height:1.5;color:#e0c2c2}",
   ".vlc-perm b{color:#f0d8a8}",
+  /* CATEGORY FILTER CHIPS (knowledge / secrets / memory journal) */
+  ".vlc-fbar{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0 9px}",
+  ".vlc-fchip{font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.08);border:1px solid rgba(var(--vacc,205,168,78),.25);border-radius:20px;padding:5px 9px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:background .15s,border-color .15s}",
+  ".vlc-fchip:hover{background:rgba(var(--vacc,205,168,78),.16)}",
+  ".vlc-fchip.on{color:#1a1610;background:var(--vsolid,#cda84e);border-color:var(--vsolid,#cda84e)}",
+  ".vlc-fchip-n{font-size:8px;opacity:.7;font-weight:700}",
+  ".vlc-fchip.on .vlc-fchip-n{opacity:.85}",
+  /* IMPORT + CLEAR ALL action buttons */
+  ".vlc-import,.vlc-clear-all{flex:1;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;border-radius:8px;padding:9px;cursor:pointer;transition:background .15s,border-color .15s}",
+  ".vlc-import{color:var(--vsolid2,#8fa67e);background:rgba(var(--vsec,143,166,126),.12);border:1px solid rgba(var(--vsec,143,166,126),.35)}",
+  ".vlc-import:hover{background:rgba(var(--vsec,143,166,126),.22)}",
+  ".vlc-import:disabled{opacity:.6;cursor:default}",
+  ".vlc-clear-all{color:#c98a8a;background:rgba(201,138,138,.1);border:1px solid rgba(201,138,138,.3)}",
+  ".vlc-clear-all:hover{background:rgba(201,138,138,.2)}",
+  ".vlc-clear-all.armed{color:#1a1610;background:#c96a6a;border-color:#c96a6a}",
+  ".vlc-clear-all:disabled{opacity:.6;cursor:default}",
   /* THEME PALETTES */
   ".vlc-root.vlt-gilt{--vacc:205,168,78;--vsolid:#cda84e;--vsec:143,166,126;--vsolid2:#8fa67e;color:#d8c9a8}",
   ".vlm-window.vlt-gilt{--vacc:205,168,78;--vsolid:#cda84e;--vsec:143,166,126;--vsolid2:#8fa67e;color:#d8c9a8;background:radial-gradient(130% 90% at 0% 0%,rgba(205,168,78,.12),transparent 55%),linear-gradient(165deg,rgba(19,17,13,.985),rgba(28,24,19,.975))}",
