@@ -1736,7 +1736,7 @@ const VELLUM_CSS = [
   ".vlc-root.vlt-mono{--vacc:170,180,195;--vsolid:#c4ccd8;--vsec:150,160,175;--vsolid2:#aab4c0;color:#cdd2da}",
   ".vlm-window.vlt-mono{--vacc:170,180,195;--vsolid:#c4ccd8;--vsec:150,160,175;--vsolid2:#aab4c0;color:#cdd2da;background:radial-gradient(130% 90% at 0% 0%,rgba(170,180,195,.1),transparent 55%),linear-gradient(165deg,rgba(18,19,22,.985),rgba(26,28,32,.975))}",
   ".vlc-root.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8}",
-  ".vlm-window.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8;background:radial-gradient(130% 90% at 0% 0%,rgba(225,140,80,.12),transparent 55%),linear-gradient(165deg,rgba(22,14,10,.985),rgba(30,20,14,.975))}"
+  ".vlm-window.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8;background:radial-gradient(130% 90% at 0% 0%,rgba(225,140,80,.12),transparent 55%),linear-gradient(165deg,rgba(22,14,10,.985),rgba(30,20,14,.975))}",
   ".vlc-lore-bar{display:flex;gap:6px;margin-bottom:10px}",
   ".vlc-know-h{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(205,168,78,.7);margin:4px 0 6px}",
   ".vlc-know{display:flex;gap:8px;align-items:baseline;padding:6px 0;border-bottom:1px solid rgba(205,168,78,.07);font-size:10.5px;line-height:1.45}",
