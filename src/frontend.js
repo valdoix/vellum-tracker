@@ -324,9 +324,21 @@ function _setupImpl(ctx) {
     slab: "'Roboto Slab', Georgia, serif",
   };
   let _theme = { accent: null, bg: null, text: null, font: '' };
+  // A dedicated <style> element carries the text/font overrides at high
+  // specificity with !important, because per-element skin rules (e.g. parchment
+  // sets its own color, and .vlm-body/titles set their own font-family) would
+  // otherwise beat an inline style on the container.
+  let _themeStyleEl = null;
+  function ensureThemeStyle() {
+    if (_themeStyleEl && _themeStyleEl.isConnected) return _themeStyleEl;
+    _themeStyleEl = document.createElement('style');
+    _themeStyleEl.id = 'vellum-custom-theme';
+    document.head.appendChild(_themeStyleEl);
+    return _themeStyleEl;
+  }
   function applyTheme2() {
     themedEls().forEach((el) => {
-      // accent
+      // accent (CSS vars cascade fine via inline style)
       if (_theme.accent && hexToRgb(_theme.accent)) {
         const rgb = hexToRgb(_theme.accent), solid = shadeHex(_theme.accent, 0.18);
         el.style.setProperty('--vacc', rgb);
@@ -334,12 +346,23 @@ function _setupImpl(ctx) {
         el.style.setProperty('--vsec', rgb);
         el.style.setProperty('--vsolid2', solid);
       } else { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); }
-      // text color
-      if (_theme.text && hexToRgb(_theme.text)) el.style.color = _theme.text; else el.style.removeProperty('color');
-      // font
-      const stack = FONT_STACKS[_theme.font] || '';
-      if (stack) el.style.fontFamily = stack; else el.style.removeProperty('font-family');
     });
+    // text color + font need !important descendant rules to override skin/base.
+    const rules = [];
+    const scopes = '.vlm-window, .vlc-root';
+    if (_theme.text && hexToRgb(_theme.text)) {
+      // recolor body text and most text elements, but leave accent-colored
+      // headers/labels alone so the accent still reads.
+      rules.push(scopes + ', .vlm-window .vlm-body, .vlc-root .vlc-body, '
+        + '.vlm-chip-v, .vlm-actor-n, .vlm-doing, .vlm-attr-v, .vlm-mind-t, .vlm-list li, .vlm-title-lg'
+        + '{color:' + _theme.text + ' !important}');
+    }
+    const stack = FONT_STACKS[_theme.font] || '';
+    if (stack) {
+      // force the font across the window/tabs and every descendant.
+      rules.push(scopes + ', .vlm-window *, .vlc-root *{font-family:' + stack + ' !important}');
+    }
+    ensureThemeStyle().textContent = rules.join('\n');
     // background only applies to the floating window (tabs live in the drawer)
     if (_theme.bg && hexToRgb(_theme.bg)) {
       const acc = _theme.accent && hexToRgb(_theme.accent) ? hexToRgb(_theme.accent) : '205,168,78';
@@ -349,7 +372,8 @@ function _setupImpl(ctx) {
   }
   function resetTheme2() {
     _theme = { accent: null, bg: null, text: null, font: '' };
-    themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); el.style.removeProperty('color'); el.style.removeProperty('font-family'); });
+    themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); });
+    if (_themeStyleEl) _themeStyleEl.textContent = '';
     win.style.removeProperty('background');
     try { localStorage.removeItem('vellum_theme_custom'); localStorage.removeItem('vellum_color'); } catch (e) {}
   }
