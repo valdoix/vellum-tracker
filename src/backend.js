@@ -427,9 +427,42 @@ function upsertTrack(map, name, status, turn, day) {
   t.lastTurn = turn; t.lastDay = day;
 }
 
+// Tokenize a log line for similarity (lowercase words >=3 chars, drop a few
+// filler words). Self-contained so it works regardless of declaration order.
+const _LOG_FILLER = new Set(['the', 'and', 'for', 'with', 'now', 'into', 'its', 'a', 'an', 'of', 'to', 'in', 'on', 'as', 'at', 'is', 'are', 'was', 'were', 'has', 'have', 'her', 'his', 'their', 'they', 'them']);
+function logSimTokens(t) {
+  return (String(t || '').toLowerCase().match(/[a-z0-9]{3,}/g) || []).filter((w) => !_LOG_FILLER.has(w));
+}
+// Containment similarity vs the smaller set — robust when one line elaborates
+// the other ("staff moving" vs "staff laying breakfast").
+function logSim(aTokens, bTokens) {
+  const A = new Set(aTokens), B = new Set(bTokens);
+  if (!A.size || !B.size) return 0;
+  let inter = 0; A.forEach((x) => { if (B.has(x)) inter++; });
+  return inter / Math.min(A.size, B.size);
+}
+
 function pushLog(arr, entry, cap) {
-  const last = arr[arr.length - 1];
-  if (last && last.text === entry.text) return;
+  // Fuzzy same-day dedup: a recurring ambient line ("Kitchen staff laying
+  // breakfast; bread rising; fire crackling") gets re-emitted nearly verbatim
+  // every turn. Skip a new entry that's highly similar to a recent one on the
+  // SAME story day; if the new wording is longer/richer, replace the old one so
+  // the most complete phrasing is kept (no duplicate rows pile up).
+  const newTokens = logSimTokens(entry.text);
+  const scanFrom = Math.max(0, arr.length - 8); // only check the recent tail
+  for (let i = arr.length - 1; i >= scanFrom; i--) {
+    const e = arr[i];
+    if (!e || e.day !== entry.day) continue;
+    if (e.text === entry.text) return; // exact dup
+    const sim = logSim(newTokens, logSimTokens(e.text));
+    if (sim >= 0.7) {
+      // near-duplicate on the same day — keep the longer (more informative) text
+      if ((entry.text || '').length > (e.text || '').length && !e.userEdited) {
+        e.text = entry.text; e.turn = entry.turn;
+      }
+      return;
+    }
+  }
   arr.push(entry);
   if (cap && arr.length > cap) arr.shift(); // cap falsy = unlimited
 }
@@ -649,6 +682,42 @@ function ensureIds(ch) {
   (ch.memories || []).forEach((m) => { if (m && !m.id) m.id = vid('m'); });
 }
 
+// Collapse same-day near-duplicate log entries already stored (events/shifts).
+// Cleans up history accumulated before fuzzy dedup existed, and catches dups
+// introduced via import/merge. Keeps the richest phrasing; never drops a
+// user-edited or user-added entry. Order-preserving. Returns count removed.
+function dedupeLogArray(arr) {
+  if (!Array.isArray(arr) || arr.length < 2) return 0;
+  const kept = [];
+  const keptTokens = [];
+  let removed = 0;
+  for (const e of arr) {
+    if (!e) continue;
+    const toks = logSimTokens(e.text);
+    let dupOf = -1;
+    for (let i = kept.length - 1; i >= 0 && i >= kept.length - 12; i--) {
+      if (kept[i].day !== e.day) continue;
+      if (kept[i].text === e.text || logSim(toks, keptTokens[i]) >= 0.7) { dupOf = i; break; }
+    }
+    if (dupOf >= 0) {
+      const prev = kept[dupOf];
+      // user content always wins and is never replaced; otherwise keep longer text
+      if (e.userEdited || e.userAdded) { kept[dupOf] = e; keptTokens[dupOf] = toks; }
+      else if (!prev.userEdited && !prev.userAdded && (e.text || '').length > (prev.text || '').length) { kept[dupOf] = e; keptTokens[dupOf] = toks; }
+      removed++;
+    } else {
+      kept.push(e); keptTokens.push(toks);
+    }
+  }
+  if (removed) { arr.length = 0; arr.push(...kept); }
+  return removed;
+}
+function dedupeLogs(ch) {
+  const r = dedupeLogArray(ch.events) + dedupeLogArray(ch.shifts);
+  if (r) spindle.log.info('[vellum_tracker] collapsed ' + r + ' duplicate log entries');
+  return r;
+}
+
 // No structural prune: the chronicle now lives on the per-extension virtual
 // disk (spindle.storage), which has no 90KB chat-var ceiling, so arcs/threads/
 // events/etc. are unbounded. Kept as a no-op hook for clarity.
@@ -704,6 +773,7 @@ async function loadChronicle(chatId) {
 async function saveChronicle(chatId, ch) {
   ch.updatedAt = Date.now();
   ensureIds(ch);
+  dedupeLogs(ch);
   chronicleByChat.set(chatId, ch);
   // Persist to the per-extension virtual disk (spindle.storage) — file-backed,
   // free-tier, NO 90KB chat-var ceiling, so the chronicle is effectively
