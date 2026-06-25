@@ -469,6 +469,51 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Reusable inline edit/add form, styled like the cast/chapter-memory editors.
+// `fields`: [{ key, label, type:'text'|'textarea'|'select', value, placeholder,
+// options:[{value,label}] }]. Calls onSave(values) with a {key:value} map.
+// Renders as a centered overlay panel within the drawer; Esc / Cancel closes.
+function vlcFormModal(title, fields, onSave) {
+  const prev = document.querySelector('.vlc-formmodal');
+  if (prev) prev.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'vlc-formmodal';
+  const rows = fields.map((f) => {
+    const id = 'ff_' + f.key;
+    if (f.type === 'textarea') {
+      return '<label class="vlc-ff-l">' + escapeHtml(f.label) + '<textarea class="vlc-cf-in vlc-cf-ta" data-ff="' + f.key + '" placeholder="' + escapeHtml(f.placeholder || '') + '">' + escapeHtml(f.value || '') + '</textarea></label>';
+    }
+    if (f.type === 'select') {
+      const opts = (f.options || []).map((o) => '<option value="' + escapeHtml(o.value) + '"' + (String(o.value) === String(f.value) ? ' selected' : '') + '>' + escapeHtml(o.label) + '</option>').join('');
+      return '<label class="vlc-ff-l">' + escapeHtml(f.label) + '<select class="vlc-cf-in vlc-cf-sel" data-ff="' + f.key + '">' + opts + '</select></label>';
+    }
+    return '<label class="vlc-ff-l">' + escapeHtml(f.label) + '<input class="vlc-cf-in" data-ff="' + f.key + '" placeholder="' + escapeHtml(f.placeholder || '') + '" value="' + escapeHtml(f.value || '') + '"></label>';
+  }).join('');
+  overlay.innerHTML = '<div class="vlc-formmodal-panel"><div class="vlc-formmodal-h">' + escapeHtml(title) + '</div>'
+    + '<div class="vlc-formmodal-body">' + rows + '</div>'
+    + '<div class="vlc-cf-btns"><button class="vlc-cf-save" data-ff-save>Save</button><button class="vlc-cf-cancel" data-ff-cancel>Cancel</button></div></div>';
+  const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('[data-ff-cancel]').addEventListener('click', close);
+  overlay.querySelector('[data-ff-save]').addEventListener('click', () => {
+    const values = {};
+    overlay.querySelectorAll('[data-ff]').forEach((el) => { values[el.getAttribute('data-ff')] = el.value; });
+    close();
+    onSave(values);
+  });
+  document.body.appendChild(overlay);
+  const first = overlay.querySelector('[data-ff]');
+  if (first) first.focus();
+}
+
+const REL_OPTS = [{ value: 'knows', label: 'knows' }, { value: 'believes', label: 'believes' }, { value: 'suspects', label: 'suspects' }, { value: 'wrong', label: 'wrongly believes' }, { value: 'unaware', label: 'unaware of' }];
+const TRUTH_OPTS = [{ value: 'unknown', label: 'unknown' }, { value: 'true', label: 'true' }, { value: 'false', label: 'false' }];
+const DANGER_OPTS = [{ value: 'minor', label: 'minor' }, { value: 'major', label: 'major' }, { value: 'explosive', label: 'explosive' }];
+const WEIGHT_OPTS = [{ value: 'trivial', label: 'trivial' }, { value: 'minor', label: 'minor' }, { value: 'significant', label: 'significant' }, { value: 'defining', label: 'defining' }];
+const SENT_OPTS = [{ value: 'neutral', label: 'neutral' }, { value: 'positive', label: 'positive' }, { value: 'negative', label: 'negative' }, { value: 'complex', label: 'complex' }];
+
 function splitItems(raw) {
   if (!raw) return [];
   return String(raw)
@@ -1290,45 +1335,117 @@ function wireChronicleControls(host) {
     btn.addEventListener('click', () => { _secFilter = btn.getAttribute('data-sec-filter') || 'all'; renderChronicle(); });
   });
 
-  // ---- manual CRUD across all chronicle types (delegated; prompt-driven) ----
+  // ---- manual CRUD across all chronicle types (delegated; inline-form driven) ----
   if (!host._vlcCrudWired) {
     host._vlcCrudWired = true;
     const send = (msg) => { if (_ctx) _ctx.sendToBackend(Object.assign({ chatId: _getChatId() }, msg)); };
     const A = (el, n) => el.getAttribute(n) || '';
+    const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : undefined; };
     host.addEventListener('click', (e) => {
       const t = e.target;
       // Arcs / threads
       let b = t.closest('[data-track-add]');
-      if (b) { const g = A(b, 'data-group'); const title = prompt((g === 'thread' ? 'New plot thread' : 'New character arc') + ' — title:'); if (title && title.trim()) { const status = prompt('Current status / beat (optional):') || ''; send({ type: 'track_add', group: g, title: title.trim(), status }); } return; }
+      if (b) { const g = A(b, 'data-group'); const noun = g === 'thread' ? 'Plot Thread' : 'Character Arc';
+        vlcFormModal('New ' + noun, [
+          { key: 'title', label: 'Title', type: 'text', placeholder: noun + ' title' },
+          { key: 'status', label: 'Current status / beat', type: 'textarea', placeholder: 'What\u2019s happening with it now (optional)' },
+        ], (v) => { if (v.title && v.title.trim()) send({ type: 'track_add', group: g, title: v.title.trim(), status: v.status || '' }); });
+        return; }
       b = t.closest('[data-track-edit]');
-      if (b) { const title = prompt('Edit title:', A(b, 'data-title')); if (title === null) return; const status = prompt('Edit current status / beat:', A(b, 'data-status')); send({ type: 'track_edit', group: A(b, 'data-group'), id: A(b, 'data-id'), title: title.trim(), status: status == null ? undefined : status }); return; }
+      if (b) { e.preventDefault(); e.stopPropagation(); const g = A(b, 'data-group');
+        vlcFormModal('Edit ' + (g === 'thread' ? 'Thread' : 'Arc'), [
+          { key: 'title', label: 'Title', type: 'text', value: A(b, 'data-title') },
+          { key: 'status', label: 'Current status / beat', type: 'textarea', value: A(b, 'data-status') },
+        ], (v) => send({ type: 'track_edit', group: g, id: A(b, 'data-id'), title: (v.title || '').trim(), status: v.status }));
+        return; }
       b = t.closest('[data-track-del]');
       if (b) { if (confirm('Delete this ' + (A(b, 'data-group') === 'thread' ? 'thread' : 'arc') + '?')) send({ type: 'track_delete', group: A(b, 'data-group'), id: A(b, 'data-id') }); return; }
       // Events / shifts
       b = t.closest('[data-log-add]');
-      if (b) { const kind = A(b, 'data-kind'); const text = prompt('New ' + kind + ' text:'); if (text && text.trim()) { const day = parseInt(prompt('Story day (number, optional):') || '', 10); send({ type: 'log_add', kind, text: text.trim(), day: Number.isFinite(day) ? day : undefined }); } return; }
+      if (b) { const kind = A(b, 'data-kind'); const noun = kind === 'shift' ? 'Narrative Shift' : 'Event';
+        vlcFormModal('New ' + noun, [
+          { key: 'text', label: noun, type: 'textarea', placeholder: kind === 'shift' ? 'e.g. Cersei-Daeron: warming' : 'What happened off-screen / in parallel' },
+          { key: 'day', label: 'Story day (number)', type: 'text', placeholder: 'optional' },
+        ], (v) => { if (v.text && v.text.trim()) send({ type: 'log_add', kind, text: v.text.trim(), day: num(v.day) }); });
+        return; }
       b = t.closest('[data-log-edit]');
-      if (b) { e.preventDefault(); e.stopPropagation(); const text = prompt('Edit text:', A(b, 'data-text')); if (text === null) return; const dayStr = prompt('Story day (number, blank = keep):', A(b, 'data-day')); const day = parseInt(dayStr || '', 10); send({ type: 'log_edit', kind: A(b, 'data-kind'), id: A(b, 'data-id'), text: text.trim(), day: Number.isFinite(day) ? day : undefined }); return; }
+      if (b) { e.preventDefault(); e.stopPropagation(); const kind = A(b, 'data-kind');
+        vlcFormModal('Edit ' + (kind === 'shift' ? 'Shift' : 'Event'), [
+          { key: 'text', label: 'Text', type: 'textarea', value: A(b, 'data-text') },
+          { key: 'day', label: 'Story day (number)', type: 'text', value: A(b, 'data-day') },
+        ], (v) => send({ type: 'log_edit', kind, id: A(b, 'data-id'), text: (v.text || '').trim(), day: num(v.day) }));
+        return; }
       b = t.closest('[data-log-del]');
       if (b) { e.preventDefault(); e.stopPropagation(); if (confirm('Delete this entry?')) send({ type: 'log_delete', kind: A(b, 'data-kind'), id: A(b, 'data-id') }); return; }
       // Knowledge
       b = t.closest('[data-knowledge-add]');
-      if (b) { const who = prompt('Who holds this knowledge? (character name)'); if (!who || !who.trim()) return; const fact = prompt('What do they know/believe? (the fact)'); if (!fact || !fact.trim()) return; const reliability = (prompt('Reliability: knows / believes / suspects / wrong / unaware', 'knows') || 'knows').trim(); send({ type: 'knowledge_add', entry: { who: who.trim(), fact: fact.trim(), reliability } }); return; }
+      if (b) {
+        vlcFormModal('New Knowledge', [
+          { key: 'who', label: 'Who holds it', type: 'text', placeholder: 'character name' },
+          { key: 'fact', label: 'What they know / believe', type: 'textarea', placeholder: 'the fact' },
+          { key: 'reliability', label: 'Reliability', type: 'select', value: 'knows', options: REL_OPTS },
+          { key: 'truth', label: 'Actual truth', type: 'select', value: 'unknown', options: TRUTH_OPTS },
+          { key: 'source', label: 'Source', type: 'text', placeholder: 'how they got it (optional)' },
+        ], (v) => { if (v.who && v.who.trim() && v.fact && v.fact.trim()) send({ type: 'knowledge_add', entry: v }); });
+        return; }
       b = t.closest('[data-know-edit]');
-      if (b) { const who = prompt('Who:', A(b, 'data-who')); if (who === null) return; const fact = prompt('Fact:', A(b, 'data-fact')); if (fact === null) return; const reliability = (prompt('Reliability: knows / believes / suspects / wrong / unaware', A(b, 'data-reliability')) || A(b, 'data-reliability')).trim(); send({ type: 'knowledge_edit', id: A(b, 'data-id'), entry: { who: who.trim(), fact: fact.trim(), reliability } }); return; }
+      if (b) {
+        vlcFormModal('Edit Knowledge', [
+          { key: 'who', label: 'Who holds it', type: 'text', value: A(b, 'data-who') },
+          { key: 'fact', label: 'Fact', type: 'textarea', value: A(b, 'data-fact') },
+          { key: 'reliability', label: 'Reliability', type: 'select', value: A(b, 'data-reliability') || 'knows', options: REL_OPTS },
+          { key: 'truth', label: 'Actual truth', type: 'select', value: A(b, 'data-truth') || 'unknown', options: TRUTH_OPTS },
+          { key: 'source', label: 'Source', type: 'text', value: A(b, 'data-source') },
+        ], (v) => send({ type: 'knowledge_edit', id: A(b, 'data-id'), entry: v }));
+        return; }
       // Secrets
       b = t.closest('[data-secret-add]');
-      if (b) { const secret = prompt('The concealed thing (the secret):'); if (!secret || !secret.trim()) return; const keeper = prompt('Who keeps it? (character name)'); if (!keeper || !keeper.trim()) return; const from = prompt('Hidden from whom? (optional)') || ''; const danger = (prompt('Danger: minor / major / explosive', 'major') || 'major').trim(); send({ type: 'secret_add', entry: { secret: secret.trim(), keeper: keeper.trim(), from, danger } }); return; }
+      if (b) {
+        vlcFormModal('New Secret', [
+          { key: 'secret', label: 'The concealed thing', type: 'textarea', placeholder: 'the secret' },
+          { key: 'keeper', label: 'Who keeps it', type: 'text', placeholder: 'character name' },
+          { key: 'from', label: 'Hidden from', type: 'text', placeholder: 'who must not find out (optional)' },
+          { key: 'exposure', label: 'How it might surface', type: 'text', placeholder: 'optional' },
+          { key: 'danger', label: 'Danger', type: 'select', value: 'major', options: DANGER_OPTS },
+        ], (v) => { if (v.secret && v.secret.trim() && v.keeper && v.keeper.trim()) send({ type: 'secret_add', entry: v }); });
+        return; }
       b = t.closest('[data-secret-edit]');
-      if (b) { const secret = prompt('Secret:', A(b, 'data-secret')); if (secret === null) return; const keeper = prompt('Keeper:', A(b, 'data-keeper')); if (keeper === null) return; const from = prompt('Hidden from:', A(b, 'data-from')); const danger = (prompt('Danger: minor / major / explosive', A(b, 'data-danger')) || A(b, 'data-danger')).trim(); send({ type: 'secret_edit', id: A(b, 'data-id'), entry: { secret: secret.trim(), keeper: keeper.trim(), from: from == null ? undefined : from, danger } }); return; }
+      if (b) {
+        vlcFormModal('Edit Secret', [
+          { key: 'secret', label: 'Secret', type: 'textarea', value: A(b, 'data-secret') },
+          { key: 'keeper', label: 'Keeper', type: 'text', value: A(b, 'data-keeper') },
+          { key: 'from', label: 'Hidden from', type: 'text', value: A(b, 'data-from') },
+          { key: 'exposure', label: 'How it might surface', type: 'text', value: A(b, 'data-exposure') },
+          { key: 'danger', label: 'Danger', type: 'select', value: A(b, 'data-danger') || 'major', options: DANGER_OPTS },
+        ], (v) => send({ type: 'secret_edit', id: A(b, 'data-id'), entry: v }));
+        return; }
       // Memory journal
       b = t.closest('[data-mj-add]');
-      if (b) { const who = A(b, 'data-who'); const memory = prompt('New memory for ' + who + ':'); if (!memory || !memory.trim()) return; const weight = (prompt('Weight: trivial / minor / significant / defining', 'minor') || 'minor').trim(); send({ type: 'mem_add', entry: { who, memory: memory.trim(), weight } }); return; }
+      if (b) { const who = A(b, 'data-who');
+        vlcFormModal('New Memory \u2014 ' + who, [
+          { key: 'memory', label: 'Memory', type: 'textarea', placeholder: 'what ' + who + ' remembers' },
+          { key: 'about', label: 'About whom', type: 'text', placeholder: 'who/what it concerns (optional)' },
+          { key: 'weight', label: 'Weight', type: 'select', value: 'minor', options: WEIGHT_OPTS },
+          { key: 'sentiment', label: 'Sentiment', type: 'select', value: 'neutral', options: SENT_OPTS },
+        ], (v) => { if (v.memory && v.memory.trim()) send({ type: 'mem_add', entry: Object.assign({ who }, v) }); });
+        return; }
       b = t.closest('[data-mj-edit]');
-      if (b) { e.preventDefault(); e.stopPropagation(); const memory = prompt('Edit memory:', A(b, 'data-memory')); if (memory === null) return; const weight = (prompt('Weight: trivial / minor / significant / defining', A(b, 'data-weight')) || A(b, 'data-weight')).trim(); send({ type: 'mem_edit', charKey: A(b, 'data-key'), id: A(b, 'data-id'), entry: { memory: memory.trim(), weight } }); return; }
+      if (b) { e.preventDefault(); e.stopPropagation();
+        vlcFormModal('Edit Memory', [
+          { key: 'memory', label: 'Memory', type: 'textarea', value: A(b, 'data-memory') },
+          { key: 'about', label: 'About whom', type: 'text', value: A(b, 'data-about') },
+          { key: 'weight', label: 'Weight', type: 'select', value: A(b, 'data-weight') || 'minor', options: WEIGHT_OPTS },
+          { key: 'sentiment', label: 'Sentiment', type: 'select', value: A(b, 'data-sentiment') || 'neutral', options: SENT_OPTS },
+        ], (v) => send({ type: 'mem_edit', charKey: A(b, 'data-key'), id: A(b, 'data-id'), entry: v }));
+        return; }
       // Chapter memory add
       b = t.closest('[data-memory-add]');
-      if (b) { const text = prompt('New chapter memory (summary text):'); if (!text || !text.trim()) return; const kw = prompt('Keywords (comma-separated, optional):') || ''; send({ type: 'memory_add', entry: { text: text.trim(), keywords: kw } }); return; }
+      if (b) {
+        vlcFormModal('New Chapter Memory', [
+          { key: 'text', label: 'Summary', type: 'textarea', placeholder: 'a dense recap of this chapter' },
+          { key: 'keywords', label: 'Keywords', type: 'text', placeholder: 'comma-separated (optional)' },
+        ], (v) => { if (v.text && v.text.trim()) send({ type: 'memory_add', entry: v }); });
+        return; }
     });
   }
 }
@@ -1857,6 +1974,14 @@ const VELLUM_CSS = [
   ".vlc-day-sub .vlc-list li b{color:#e3d6bb;font-weight:600}",
   /* section breaks between chronicle groups */
   ".vlc-break{height:1px;margin:18px 2px;background:linear-gradient(to right,transparent,rgba(var(--vacc,205,168,78),.4),transparent)}",
+  /* inline edit/add form modal */
+  ".vlc-formmodal{position:fixed;inset:0;z-index:9999;display:grid;place-items:center;background:rgba(0,0,0,.55);backdrop-filter:blur(2px);padding:18px}",
+  ".vlc-formmodal-panel{width:min(420px,94vw);max-height:88vh;overflow:auto;background:linear-gradient(165deg,rgba(28,22,15,.99),rgba(22,17,12,.99));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:12px;padding:16px;box-shadow:0 18px 50px rgba(0,0,0,.6)}",
+  ".vlc-formmodal-h{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--vsolid,#cda84e);margin-bottom:12px}",
+  ".vlc-formmodal-body{display:flex;flex-direction:column;gap:9px}",
+  ".vlc-ff-l{display:flex;flex-direction:column;gap:4px;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.5px;text-transform:uppercase;color:rgba(230,217,189,.7)}",
+  ".vlc-cf-sel{appearance:none;-webkit-appearance:none;cursor:pointer}",
+  ".vlc-cf-sel option{background:#1c160f;color:#e6d9bd}",
   ".vlc-h-n{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:400;color:#1a1610;background:rgba(var(--vacc,205,168,78),.7);border-radius:10px;padding:1px 7px;margin-left:6px;vertical-align:middle}",
   /* pagination */
   ".vlc-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin:10px 0 2px}",
