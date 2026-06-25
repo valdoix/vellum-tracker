@@ -399,7 +399,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], covered: 0, tombstones: { mem: [], know: [], sec: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
 }
 
 function normKey(s) {
@@ -680,6 +680,7 @@ function ensureIds(ch) {
     (ch.memJournal[k].entries || []).forEach((e) => { if (e && !e.id) e.id = vid('mj'); });
   }
   (ch.memories || []).forEach((m) => { if (m && !m.id) m.id = vid('m'); });
+  (ch.relations || []).forEach((r) => { if (r && !r.id) r.id = vid('rel'); });
 }
 
 // Collapse same-day near-duplicate log entries already stored (events/shifts).
@@ -754,12 +755,14 @@ async function loadChronicle(chatId) {
   if (!ch.memJournal || typeof ch.memJournal !== 'object') ch.memJournal = {};
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
+  if (!Array.isArray(ch.relations)) ch.relations = []; // cast relationship edges
   // Tombstones: signatures of entries the user deleted, so a re-import or a
   // future scan never resurrects them. Capped to stay bounded.
-  if (!ch.tombstones || typeof ch.tombstones !== 'object') ch.tombstones = { mem: [], know: [], sec: [] };
+  if (!ch.tombstones || typeof ch.tombstones !== 'object') ch.tombstones = { mem: [], know: [], sec: [], rel: [] };
   if (!Array.isArray(ch.tombstones.mem)) ch.tombstones.mem = [];
   if (!Array.isArray(ch.tombstones.know)) ch.tombstones.know = [];
   if (!Array.isArray(ch.tombstones.sec)) ch.tombstones.sec = [];
+  if (!Array.isArray(ch.tombstones.rel)) ch.tombstones.rel = [];
   // Injector state (persisted so it survives worker idle-unload):
   if (!Array.isArray(ch.injLog)) ch.injLog = [];            // cooldown ring (#2)
   if (!ch.fb || typeof ch.fb !== 'object') ch.fb = {};      // per-id feedback (#1): {inj,ref,miss}
@@ -1379,7 +1382,9 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
     const c = cast[k];
     const present = presentIds.has(c.id);
     const sig = nameSignal(c, qtokens, qphrase);
-    if (present || sig >= 6) anchors.push({ c, strength: present ? 100 : sig });
+    // Anchor on present cast, or any character distinctly named in the scene
+    // (full name = 6, a distinctive first-name/alias token = 3).
+    if (present || sig >= 3) anchors.push({ c, strength: present ? 100 : sig });
   }
   anchors.sort((a, b) => b.strength - a.strength);
   const top = anchors.slice(0, 3);
@@ -1403,6 +1408,19 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
     Object.values(ch.threads || {}).forEach((t) => { const id = 'thread:' + t.id; if (!exclude.has(id) && mentionsAnchor(t.title + ' ' + (t.status || ''), c)) cands.push({ id, kind: 'thread', label: t.title, recent: t.lastTurn || 0, anchor: c.name, line: '🧵 ' + t.title + ' [' + dl(t.lastDay) + ']: ' + (t.status || '') }); });
     (ch.secrets || []).forEach((s) => { if (s.revealed) return; const id = 'secret:' + vhash(s.secret); if (exclude.has(id)) return; if (castKey(s.keeper) === castKey(c.name) || mentionsAnchor(s.keeper + ' ' + (s.from || ''), c)) cands.push({ id, kind: 'secret', label: s.secret.slice(0, 40), recent: s.lastTurn || 0, anchor: c.name, line: '⚿ ' + s.keeper + ' hides from ' + (s.from || 'others') + ': ' + s.secret + ' [' + s.danger + ']' }); });
     (ch.knowledge || []).forEach((k) => { const id = 'know:' + vhash(k.who + k.fact); if (exclude.has(id)) return; if (castKey(k.who) === castKey(c.name)) { let tag = k.reliability === 'wrong' ? 'WRONGLY believes' : k.reliability === 'unaware' ? 'does NOT know' : k.reliability; cands.push({ id, kind: 'knowledge', label: k.fact.slice(0, 40), recent: k.lastTurn || 0, anchor: c.name, line: '◇ ' + k.who + ' ' + tag + ': ' + k.fact }); } });
+    // Relations: surface bonds tied to the scene-present character (the unique
+    // continuity win — "Cersei is Daeron's betrothed" even if unsaid this turn).
+    (ch.relations || []).forEach((r) => {
+      const id = 'rel:' + r.id;
+      if (exclude.has(id)) return;
+      if (r.a !== c.id && r.b !== c.id) return;
+      const other = r.a === c.id ? r.b : r.a;
+      const om = ch.cast[other];
+      const oName = om ? om.name : other;
+      const lbl = r.label ? (c.name + ' \u2014 ' + r.label) : (c.name + ' \u2194 ' + oName);
+      const tags = [r.category]; if (r.status && r.status !== 'active') tags.push(r.status);
+      cands.push({ id, kind: 'relation', label: (r.label || (c.name + '/' + oName)).slice(0, 40), recent: r.lastTurn || 0, anchor: c.name, line: '\u21ce ' + lbl + ' (' + tags.join(', ') + ')' });
+    });
   }
   // dedupe by id, prefer most-recent, then pack to budget
   const seen = new Set();
@@ -1716,7 +1734,7 @@ async function summarizeAll(chatId, userId) {
  * ========================================================================== */
 const scanningCast = new Set();
 
-const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about, and including the human player\u2019s own character). For each, infer their details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}]}. Rules: ALWAYS use the real names given to you \u2014 never output "{{user}}", "User", "{{char}}", or "you" as a name; pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words; never invent unsupported details (use "unknown"); merge obvious duplicates into one entry. No prose outside the JSON.';
+const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about, and including the human player\u2019s own character), AND the relationships between them. For each, infer details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}],"relations":[{"a":"Character A (exact name)","b":"Character B (exact name)","label":"how A relates to B, from A\u2019s side, e.g. \\"Tywin\u2019s daughter\\" / \\"betrothed to Daeron\\"","category":"familial|romantic|alliance|rivalry|social|neutral","status":"active|past|broken|secret","sentiment":"warm|strained|hostile|complex|neutral"}]}. Rules: ALWAYS use the real names given to you \u2014 never output "{{user}}", "User", "{{char}}", or "you" as a name; pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words. For relations: only between NAMED characters; status=past for former/dissolved bonds (e.g. "once considered for betrothal" = neutral + past); category=neutral for faded or hypothetical links; never invent unsupported details (use "unknown"); merge obvious duplicates. No prose outside the JSON.';
 
 function parseCastJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1726,7 +1744,7 @@ function parseCastJson(text) {
     if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { obj = null; } }
   }
   if (!obj || !Array.isArray(obj.characters)) return null;
-  return obj.characters.map((c) => ({
+  const list = obj.characters.map((c) => ({
     name: String(c.name || '').trim().slice(0, 60),
     aka: Array.isArray(c.aka) ? c.aka.map((a) => String(a).trim()).filter(Boolean).slice(0, 8) : [],
     age: String(c.age || '').trim().slice(0, 40),
@@ -1734,6 +1752,16 @@ function parseCastJson(text) {
     role: String(c.role || '').trim().slice(0, 120),
     mentionedOnly: !!c.mentioned_only,
   })).filter((c) => c.name && /[a-z]/i.test(c.name));
+  // Relations ride alongside the character list (parsed from the same JSON).
+  list._relations = Array.isArray(obj.relations) ? obj.relations.map((r) => ({
+    a: String(r.a || '').trim().slice(0, 60),
+    b: String(r.b || '').trim().slice(0, 60),
+    label: String(r.label || '').trim().slice(0, 120),
+    category: String(r.category || 'neutral').trim().toLowerCase(),
+    status: String(r.status || 'active').trim().toLowerCase(),
+    sentiment: String(r.sentiment || 'neutral').trim().toLowerCase(),
+  })).filter((r) => r.a && r.b) : [];
+  return list;
 }
 
 // Smarter history sampler for the LLM scanners. Instead of only head+tail,
@@ -1798,7 +1826,9 @@ function applyCastList(ch, list, nc) {
     if (m.status !== 'active' && !c.mentionedOnly) m.status = 'active';
     if (touched) { refreshDerivedAliases(m); enriched++; }
   }
-  return { added, enriched };
+  // Fold any relations the scan produced (rides on list._relations).
+  const relAdded = applyRelations(ch, list && list._relations, nc);
+  return { added, enriched, relations: relAdded };
 }
 
 // Run the cast LLM extraction over a turns array. Returns the parsed list or null.
@@ -1996,6 +2026,13 @@ function parseKnowJson(text) {
 
 function knowSig(k) { return (k.who + '|' + k.fact).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 120); }
 function secSig(s) { return (s.keeper + '|' + s.secret).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 120); }
+// Relation signature: unordered pair + category, so "A↔B familial" dedupes
+// regardless of which side is `a`, and a familial vs romantic bond between the
+// same two people are distinct edges.
+function relSig(aId, bId, category) {
+  const pair = [String(aId || ''), String(bId || '')].sort().join('|');
+  return (pair + '|' + String(category || '')).toLowerCase().slice(0, 160);
+}
 
 async function scanKnowledge(chatId, userId) {
   const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_know_done', ok }, extra || {}), userId);
@@ -2259,6 +2296,108 @@ function chapterMemoryAdd(ch, input) {
   const e = { id: vid('m'), fromTurn: null, toTurn: null, day: Number.isFinite(input.day) ? input.day : null, text: text.slice(0, 2000), keywords: kw.map((k) => String(k).toLowerCase().trim()).filter(Boolean).slice(0, 14), userAdded: true, edited: true };
   ch.memories.push(e);
   return e;
+}
+
+/* ============================================================================
+ * RELATIONS — edges between cast members ("Cersei is Tywin's daughter").
+ * Stored once as ch.relations = [{ id, a, b, label, category, status,
+ * sentiment, source, ... }] where a/b are canonical cast ids. The label is
+ * written from a's perspective; the reverse view renders the raw edge rather
+ * than auto-inverting the wording (siblings/in-laws make inversion unreliable).
+ * ========================================================================== */
+const REL_CATEGORIES = new Set(['familial', 'romantic', 'alliance', 'rivalry', 'social', 'neutral']);
+const REL_STATUS = new Set(['active', 'past', 'broken', 'secret']);
+const REL_SENTIMENT = new Set(['warm', 'strained', 'hostile', 'complex', 'neutral']);
+
+// Resolve a name to a cast id, creating a lightweight 'mentioned' card if the
+// person isn't tracked yet (so a relation can name someone off-page). Returns
+// null for blank/incidental names.
+function resolveOrAddCast(ch, name) {
+  const n = String(name || '').trim();
+  if (!n || castKey(n).length < 2) return null;
+  if (isIncidentalName(n)) return null;
+  let m = findCastMember(ch, n);
+  if (!m) {
+    const key = castKey(n);
+    m = ch.cast[key] = { id: key, name: n, aka: [], source: 'auto', status: 'mentioned', age: '', appearance: '', role: '', note: '', firstTurn: ch.turns || 0, lastTurn: ch.turns || 0, firstDay: ch.lastDay, lastDay: ch.lastDay };
+  }
+  return m;
+}
+
+function relationAdd(ch, input, opts) {
+  if (!Array.isArray(ch.relations)) ch.relations = [];
+  const o = opts || {};
+  const aName = input.a || input.from || input.subject;
+  const bName = input.b || input.to || input.other;
+  const ma = resolveOrAddCast(ch, aName);
+  const mb = resolveOrAddCast(ch, bName);
+  if (!ma || !mb || ma.id === mb.id) return null;
+  const category = REL_CATEGORIES.has(input.category) ? input.category : 'neutral';
+  const sig = relSig(ma.id, mb.id, category);
+  if (o.respectTombstone !== false && isTombstoned(ch, 'rel', sig)) return null; // user deleted — don't resurrect
+  const existing = ch.relations.find((r) => relSig(r.a, r.b, r.category) === sig);
+  const turn = ch.turns || 0;
+  if (existing) {
+    if (existing.userEdited && o.source !== 'user') return existing; // protect manual edits from auto
+    // Keep the first-seen label/perspective on auto-fold (avoids "A's daughter"
+    // flipping to "father of A" when the reverse edge is seen); manual always sets.
+    if (input.label && (o.source === 'user' || !existing.label)) existing.label = String(input.label).slice(0, 120);
+    if (REL_STATUS.has(input.status)) existing.status = input.status;
+    if (REL_SENTIMENT.has(input.sentiment)) existing.sentiment = input.sentiment;
+    existing.lastTurn = turn;
+    if (o.source === 'user') existing.userEdited = true;
+    return existing;
+  }
+  const rel = {
+    id: vid('rel'), a: ma.id, b: mb.id,
+    label: String(input.label || '').slice(0, 120),
+    category,
+    status: REL_STATUS.has(input.status) ? input.status : 'active',
+    sentiment: REL_SENTIMENT.has(input.sentiment) ? input.sentiment : 'neutral',
+    source: o.source === 'user' ? 'user' : 'auto',
+    firstTurn: turn, lastTurn: turn,
+  };
+  if (o.source === 'user') rel.userEdited = true;
+  ch.relations.push(rel);
+  return rel;
+}
+
+function relationEdit(ch, id, input) {
+  const r = Array.isArray(ch.relations) && ch.relations.find((x) => x.id === id);
+  if (!r) return null;
+  if (input.a) { const m = resolveOrAddCast(ch, input.a); if (m) r.a = m.id; }
+  if (input.b) { const m = resolveOrAddCast(ch, input.b); if (m) r.b = m.id; }
+  if (typeof input.label === 'string') r.label = input.label.slice(0, 120);
+  if (REL_CATEGORIES.has(input.category)) r.category = input.category;
+  if (REL_STATUS.has(input.status)) r.status = input.status;
+  if (REL_SENTIMENT.has(input.sentiment)) r.sentiment = input.sentiment;
+  r.userEdited = true;
+  return r;
+}
+
+function relationDelete(ch, id) {
+  if (!Array.isArray(ch.relations)) return false;
+  const i = ch.relations.findIndex((x) => x.id === id);
+  if (i < 0) return false;
+  const r = ch.relations[i];
+  addTombstone(ch, 'rel', relSig(r.a, r.b, r.category));
+  ch.relations.splice(i, 1);
+  return true;
+}
+
+// Fold an auto-extracted relation list (from the cast scan) into ch.relations.
+// Resolves names to cast ids, dedupes, honors tombstones + userEdited.
+function applyRelations(ch, list, nc) {
+  if (!Array.isArray(list)) return 0;
+  let added = 0;
+  for (const r of list) {
+    const a = canonName(r.a || r.from || r.subject, nc);
+    const b = canonName(r.b || r.to || r.other, nc);
+    const before = ch.relations.length;
+    const res = relationAdd(ch, { a, b, label: r.label, category: r.category, status: r.status, sentiment: r.sentiment }, { source: 'auto' });
+    if (res && ch.relations.length > before) added++;
+  }
+  return added;
 }
 
 function broadcastChronicle(chatId, ch, userId) {
@@ -2929,7 +3068,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const chatId = await resolveChatId(payload.chatId, userId);
       if (!chatId) return;
       const ch = await loadChronicle(chatId);
-      if (payload.id && ch.cast[payload.id]) { delete ch.cast[payload.id]; await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId); }
+      if (payload.id && ch.cast[payload.id]) { delete ch.cast[payload.id]; if (Array.isArray(ch.relations)) ch.relations = ch.relations.filter((r) => r.a !== payload.id && r.b !== payload.id); await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId); }
       return;
     }
     if (payload?.type === 'memory_edit') {
@@ -3009,7 +3148,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
       || payload?.type === 'knowledge_add' || payload?.type === 'knowledge_edit'
       || payload?.type === 'secret_add' || payload?.type === 'secret_edit'
       || payload?.type === 'mem_add' || payload?.type === 'mem_edit'
-      || payload?.type === 'memory_add') {
+      || payload?.type === 'memory_add'
+      || payload?.type === 'relation_add' || payload?.type === 'relation_edit' || payload?.type === 'relation_delete') {
       const chatId = await resolveChatId(payload.chatId, userId);
       if (!chatId) return;
       const ch = await loadChronicle(chatId);
@@ -3028,6 +3168,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       else if (tp === 'mem_add') ok = !!memJournalAdd(ch, payload.entry || payload);
       else if (tp === 'mem_edit') ok = !!memJournalEdit(ch, payload.charKey, payload.id, payload.entry || payload);
       else if (tp === 'memory_add') ok = !!chapterMemoryAdd(ch, payload.entry || payload);
+      else if (tp === 'relation_add') ok = !!relationAdd(ch, payload.entry || payload, { source: 'user' });
+      else if (tp === 'relation_edit') ok = !!relationEdit(ch, payload.id, payload.entry || payload);
+      else if (tp === 'relation_delete') ok = relationDelete(ch, payload.id);
       if (ok) { await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId); }
       return;
     }

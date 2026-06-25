@@ -129,6 +129,53 @@ function _setupImpl(ctx) {
       if (castData) renderCast(castBody, castData);
       return;
     }
+    const A = (el, n) => el.getAttribute(n) || '';
+    // Memory-journal add/edit (these rows live in the cast body).
+    let mb = e.target.closest('[data-mj-add]');
+    if (mb) { const who = A(mb, 'data-who');
+      vlcFormModal('New Memory \u2014 ' + who, [
+        { key: 'memory', label: 'Memory', type: 'textarea', placeholder: 'what ' + who + ' remembers' },
+        { key: 'about', label: 'About whom', type: 'text', placeholder: 'who/what it concerns (optional)' },
+        { key: 'weight', label: 'Weight', type: 'select', value: 'minor', options: WEIGHT_OPTS },
+        { key: 'sentiment', label: 'Sentiment', type: 'select', value: 'neutral', options: SENT_OPTS },
+      ], (v) => { if (v.memory && v.memory.trim()) ctx.sendToBackend({ type: 'mem_add', chatId: currentChatId, entry: Object.assign({ who }, v) }); });
+      return; }
+    mb = e.target.closest('[data-mj-edit]');
+    if (mb) { e.preventDefault(); e.stopPropagation();
+      vlcFormModal('Edit Memory', [
+        { key: 'memory', label: 'Memory', type: 'textarea', value: A(mb, 'data-memory') },
+        { key: 'about', label: 'About whom', type: 'text', value: A(mb, 'data-about') },
+        { key: 'weight', label: 'Weight', type: 'select', value: A(mb, 'data-weight') || 'minor', options: WEIGHT_OPTS },
+        { key: 'sentiment', label: 'Sentiment', type: 'select', value: A(mb, 'data-sentiment') || 'neutral', options: SENT_OPTS },
+      ], (v) => ctx.sendToBackend({ type: 'mem_edit', chatId: currentChatId, charKey: A(mb, 'data-key'), id: A(mb, 'data-id'), entry: v }));
+      return; }
+    // Relations CRUD + filter (rendered in the cast body).
+    const relF = e.target.closest('[data-rel-filter]');
+    if (relF) { _relFilter = relF.getAttribute('data-rel-filter') || 'all'; if (castData) renderCast(castBody, castData); return; }
+    let rb = e.target.closest('[data-relation-add]');
+    if (rb) {
+      vlcFormModal('New Relation', [
+        { key: 'a', label: 'Character A', type: 'text', placeholder: 'name (the subject)' },
+        { key: 'label', label: 'Relation (from A\u2019s side)', type: 'text', placeholder: "e.g. Tywin's daughter / betrothed to Daeron" },
+        { key: 'b', label: 'Character B', type: 'text', placeholder: 'the other person' },
+        { key: 'category', label: 'Category', type: 'select', value: 'neutral', options: REL_CAT_OPTS },
+        { key: 'status', label: 'Status', type: 'select', value: 'active', options: REL_STATUS_OPTS },
+        { key: 'sentiment', label: 'Sentiment', type: 'select', value: 'neutral', options: REL_SENT_OPTS },
+      ], (v) => { if (v.a && v.a.trim() && v.b && v.b.trim()) ctx.sendToBackend({ type: 'relation_add', chatId: currentChatId, entry: v }); });
+      return; }
+    rb = e.target.closest('[data-relation-edit]');
+    if (rb) {
+      vlcFormModal('Edit Relation', [
+        { key: 'a', label: 'Character A', type: 'text', value: A(rb, 'data-a') },
+        { key: 'label', label: 'Relation (from A\u2019s side)', type: 'text', value: A(rb, 'data-label') },
+        { key: 'b', label: 'Character B', type: 'text', value: A(rb, 'data-b') },
+        { key: 'category', label: 'Category', type: 'select', value: A(rb, 'data-category') || 'neutral', options: REL_CAT_OPTS },
+        { key: 'status', label: 'Status', type: 'select', value: A(rb, 'data-status') || 'active', options: REL_STATUS_OPTS },
+        { key: 'sentiment', label: 'Sentiment', type: 'select', value: A(rb, 'data-sentiment') || 'neutral', options: REL_SENT_OPTS },
+      ], (v) => ctx.sendToBackend({ type: 'relation_edit', chatId: currentChatId, id: A(rb, 'data-id'), entry: v }));
+      return; }
+    rb = e.target.closest('[data-relation-del]');
+    if (rb) { if (confirm('Delete this relation?')) ctx.sendToBackend({ type: 'relation_delete', chatId: currentChatId, id: A(rb, 'data-id') }); return; }
   });
   wireCastTab(ctx, castRoot, castBody, () => currentChatId, (id) => { currentChatId = id; });
 
@@ -513,6 +560,9 @@ const TRUTH_OPTS = [{ value: 'unknown', label: 'unknown' }, { value: 'true', lab
 const DANGER_OPTS = [{ value: 'minor', label: 'minor' }, { value: 'major', label: 'major' }, { value: 'explosive', label: 'explosive' }];
 const WEIGHT_OPTS = [{ value: 'trivial', label: 'trivial' }, { value: 'minor', label: 'minor' }, { value: 'significant', label: 'significant' }, { value: 'defining', label: 'defining' }];
 const SENT_OPTS = [{ value: 'neutral', label: 'neutral' }, { value: 'positive', label: 'positive' }, { value: 'negative', label: 'negative' }, { value: 'complex', label: 'complex' }];
+const REL_CAT_OPTS = [{ value: 'familial', label: 'familial' }, { value: 'romantic', label: 'romantic' }, { value: 'alliance', label: 'alliance' }, { value: 'rivalry', label: 'rivalry' }, { value: 'social', label: 'social' }, { value: 'neutral', label: 'neutral' }];
+const REL_STATUS_OPTS = [{ value: 'active', label: 'active' }, { value: 'past', label: 'past' }, { value: 'broken', label: 'broken' }, { value: 'secret', label: 'secret' }];
+const REL_SENT_OPTS = [{ value: 'neutral', label: 'neutral' }, { value: 'warm', label: 'warm' }, { value: 'strained', label: 'strained' }, { value: 'hostile', label: 'hostile' }, { value: 'complex', label: 'complex' }];
 
 function splitItems(raw) {
   if (!raw) return [];
@@ -903,6 +953,7 @@ let _deepOn = false;
 let _knowFilter = 'all';   // all | knows | believes | suspects | wrong | unaware
 let _secFilter = 'all';    // all | minor | major | explosive
 const _mjFilter = {};      // per-character key -> weight filter (all|defining|significant|minor|trivial)
+let _relFilter = 'all';    // all | familial | romantic | alliance | rivalry | social | neutral
 // Module refs so render helpers can message the backend (set once in setup()).
 let _ctx = null;
 let _getChatId = () => null;
@@ -1577,6 +1628,38 @@ function castGroup(grp, title, hint, arr, present) {
   return '<section data-grp="' + grp + '">' + head + arr.map((c) => castCard(c, present)).join('') + '</section>';
 }
 
+// Relations panel: edges between cast members, grouped under each character,
+// with category filter chips. Label is shown from the edge's `a` perspective;
+// the reverse view shows the raw "A ↔ B" so wording stays accurate.
+function relationsHtml(ch) {
+  const rels = (ch && ch.relations) || [];
+  if (!rels.length) {
+    return '<div class="vlc-empty">No relations yet.<br><span style="opacity:.7;font-size:10px">Hit \u2756 Scan to auto-map bonds, or + Relation to add one (e.g. \u201cCersei \u2014 Tywin\u2019s daughter / familial\u201d).</span></div>';
+  }
+  const nameOf = (id) => (ch.cast && ch.cast[id] ? ch.cast[id].name : id);
+  const catCls = { familial: 'r-fam', romantic: 'r-rom', alliance: 'r-all', rivalry: 'r-riv', social: 'r-soc', neutral: 'r-neu' };
+  const cnt = rels.reduce((acc, r) => { const c = r.category || 'neutral'; acc[c] = (acc[c] || 0) + 1; return acc; }, {});
+  const order = ['familial', 'romantic', 'alliance', 'rivalry', 'social', 'neutral'];
+  const chips = ['all'].concat(order.filter((c) => cnt[c])).map((c) =>
+    '<button class="vlc-fchip' + (_relFilter === c ? ' on' : '') + '" data-rel-filter="' + c + '">'
+    + (c === 'all' ? 'All' : escapeHtml(c)) + ' <span class="vlc-fchip-n">' + (c === 'all' ? rels.length : cnt[c]) + '</span></button>'
+  ).join('');
+  const shown = _relFilter === 'all' ? rels : rels.filter((r) => (r.category || 'neutral') === _relFilter);
+  const rows = shown.length ? shown.slice().sort((a, b) => (b.lastTurn || 0) - (a.lastTurn || 0)).map((r) => {
+    const aN = nameOf(r.a), bN = nameOf(r.b);
+    const text = r.label ? (escapeHtml(aN) + ' \u2014 ' + escapeHtml(r.label)) : (escapeHtml(aN) + ' \u2194 ' + escapeHtml(bN));
+    const sub = r.label ? ('<span class="vlc-rel-b">\u2194 ' + escapeHtml(bN) + '</span>') : '';
+    const tags = '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>'
+      + (r.status && r.status !== 'active' ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '');
+    return '<div class="vlc-rel-row">'
+      + '<span class="vlc-rel-t">' + text + ' ' + sub + '</span>' + tags
+      + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" title="Edit">\u270E</button>'
+      + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button>'
+      + '</div>';
+  }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_relFilter) + '\u201d relations.</div>';
+  return '<div class="vlc-fbar" data-rel-fbar>' + chips + '</div>' + rows;
+}
+
 function renderCast(host, ch) {
   if (!host) return;
   const cast = ch && ch.cast ? Object.values(ch.cast) : [];
@@ -1617,6 +1700,9 @@ function renderCast(host, ch) {
     + castGroup('mentioned', '\u2027 Mentioned', 'No off-page mentions yet.', mentioned, false)
     + '<div class="vlc-break"></div>'
     + castGroup('added', '\u2605 Added (not yet in story)', 'Add your own with + Add.', mine, false)
+    + '<div class="vlc-break"></div>'
+    + '<section data-grp="relations"><h3 class="vlc-h">\u21ce Relations <span class="vlc-h-n">' + ((ch.relations || []).length) + '</span><button class="vlc-add-btn" data-relation-add>+ Relation</button></h3>'
+      + relationsHtml(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="journal"><h3 class="vlc-h">\uD83D\uDCD6 Memory Journal <span class="vlc-h-n">' + Object.keys(ch.memJournal || {}).length + '</span></h3>'
       + '<div class="vlc-lore-bar"><button class="vlc-btn" data-scan-mem>\uD83D\uDCD6 Scan memories</button></div>'
@@ -2106,6 +2192,14 @@ const VELLUM_CSS = [
   ".vlc-mj-row.s-pos{border-left:2px solid rgba(143,166,126,.5);padding-left:6px}",".vlc-mj-row.s-neg{border-left:2px solid rgba(201,138,138,.5);padding-left:6px}",".vlc-mj-row.s-cx{border-left:2px solid rgba(180,142,208,.5);padding-left:6px}",".vlc-mj-row.s-neu{border-left:2px solid rgba(140,132,120,.4);padding-left:6px}",
   ".vlc-mini-del{flex:none;margin-left:auto;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(201,138,138,.14);color:#c98a8a;font-size:8px;line-height:1;display:grid;place-items:center}",
   ".vlc-mini-del:hover{background:rgba(201,138,138,.34)}",
+  /* relations */
+  ".vlc-rel-row{display:flex;gap:7px;align-items:center;padding:6px 0;border-bottom:1px solid rgba(205,168,78,.07);font-size:10.5px;line-height:1.4}",
+  ".vlc-rel-row:last-child{border-bottom:none}",
+  ".vlc-rel-t{flex:1;color:#e6d9bd}",
+  ".vlc-rel-b{opacity:.6;font-size:9.5px}",
+  ".vlc-rel-cat{flex:none;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:4px;color:#1a1610;background:#8c8478}",
+  ".r-fam{background:#cda84e}",".r-rom{background:#c97a9a}",".r-all{background:#8fa67e}",".r-riv{background:#c96a6a}",".r-soc{background:#7ea6b0}",".r-neu{background:#8c8478}",
+  ".vlc-rel-st{flex:none;font-size:8px;letter-spacing:.5px;text-transform:uppercase;padding:2px 5px;border-radius:4px;color:#cda84e;background:rgba(205,168,78,.14);border:1px solid rgba(205,168,78,.25)}",
   ".vlc-mini-edit{flex:none;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(205,168,78,.14);color:#cda84e;font-size:9px;line-height:1;display:grid;place-items:center;margin-left:4px}",
   ".vlc-mini-edit:hover{background:rgba(205,168,78,.34)}",
   ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",
