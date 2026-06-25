@@ -362,13 +362,14 @@ function _setupImpl(ctx) {
       // force the font across the window/tabs and every descendant.
       rules.push(scopes + ', .vlm-window *, .vlc-root *{font-family:' + stack + ' !important}');
     }
-    // font size: scale the window/tab body via font-size on the scroll container
-    // (most text is in em/px; scaling the body root + key blocks reads cleanly).
+    // font size: child elements all use explicit px, so scaling the body's
+    // font-size won't cascade. Use `zoom` on the scroll container, which scales
+    // the rendered size of every descendant regardless of its px value.
     const sz = Number(_theme.size) || 100;
     if (sz !== 100) {
       const f = (sz / 100).toFixed(3);
-      rules.push('.vlm-window .vlm-body{font-size:calc(11.5px * ' + f + ') !important}');
-      rules.push('.vlc-root .vlc-body{font-size:calc(11px * ' + f + ') !important}');
+      rules.push('.vlm-window .vlm-body{zoom:' + f + '}');
+      rules.push('.vlc-root .vlc-body{zoom:' + f + '}');
     }
     ensureThemeStyle().textContent = rules.join('\n');
     // background only applies to the floating window (tabs live in the drawer)
