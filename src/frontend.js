@@ -78,6 +78,12 @@ function _setupImpl(ctx) {
       btn.textContent = '…';
       return;
     }
+    const hideBtn = e.target.closest('[data-vlc-hide]');
+    if (hideBtn) {
+      ctx.sendToBackend({ type: 'set_hide_summarized', chatId: currentChatId, enabled: !_hideOn });
+      hideBtn.textContent = '…';
+      return;
+    }
     const scanK = e.target.closest('[data-scan-knowledge]');
     if (scanK) {
       scanK.disabled = true; scanK.textContent = '⏳ Scanning…';
@@ -253,7 +259,7 @@ function _setupImpl(ctx) {
     }
   });
 
-  function requestChronicle() { ctx.sendToBackend({ type: 'get_chronicle', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_injection', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_deep_recall', chatId: currentChatId }); }
+  function requestChronicle() { ctx.sendToBackend({ type: 'get_chronicle', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_injection', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_deep_recall', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_hide_summarized', chatId: currentChatId }); }
 
   // Best-effort scrape of the visible transcript so a rebuild has data even if
   // the backend's cached interceptor array is empty (e.g. just after reload).
@@ -330,6 +336,11 @@ function _setupImpl(ctx) {
       if (host) host.innerHTML = injectionHtml(_lastInjection);
     } else if (p?.type === 'vellum_deep_recall') {
       _deepOn = !!p.enabled;
+      const host = chronicleBody && chronicleBody.querySelector('[data-vlc-inj]');
+      if (host) host.innerHTML = injectionHtml(_lastInjection);
+    } else if (p?.type === 'vellum_hide_summarized') {
+      _hideOn = !!p.enabled;
+      _hideInfo = { covered: p.covered || 0, memories: p.memories || 0 };
       const host = chronicleBody && chronicleBody.querySelector('[data-vlc-inj]');
       if (host) host.innerHTML = injectionHtml(_lastInjection);
     } else if (p?.type === 'vellum_chronicle_empty') {
@@ -949,6 +960,8 @@ function sortTracks(map) {
 // Last injection snapshot pushed from the backend (what VELLUM put in the prompt).
 let _lastInjection = null;
 let _deepOn = false;
+let _hideOn = false;          // hide-summarized-turns toggle state
+let _hideInfo = { covered: 0, memories: 0 };
 // Active category filters (persist across re-renders).
 let _knowFilter = 'all';   // all | knows | believes | suspects | wrong | unaware
 let _secFilter = 'all';    // all | minor | major | explosive
@@ -961,7 +974,9 @@ let _getChatId = () => null;
 // Render the "what was injected into the chat this turn" panel (LoreRecall-style).
 function injectionHtml(inj) {
   const toggle = '<div class="vlc-deep"><div class="vlc-deep-l"><b>Deep Recall</b> <span>LLM picks relevant entries each turn (background, opt-in)</span></div>'
-    + '<button class="vlc-deep-btn' + (_deepOn ? ' on' : '') + '" data-vlc-deep>' + (_deepOn ? 'ON' : 'OFF') + '</button></div>';
+    + '<button class="vlc-deep-btn' + (_deepOn ? ' on' : '') + '" data-vlc-deep>' + (_deepOn ? 'ON' : 'OFF') + '</button></div>'
+    + '<div class="vlc-deep"><div class="vlc-deep-l"><b>Hide summarized turns</b> <span>' + (_hideInfo.covered ? ('Drops ~' + _hideInfo.covered + ' old turns already in ' + _hideInfo.memories + ' memories; replaced by a compact \u201cStory so far\u201d. Recent turns kept.') : 'Once early turns are summarized, drop them from the prompt to save tokens (a compact recap is sent instead).') + '</span></div>'
+    + '<button class="vlc-deep-btn' + (_hideOn ? ' on' : '') + '" data-vlc-hide>' + (_hideOn ? 'ON' : 'OFF') + '</button></div>';
   if (!inj || (!inj.cast && (!inj.recall || !inj.recall.length))) {
     return toggle + '<div class="vlc-empty">Nothing injected yet.<br><span style="opacity:.7;font-size:10px">After your next turn, the cast roster and scene-relevant recall VELLUM adds to the prompt will show here.</span></div>';
   }

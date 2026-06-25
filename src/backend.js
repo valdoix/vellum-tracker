@@ -399,7 +399,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, hideSummarized: false, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
 }
 
 function normKey(s) {
@@ -752,6 +752,7 @@ async function loadChronicle(chatId) {
   if (!Array.isArray(ch.present)) ch.present = [];
   if (!Array.isArray(ch.presentIds)) ch.presentIds = [];
   if (typeof ch.deepRecall !== 'boolean') ch.deepRecall = false;
+  if (typeof ch.hideSummarized !== 'boolean') ch.hideSummarized = false;
   if (!ch.memJournal || typeof ch.memJournal !== 'object') ch.memJournal = {};
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
@@ -2686,6 +2687,53 @@ function mergeEnrich(base, extra) {
 
 /* ---------- interceptor: lean the older context + inject scene-relevant recall ---------- */
 let lastInterceptedMessages = null;
+
+// "Hide summarized turns" (#token-saving): when enabled, drop the old
+// user/assistant turns that have ALREADY been distilled into chapter memories
+// (turn index <= ch.covered) from the outgoing context, and prepend one compact
+// STORY SO FAR block built from those covering memories. Recent turns are never
+// touched — ch.covered always lags the live tail by SUMMARY.triggerLead. Only
+// drops when covering memories exist, so continuity is preserved. A safety floor
+// always keeps the most recent KEEP_RECENT turns verbatim regardless.
+const HIDE_KEEP_RECENT = 4;
+function buildStorySoFar(ch, uptoTurn) {
+  const mems = (ch.memories || []).filter((m) => typeof m.toTurn === 'number' && m.toTurn <= uptoTurn)
+    .sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0));
+  if (!mems.length) return '';
+  const dl = (d) => (d ? 'Day ' + d + ': ' : '');
+  const lines = mems.map((m) => '• ' + dl(m.day) + (m.text || '').trim());
+  let out = lines.join('\n');
+  if (out.length > 9000) out = out.slice(0, 9000) + '…';
+  return out;
+}
+function applyHideSummarized(messages, ch) {
+  const covered = ch.covered || 0;
+  if (covered <= 0) return messages;
+  const story = buildStorySoFar(ch, covered);
+  if (!story) return messages; // nothing distilled yet → never drop blind
+  // Total assistant turns present in this context.
+  let totalAsst = 0;
+  for (const m of messages) if (m && m.role === 'assistant') totalAsst++;
+  // Never drop into the recent tail.
+  const dropUpToTurn = Math.min(covered, Math.max(0, totalAsst - HIDE_KEEP_RECENT));
+  if (dropUpToTurn <= 0) return messages;
+  const kept = [];
+  let asstSeen = 0;
+  let droppedAny = false;
+  for (const m of messages) {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) { kept.push(m); continue; }
+    // The turn this message belongs to: an assistant message owns the turn it
+    // closes; a user message belongs to the upcoming assistant turn.
+    const ownTurn = m.role === 'assistant' ? (asstSeen + 1) : (asstSeen + 1);
+    if (m.role === 'assistant') asstSeen++;
+    if (ownTurn <= dropUpToTurn) { droppedAny = true; continue; } // drop summarized turn
+    kept.push(m);
+  }
+  if (!droppedAny) return messages;
+  const block = { role: 'system', content: '[STORY SO FAR — the earlier chapters of this scene, condensed to save context. Treat as established, already-happened history; do not recap it in prose.]\n' + story };
+  return [block, ...kept];
+}
+
 const lastInjectionByChat = new Map();
 // Pre-warm cache (#10): reuse the assembled injection when the scene query is
 // unchanged (swipes / regenerations / rapid retries hit the same fingerprint),
@@ -2715,6 +2763,20 @@ const vellumInterceptor = async (messages, context) => {
     return filtered === msg.content ? msg : { ...msg, content: filtered };
   });
 
+  // Optional: drop already-summarized old turns to save context (opt-in toggle).
+  let _hideCh = null;
+  try {
+    const cid0 = context && (context.chatId || context.chat_id);
+    if (cid0) {
+      _hideCh = await loadChronicle(cid0);
+      if (_hideCh && _hideCh.hideSummarized) {
+        const before = out.length;
+        out = applyHideSummarized(out, _hideCh);
+        if (out.length !== before) spindle.log.info('[vellum_tracker] hid summarized turns (' + before + '→' + out.length + ' msgs)');
+      }
+    }
+  } catch (eHide) { spindle.log.warn('[vellum_tracker] hideSummarized: ' + (eHide && eHide.message)); }
+
   // Scene-relevant chronicle recall (budgeted, retrieval-gated — never a full dump).
   let injectedContent = '';
   try {
@@ -2722,7 +2784,7 @@ const vellumInterceptor = async (messages, context) => {
     if (!chatId) {
       spindle.log.warn('[vellum_tracker] interceptor: no context.chatId — cannot inject');
     } else {
-      const ch = await loadChronicle(chatId);
+      const ch = _hideCh || await loadChronicle(chatId);
       if (chronicleHasContent(ch)) {
         const query = queryFromMessages(out, RECALL.queryMessages);
         // Pre-warm reuse (#10): identical scene query (swipe/regeneration) → reuse
@@ -2985,6 +3047,18 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const chatId = await resolveChatId(payload.chatId, userId);
       const ch = chatId ? await loadChronicle(chatId) : null;
       spindle.sendToFrontend({ type: 'vellum_deep_recall', enabled: !!(ch && ch.deepRecall) }, userId);
+      return;
+    }
+    if (payload?.type === 'set_hide_summarized' || payload?.type === 'get_hide_summarized') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (!chatId) { spindle.sendToFrontend({ type: 'vellum_hide_summarized', enabled: false, covered: 0, memories: 0 }, userId); return; }
+      const ch = await loadChronicle(chatId);
+      if (payload.type === 'set_hide_summarized') {
+        ch.hideSummarized = !!payload.enabled;
+        _prewarmCache.delete(chatId); // affects outgoing context → invalidate cache
+        await saveChronicle(chatId, ch);
+      }
+      spindle.sendToFrontend({ type: 'vellum_hide_summarized', enabled: !!ch.hideSummarized, covered: ch.covered || 0, memories: (ch.memories || []).length }, userId);
       return;
     }
     if (payload?.type === 'summarize_all') {
