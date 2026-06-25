@@ -323,7 +323,7 @@ function _setupImpl(ctx) {
     rounded: "'Quicksand', 'Comfortaa', system-ui, sans-serif",
     slab: "'Roboto Slab', Georgia, serif",
   };
-  let _theme = { accent: null, bg: null, text: null, font: '' };
+  let _theme = { accent: null, bg: null, text: null, font: '', size: 100 };
   // A dedicated <style> element carries the text/font overrides at high
   // specificity with !important, because per-element skin rules (e.g. parchment
   // sets its own color, and .vlm-body/titles set their own font-family) would
@@ -362,6 +362,14 @@ function _setupImpl(ctx) {
       // force the font across the window/tabs and every descendant.
       rules.push(scopes + ', .vlm-window *, .vlc-root *{font-family:' + stack + ' !important}');
     }
+    // font size: scale the window/tab body via font-size on the scroll container
+    // (most text is in em/px; scaling the body root + key blocks reads cleanly).
+    const sz = Number(_theme.size) || 100;
+    if (sz !== 100) {
+      const f = (sz / 100).toFixed(3);
+      rules.push('.vlm-window .vlm-body{font-size:calc(11.5px * ' + f + ') !important}');
+      rules.push('.vlc-root .vlc-body{font-size:calc(11px * ' + f + ') !important}');
+    }
     ensureThemeStyle().textContent = rules.join('\n');
     // background only applies to the floating window (tabs live in the drawer)
     if (_theme.bg && hexToRgb(_theme.bg)) {
@@ -371,7 +379,7 @@ function _setupImpl(ctx) {
     try { localStorage.setItem('vellum_theme_custom', JSON.stringify(_theme)); } catch (e) {}
   }
   function resetTheme2() {
-    _theme = { accent: null, bg: null, text: null, font: '' };
+    _theme = { accent: null, bg: null, text: null, font: '', size: 100 };
     themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); });
     if (_themeStyleEl) _themeStyleEl.textContent = '';
     win.style.removeProperty('background');
@@ -393,7 +401,7 @@ function _setupImpl(ctx) {
   // Load saved custom theme (new multi-key, with legacy accent-only fallback).
   try {
     const j = localStorage.getItem('vellum_theme_custom');
-    if (j) { const o = JSON.parse(j); _theme = { accent: o.accent || null, bg: o.bg || null, text: o.text || null, font: o.font || '' }; }
+    if (j) { const o = JSON.parse(j); _theme = { accent: o.accent || null, bg: o.bg || null, text: o.text || null, font: o.font || '', size: Number(o.size) || 100 }; }
     else { const legacy = localStorage.getItem('vellum_color'); if (legacy) _theme.accent = legacy; }
   } catch (e) {}
   applyTheme2();
@@ -404,6 +412,21 @@ function _setupImpl(ctx) {
     applySkin(VELLUM_SKINS[_skinIdx]);
     skinBtn.title = 'Skin: ' + (SKIN_LABEL[VELLUM_SKINS[_skinIdx]] || VELLUM_SKINS[_skinIdx]);
   });
+  // ---- Window tabs (Scene / Minds / Story / Backstage) ----
+  const WIN_TABS = ['scene', 'minds', 'story', 'backstage'];
+  function applyWinTab(name) {
+    const t = WIN_TABS.includes(name) ? name : 'scene';
+    win.setAttribute('data-wintab', t);
+    win.querySelectorAll('[data-wintab-btn]').forEach((b) => b.classList.toggle('on', b.getAttribute('data-wintab-btn') === t));
+    try { localStorage.setItem('vellum_wintab', t); } catch (e) {}
+  }
+  let _winTab = 'scene';
+  try { const sv = localStorage.getItem('vellum_wintab'); if (sv && WIN_TABS.includes(sv)) _winTab = sv; } catch (e) {}
+  applyWinTab(_winTab);
+  win.querySelectorAll('[data-wintab-btn]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    applyWinTab(b.getAttribute('data-wintab-btn'));
+  }));
   // Custom theme popover (accent / background / text / font)
   const colorBtn = win.querySelector('[data-color]');
   const colorPop = win.querySelector('[data-colorpop]');
@@ -413,6 +436,7 @@ function _setupImpl(ctx) {
     const bgW = q('[data-cp-bg]'), bgH = q('[data-cp-bg-hex]');
     const txW = q('[data-cp-text]'), txH = q('[data-cp-text-hex]');
     const fontSel = q('[data-cp-font]');
+    const sizeSl = q('[data-cp-size]'); const sizeVal = q('[data-cp-size-val]');
     const cpSwatches = q('[data-cp-swatches]');
     const PRESET_SWATCHES = ['#cda84e', '#9bc0e6', '#e89bb0', '#7fd0a0', '#c4ccd8', '#f0a05a', '#b48ed0', '#d86a6a', '#6fb0a6', '#e6c07a'];
     if (cpSwatches) cpSwatches.innerHTML = PRESET_SWATCHES.map((c) => '<button class="vlm-cp-s" data-cp-pick="' + c + '" style="background:' + c + '" title="' + c + '"></button>').join('');
@@ -424,6 +448,8 @@ function _setupImpl(ctx) {
       if (txW) txW.value = _theme.text || '#d8c9a8';
       if (txH) txH.value = _theme.text || '';
       if (fontSel) fontSel.value = _theme.font || '';
+      if (sizeSl) sizeSl.value = _theme.size || 100;
+      if (sizeVal) sizeVal.textContent = (_theme.size || 100) + '%';
     };
     const norm = (v) => { const s = String(v || '').trim(); if (!s) return null; const h = s.replace(/^#?/, '#'); return hexToRgb(h) ? h : null; };
 
@@ -437,6 +463,7 @@ function _setupImpl(ctx) {
     if (txW) txW.addEventListener('input', () => { _theme.text = txW.value; if (txH) txH.value = txW.value; applyTheme2(); });
     if (txH) txH.addEventListener('change', () => { _theme.text = norm(txH.value); applyTheme2(); syncUI(); });
     if (fontSel) fontSel.addEventListener('change', () => { _theme.font = fontSel.value; applyTheme2(); });
+    if (sizeSl) sizeSl.addEventListener('input', () => { _theme.size = Number(sizeSl.value) || 100; if (sizeVal) sizeVal.textContent = _theme.size + '%'; applyTheme2(); });
     if (cpSwatches) cpSwatches.addEventListener('click', (e) => { const b = e.target.closest('[data-cp-pick]'); if (b) { _theme.accent = b.getAttribute('data-cp-pick'); applyTheme2(); syncUI(); } });
 
     const applyB = q('[data-cp-apply]'); if (applyB) applyB.addEventListener('click', () => { colorPop.hidden = true; });
@@ -1028,27 +1055,36 @@ function render(body, dot, data) {
   }
   let html = '';
   if (g) {
-    // hero
-    html += '<div class="vlm-hero">'
+    // ----- SCENE panel: where & when, right now -----
+    let scene = '<div class="vlm-hero">'
       + '<div class="vlm-kicker">· current state ·</div>'
       + (g.location ? '<div class="vlm-title-lg">' + escapeHtml(g.location.split(/[—,]/)[0].trim()) + '</div>' : '<div class="vlm-title-lg">The Scene</div>')
       + '<div class="vlm-rule"></div></div>';
-    // chips
-    html += '<div class="vlm-chips">'
+    scene += '<div class="vlm-chips">'
       + chipHtml('⏱', g.time) + chipHtml('🌤', g.weather) + chipHtml('👥', g.present) + '</div>';
-    // meters
     if (g.sceneTension || g.bondTension) {
-      html += '<div class="vlm-meters">' + meterHtml('Scene', g.sceneTension, '') + meterHtml('Bond', g.bondTension, 'bond') + '</div>';
+      scene += '<div class="vlm-meters">' + meterHtml('Scene', g.sceneTension, '') + meterHtml('Bond', g.bondTension, 'bond') + '</div>';
     }
-    html += mindSecHtml('💭', 'Inner Landscape', g.thoughts);
-    html += listSecHtml('📜', 'Active Arcs', g.arcs);
-    html += listSecHtml('🌊', 'Undercurrents', g.offscreen);
+    html += '<div class="vlm-panel" data-panel="scene">' + scene + '</div>';
+    // ----- MINDS panel: inner landscape -----
+    const minds = mindSecHtml('💭', 'Inner Landscape', g.thoughts);
+    html += '<div class="vlm-panel" data-panel="minds">' + (minds || emptyPanel('No inner landscape recorded this turn.')) + '</div>';
+    // ----- STORY panel: arcs + undercurrents -----
+    let story = listSecHtml('📜', 'Active Arcs', g.arcs) + listSecHtml('🌊', 'Undercurrents', g.offscreen);
+    html += '<div class="vlm-panel" data-panel="story">' + (story || emptyPanel('No active arcs or undercurrents yet.')) + '</div>';
+  } else {
+    html += '<div class="vlm-panel" data-panel="scene">' + emptyPanel('No ledger yet.') + '</div>';
+    html += '<div class="vlm-panel" data-panel="minds">' + emptyPanel('No inner landscape yet.') + '</div>';
+    html += '<div class="vlm-panel" data-panel="story">' + emptyPanel('No story state yet.') + '</div>';
   }
-  if (bts) html += btsHtml(bts);
+  // ----- BACKSTAGE panel -----
+  html += '<div class="vlm-panel" data-panel="backstage">' + (bts ? btsHtml(bts) : emptyPanel('No backstage activity yet.')) + '</div>';
   html += '<div class="vlm-foot">The ledger and backstage are hidden from the chat and live only here. Arc memory (@vellum_*) syncs every turn.</div>';
   body.innerHTML = html;
   if (dot) dot.style.background = '#cda84e';
 }
+
+function emptyPanel(msg) { return '<div class="vlm-empty" style="padding:40px 12px;font-size:14px">' + escapeHtml(msg) + '</div>'; }
 
 /* ============================================================================
  * CHRONICLE VIEW (drawer tab) — long-term continuity.
@@ -2019,14 +2055,56 @@ const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" d
   + '<div class="vlm-cp-field"><label>Background</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-bg value="#171511"><input type="text" class="vlm-cp-hex" data-cp-bg-hex placeholder="default" maxlength="7"></div></div>'
   + '<div class="vlm-cp-field"><label>Text</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-text value="#d8c9a8"><input type="text" class="vlm-cp-hex" data-cp-text-hex placeholder="default" maxlength="7"></div></div>'
   + '<div class="vlm-cp-field"><label>Font</label><select class="vlm-cp-font" data-cp-font><option value="">Skin default</option><option value="serif">Serif (Cormorant)</option><option value="sans">Sans (Inter)</option><option value="mono">Mono (JetBrains)</option><option value="rounded">Rounded (Quicksand)</option><option value="slab">Slab (Roboto Slab)</option></select></div>'
+  + '<div class="vlm-cp-field"><label>Font size <span data-cp-size-val>100%</span></label><input type="range" class="vlm-cp-range" data-cp-size min="80" max="150" step="5" value="100"></div>'
   + '<div class="vlm-cp-h" style="margin-top:4px">Accent presets</div>'
   + '<div class="vlm-cp-sw" data-cp-swatches></div>'
   + '<div class="vlm-cp-btns"><button class="vlm-cp-apply" data-cp-apply>Done</button><button class="vlm-cp-reset" data-cp-reset>Reset all</button></div>'
   + '</div>'
-  + '</div><div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
+  + '</div>'
+  + '<div class="vlm-tabs" data-wintabs>'
+  + '<button class="vlm-tab" data-wintab-btn="scene"><span class="vlm-tab-ico">◷</span><span class="vlm-tab-rn">I</span><span class="vlm-tab-lbl">Scene</span></button>'
+  + '<button class="vlm-tab" data-wintab-btn="minds"><span class="vlm-tab-ico">💭</span><span class="vlm-tab-rn">II</span><span class="vlm-tab-lbl">Minds</span></button>'
+  + '<button class="vlm-tab" data-wintab-btn="story"><span class="vlm-tab-ico">📜</span><span class="vlm-tab-rn">III</span><span class="vlm-tab-lbl">Story</span></button>'
+  + '<button class="vlm-tab" data-wintab-btn="backstage"><span class="vlm-tab-ico">🎭</span><span class="vlm-tab-rn">IV</span><span class="vlm-tab-lbl">Backstage</span></button>'
+  + '</div>'
+  + '<div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
 
 const VELLUM_CSS = [
   "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;600&family=Quicksand:wght@400;600&family=Roboto+Slab:wght@400;600&display=swap');",
+﻿  ".vlm-cp-range{width:100%;accent-color:var(--vsolid,#cda84e);cursor:pointer}",
+  ".vlm-tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid rgba(var(--vacc,205,168,78),.2);flex:none}",
+  ".vlm-window.vlm-min .vlm-tabs{display:none}",
+  ".vlm-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:5px;cursor:pointer;background:none;border:none;border-bottom:2px solid transparent;padding:8px 4px 9px;color:rgba(var(--vacc,205,168,78),.55);font-family:'Cormorant Garamond',Georgia,serif;font-size:12px;letter-spacing:1.5px;text-transform:uppercase;transition:color .15s,border-color .15s}",
+  ".vlm-tab:hover{color:rgba(var(--vacc,205,168,78),.85)}",
+  ".vlm-tab.on{color:var(--vsolid,#cda84e);border-bottom-color:var(--vsolid,#cda84e)}",
+  ".vlm-tab-ico{display:none}",
+  ".vlm-tab-rn{display:none}",
+  ".vlm-tab-lbl{display:inline}",
+  ".vlm-panel{display:none}",
+  ".vlm-window[data-wintab=scene] .vlm-panel[data-panel=scene]{display:block}",
+  ".vlm-window[data-wintab=minds] .vlm-panel[data-panel=minds]{display:block}",
+  ".vlm-window[data-wintab=story] .vlm-panel[data-panel=story]{display:block}",
+  ".vlm-window[data-wintab=backstage] .vlm-panel[data-panel=backstage]{display:block}",
+﻿  ".vls-parchment .vlm-tabs{border-bottom:1px solid rgba(90,70,40,.4)}",
+  ".vls-parchment .vlm-tab{color:rgba(90,68,32,.6);font-family:'Cormorant Garamond',Georgia,serif;font-style:italic}",
+  ".vls-parchment .vlm-tab.on{color:#5a4420;border-bottom-color:#5a4420}",
+  ".vls-parchment .vlm-tab-lbl{display:none}",
+  ".vls-parchment .vlm-tab-rn{display:inline;font-size:16px;font-style:normal;letter-spacing:0}",
+  ".vls-phone .vlm-tabs{gap:6px;padding:8px 12px;border-bottom:1px solid rgba(var(--vacc,205,168,78),.16)}",
+  ".vls-phone .vlm-tab{border:none;border-radius:14px;padding:8px;background:rgba(var(--vacc,205,168,78),.08);font-size:18px}",
+  ".vls-phone .vlm-tab.on{background:rgba(var(--vacc,205,168,78),.22);border-bottom-color:transparent}",
+  ".vls-phone .vlm-tab-ico{display:inline}",
+  ".vls-phone .vlm-tab-lbl,.vls-phone .vlm-tab-rn{display:none}",
+  ".vls-codex .vlm-tabs{gap:0;padding:4px 8px 0;border-bottom:1px dashed rgba(var(--vacc,205,168,78),.4)}",
+  ".vls-codex .vlm-tab{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:lowercase}",
+  ".vls-codex .vlm-tab-lbl{display:inline}",
+  ".vls-codex .vlm-tab.on .vlm-tab-lbl::before{content:'['}",
+  ".vls-codex .vlm-tab.on .vlm-tab-lbl::after{content:']'}",
+  ".vls-grimoire .vlm-tab{font-family:'Cormorant Garamond',Georgia,serif;font-size:13px;letter-spacing:2px}",
+  ".vls-grimoire .vlm-tab.on .vlm-tab-lbl::before{content:'\\2766 '}",
+  ".vls-grimoire .vlm-tab.on{text-shadow:0 0 12px rgba(var(--vacc,205,168,78),.6)}",
+  ".vls-vn .vlm-tabs{border-bottom:1px solid rgba(var(--vacc,205,168,78),.25)}",
+  ".vls-vn .vlm-tab{font-style:italic;text-transform:none;letter-spacing:1px}",
   ".vlm-window{position:fixed;z-index:99990;width:360px;height:560px;min-width:280px;min-height:240px;top:90px;right:28px;display:flex;flex-direction:column;background:radial-gradient(130% 90% at 0% 0%,rgba(var(--vacc,205,168,78),.12),transparent 55%),linear-gradient(165deg,rgba(19,17,13,.985),rgba(28,24,19,.975));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:16px;box-shadow:0 22px 70px rgba(0,0,0,.6),inset 0 0 70px rgba(var(--vacc,205,168,78),.05);color:#d8c9a8;overflow:hidden;backdrop-filter:blur(10px);transition:opacity .2s ease,transform .2s ease}",
   ".vlm-window.vlm-hidden{opacity:0;pointer-events:none;transform:translateY(10px) scale(.97)}",
   ".vlm-window.vlm-min{height:48px!important;min-height:48px}",
