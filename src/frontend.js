@@ -625,7 +625,7 @@ function wireWindowControls(win, hide, refresh) {
 function makeDraggable(win, handle) {
   let sx = 0, sy = 0, ox = 0, oy = 0, on = false;
   handle.addEventListener('mousedown', (e) => {
-    if (e.target.closest('.vlm-btn')) return;
+    if (e.target.closest('.vlm-btn') || e.target.closest('.vlm-colorpop')) return;
     on = true;
     const r = win.getBoundingClientRect();
     ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY;
