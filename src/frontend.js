@@ -367,11 +367,12 @@ function _setupImpl(ctx) {
     // font size: child elements all use explicit px, so scaling the body's
     // font-size won't cascade. Use `zoom` on the scroll container, which scales
     // the rendered size of every descendant regardless of its px value.
+    // Scoped to the FLOATING WINDOW only — the chronicle/cast drawer tabs keep
+    // their default size for legibility.
     const sz = Number(_theme.size) || 100;
     if (sz !== 100) {
       const f = (sz / 100).toFixed(3);
       rules.push('.vlm-window .vlm-body{zoom:' + f + '}');
-      rules.push('.vlc-root .vlc-body{zoom:' + f + '}');
     }
     ensureThemeStyle().textContent = rules.join('\n');
     // background only applies to the floating window (tabs live in the drawer)
@@ -1277,16 +1278,22 @@ function knowledgeHtml(ch) {
     const kn = _knowFilter === 'all' ? knAll : knAll.filter((k) => k.reliability === _knowFilter);
     html += '<div class="vlc-know-h">What characters know</div>';
     html += '<div class="vlc-fbar" data-know-fbar>' + chips + '</div>';
-    html += kn.length ? kn.map((k) => {
+    html += kn.length ? '<div class="vlc-know-grid">' + kn.map((k) => {
       const i = knAll.indexOf(k);
-      return '<div class="vlc-know" data-know-i="' + i + '">'
-      + '<span class="vlc-know-rel ' + (relCls[k.reliability] || 'k-knows') + '">' + escapeHtml(relLbl[k.reliability] || k.reliability) + '</span>'
-      + '<span class="vlc-know-who">' + escapeHtml(k.who) + '</span>'
-      + '<span class="vlc-know-fact">' + escapeHtml(k.fact) + (k.reliability === 'wrong' && k.truth === 'false' ? ' <em class="vlc-know-x">(untrue)</em>' : '') + '</span>'
-      + '<button class="vlc-mini-edit" data-know-edit data-id="' + escapeHtml(k.id || '') + '" data-who="' + escapeHtml(k.who) + '" data-fact="' + escapeHtml(k.fact) + '" data-reliability="' + escapeHtml(k.reliability || '') + '" data-truth="' + escapeHtml(k.truth || '') + '" data-source="' + escapeHtml(k.source || '') + '" title="Edit">\u270E</button>'
-      + '<button class="vlc-mini-del" data-know-del="knowledge" data-id="' + escapeHtml(k.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button>'
+      const untrue = (k.reliability === 'wrong' && k.truth === 'false') ? '<span class="vlc-know-x">untrue</span>' : '';
+      return '<div class="vlc-know ' + (relCls[k.reliability] || 'k-knows') + '" data-know-i="' + i + '">'
+      + '<div class="vlc-know-top">'
+        + '<span class="vlc-know-who">' + escapeHtml(k.who) + '</span>'
+        + '<span class="vlc-know-rel">' + escapeHtml(relLbl[k.reliability] || k.reliability) + '</span>' + untrue
+        + '<span class="vlc-know-ctl">'
+        + '<button class="vlc-mini-edit" data-know-edit data-id="' + escapeHtml(k.id || '') + '" data-who="' + escapeHtml(k.who) + '" data-fact="' + escapeHtml(k.fact) + '" data-reliability="' + escapeHtml(k.reliability || '') + '" data-truth="' + escapeHtml(k.truth || '') + '" data-source="' + escapeHtml(k.source || '') + '" title="Edit">\u270E</button>'
+        + '<button class="vlc-mini-del" data-know-del="knowledge" data-id="' + escapeHtml(k.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button>'
+        + '</span>'
+      + '</div>'
+      + '<div class="vlc-know-fact">' + escapeHtml(k.fact) + '</div>'
+      + (k.source ? '<div class="vlc-know-src">via ' + escapeHtml(k.source) + '</div>' : '')
       + '</div>';
-    }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(relLbl[_knowFilter] || _knowFilter) + '\u201d entries.</div>';
+    }).join('') + '</div>' : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(relLbl[_knowFilter] || _knowFilter) + '\u201d entries.</div>';
   }
   if (secAll.length) {
     const dCls = { minor: 's-minor', major: 's-major', explosive: 's-explosive' };
@@ -1299,7 +1306,7 @@ function knowledgeHtml(ch) {
     const sec = _secFilter === 'all' ? secAll : secAll.filter((x) => x.danger === _secFilter);
     html += '<div class="vlc-know-h" style="margin-top:12px">Secrets in play</div>';
     html += '<div class="vlc-fbar" data-sec-fbar>' + chips + '</div>';
-    html += sec.length ? sec.map((x) => {
+    html += sec.length ? '<div class="vlc-sec-grid">' + sec.map((x) => {
       const i = secAll.indexOf(x);
       return '<div class="vlc-secret ' + (dCls[x.danger] || 's-major') + '" data-secret-i="' + i + '">'
       + '<div class="vlc-secret-top"><span class="vlc-secret-keeper">' + escapeHtml(x.keeper) + '</span>'
@@ -1310,7 +1317,7 @@ function knowledgeHtml(ch) {
       + '<div class="vlc-secret-body">' + escapeHtml(x.secret) + '</div>'
       + (x.exposure ? '<div class="vlc-secret-exp">may surface: ' + escapeHtml(x.exposure) + '</div>' : '')
       + '</div>';
-    }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_secFilter) + '\u201d secrets.</div>';
+    }).join('') + '</div>' : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_secFilter) + '\u201d secrets.</div>';
   }
   return html;
 }
@@ -1917,7 +1924,7 @@ function relationsHtml(ch) {
     return '<div class="vlc-rel-score"><span class="vlc-rel-score-l">' + label + '</span>'
       + '<span class="vlc-rel-track"><span class="vlc-rel-mid"></span>'
       + '<span class="vlc-rel-fill ' + (pos ? 'pos' : 'neg') + '" style="' + (pos ? 'left:50%;width:' + pct + '%' : 'right:50%;width:' + pct + '%') + '"></span></span>'
-      + '<span class="vlc-rel-score-v">' + (n > 0 ? '+' : '') + n + '</span></div>';
+      + '<span class="vlc-rel-score-v ' + (pos ? 'pos' : 'neg') + '">' + (n > 0 ? '+' : '') + n + '</span></div>';
   };
   // tiny sparkline of the affection history (last ~12 points)
   const spark = (r) => {
@@ -1928,21 +1935,29 @@ function relationsHtml(ch) {
   };
   const rows = shown.length ? shown.slice().sort((a, b) => (b.lastTurn || 0) - (a.lastTurn || 0)).map((r) => {
     const aN = nameOf(r.a), bN = nameOf(r.b);
-    const text = r.label ? (escapeHtml(aN) + ' \u2014 ' + escapeHtml(r.label)) : (escapeHtml(aN) + ' \u2194 ' + escapeHtml(bN));
-    const sub = r.label ? ('<span class="vlc-rel-b">\u2194 ' + escapeHtml(bN) + '</span>') : '';
-    const tags = '<span class="vlc-rel-sent ' + (sentCls[r.sentiment] || 'se-neu') + '" title="' + escapeHtml(r.sentiment || 'neutral') + '">' + escapeHtml(sentLbl[r.sentiment] || (r.sentiment || 'neutral')) + '</span>'
-      + '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>'
-      + (r.status && r.status !== 'active' ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '');
     const aff = (typeof r.affection === 'number') ? r.affection : 0;
     const tr = (typeof r.trust === 'number') ? r.trust : 0;
-    return '<div class="vlc-rel-row">'
-      + '<div class="vlc-rel-head"><span class="vlc-rel-t">' + text + ' ' + sub + '</span>' + tags
-      + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" data-affection="' + aff + '" data-trust="' + tr + '" title="Edit">\u270E</button>'
-      + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button></div>'
-      + '<div class="vlc-rel-scores">' + scoreBar('aff', aff) + scoreBar('trust', tr) + spark(r) + '</div>'
+    const sentChip = '<span class="vlc-rel-sent ' + (sentCls[r.sentiment] || 'se-neu') + '" title="' + escapeHtml(r.sentiment || 'neutral') + '">' + escapeHtml(sentLbl[r.sentiment] || (r.sentiment || 'neutral')) + '</span>';
+    const catChip = '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>';
+    const stChip = (r.status && r.status !== 'active') ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '';
+    // header: A → B as a clear pair; the relationship label sits on its own line
+    const pair = '<span class="vlc-rel-a">' + escapeHtml(aN) + '</span><span class="vlc-rel-arrow">\u2192</span><span class="vlc-rel-bn">' + escapeHtml(bN) + '</span>';
+    const lbl = r.label ? '<div class="vlc-rel-label">\u201c' + escapeHtml(r.label) + '\u201d</div>' : '';
+    return '<div class="vlc-rel-card ' + (sentCls[r.sentiment] || 'se-neu') + '" data-cat="' + escapeHtml(r.category || 'neutral') + '">'
+      + '<div class="vlc-rel-top">'
+        + '<div class="vlc-rel-pair">' + pair + '</div>'
+        + '<div class="vlc-rel-ctl">'
+          + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" data-affection="' + aff + '" data-trust="' + tr + '" title="Edit">\u270E</button>'
+          + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button>'
+        + '</div>'
+      + '</div>'
+      + lbl
+      + '<div class="vlc-rel-tags">' + sentChip + catChip + stChip + '</div>'
+      + '<div class="vlc-rel-scores">' + scoreBar('Affection', aff) + scoreBar('Trust', tr) + '</div>'
+      + (spark(r) ? '<div class="vlc-rel-sparkwrap">' + spark(r) + '</div>' : '')
       + '</div>';
   }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_relFilter) + '\u201d relations.</div>';
-  return '<div class="vlc-fbar" data-rel-fbar>' + chips + '</div>' + rows;
+  return '<div class="vlc-fbar" data-rel-fbar>' + chips + '</div><div class="vlc-rel-grid">' + rows + '</div>';
 }
 
 function renderCast(host, ch) {
@@ -2171,7 +2186,7 @@ const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" d
   + '<div class="vlm-resize" data-resize></div>';
 
 const VELLUM_CSS = [
-  "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;600&family=Quicksand:wght@400;600&family=Roboto+Slab:wght@400;600&display=swap');",
+  "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;600&family=Quicksand:wght@400;600&family=Roboto+Slab:wght@400;600&family=Spectral:ital,wght@0,400;0,500;0,600;1,400&display=swap');",
 ﻿  ".vlm-cp-range{width:100%;accent-color:var(--vsolid,#cda84e);cursor:pointer}",
   ".vlm-tabs{display:flex;gap:2px;padding:6px 8px 0;border-bottom:1px solid rgba(var(--vacc,205,168,78),.2);flex:none}",
   ".vlm-window.vlm-min .vlm-tabs{display:none}",
@@ -2214,18 +2229,6 @@ const VELLUM_CSS = [
   ".vlm-cp-living-d{flex:1;font-family:'JetBrains Mono',monospace;font-size:8.5px;line-height:1.4;color:rgba(var(--vacc,205,168,78),.5)}",
   ".vlm-cp-living-btn{flex:none;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.12);border:1px solid rgba(var(--vacc,205,168,78),.35);border-radius:7px;padding:6px 12px;cursor:pointer}",
   ".vlm-cp-living-btn.on{color:#1a1610;background:var(--vsolid,#cda84e)}",
-  ".vlc-rel-head{display:flex;gap:7px;align-items:center}",
-  ".vlc-rel-scores{display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap}",
-  ".vlc-rel-score{display:flex;gap:5px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:8.5px}",
-  ".vlc-rel-score-l{color:rgba(205,168,78,.6);text-transform:uppercase;letter-spacing:.5px;width:30px}",
-  ".vlc-rel-track{position:relative;width:84px;height:7px;border-radius:4px;background:rgba(120,110,90,.25);overflow:hidden}",
-  ".vlc-rel-mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.25)}",
-  ".vlc-rel-fill{position:absolute;top:0;bottom:0}",
-  ".vlc-rel-fill.pos{background:linear-gradient(90deg,rgba(143,166,126,.5),#8fa67e)}",
-  ".vlc-rel-fill.neg{background:linear-gradient(270deg,rgba(201,106,106,.5),#c96a6a)}",
-  ".vlc-rel-score-v{color:#cdbf9a;width:26px;text-align:right}",
-  ".vlc-rel-spark{width:60px;height:18px}",
-  ".vlc-rel-spark polyline{fill:none;stroke:var(--vsolid,#cda84e);stroke-width:2;opacity:.7}",
 ﻿  ".vls-parchment .vlm-tabs{border-bottom:1px solid rgba(90,70,40,.4)}",
   ".vls-parchment .vlm-tab{color:rgba(90,68,32,.6);font-family:'Cormorant Garamond',Georgia,serif;font-style:italic}",
   ".vls-parchment .vlm-tab.on{color:#5a4420;border-bottom-color:#5a4420}",
@@ -2332,7 +2335,7 @@ const VELLUM_CSS = [
   ".vlm-resize{position:absolute;right:2px;bottom:2px;width:16px;height:16px;cursor:nwse-resize;opacity:.5}",
   ".vlm-resize::after{content:'';position:absolute;right:3px;bottom:3px;width:8px;height:8px;border-right:2px solid var(--vsolid,#cda84e);border-bottom:2px solid var(--vsolid,#cda84e)}",
   /* ---- Chronicle (drawer tab) ---- */
-  ".vlc-root{display:flex;flex-direction:column;height:100%;color:#d8c9a8;font-family:'JetBrains Mono',Consolas,monospace;background:radial-gradient(120% 60% at 100% 0%,rgba(var(--vacc,205,168,78),.07),transparent 60%)}",
+  ".vlc-root{display:flex;flex-direction:column;height:100%;color:#e3d6ba;font-family:'Spectral',Georgia,serif;font-size:13.5px;line-height:1.55;background:radial-gradient(120% 60% at 100% 0%,rgba(var(--vacc,205,168,78),.07),transparent 60%)}",
   ".vlc-head{padding:16px 18px 10px}",
   ".vlc-title{font-family:'Cormorant Garamond',Georgia,serif;font-size:24px;font-weight:600;letter-spacing:1px;color:#ecdcb6}",
   ".vlc-sub{font-size:10px;opacity:.6;line-height:1.4;margin-top:2px}",
@@ -2351,7 +2354,7 @@ const VELLUM_CSS = [
   ".vlc-track-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:5px}",
   ".vlc-track-name{font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;font-weight:600;color:#ecdcb6;line-height:1.15}",
   ".vlc-track-span{flex:none;font-size:8.5px;letter-spacing:1px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.6)}",
-  ".vlc-track-now{font-size:11px;line-height:1.5;color:#e3d6bb}",
+  ".vlc-track-now{font-size:13px;line-height:1.5;color:#e3d6bb}",
   ".vlc-evo-toggle{margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.78);background:none;border:none;cursor:pointer;padding:2px 0}",
   ".vlc-evo{margin-top:8px;padding-left:8px;border-left:1px dashed rgba(var(--vacc,205,168,78),.3)}",
   ".vlc-step{position:relative;padding:5px 0 5px 14px}",
@@ -2379,7 +2382,7 @@ const VELLUM_CSS = [
   ".vlc-log-row:last-child{border-bottom:none}",
   ".vlc-log-d{flex:none;width:54px;font-size:8.5px;letter-spacing:.5px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.6)}",
   ".vlc-log-x{flex:none;color:rgba(var(--vacc,205,168,78),.7)}",
-  ".vlc-log-t{flex:1;color:#cdbf9e}",
+  ".vlc-log-t{flex:1;color:#d8c9a8;font-size:13px;line-height:1.5}",
   ".vlc-empty{opacity:.5;font-style:italic;font-size:11px;padding:8px 2px}",
   ".vlc-empty.big{text-align:center;padding:48px 12px;font-family:'Cormorant Garamond',serif;font-size:16px;line-height:1.9}",
   ".vlc-empty.big span{font-size:11px;opacity:.7}",
@@ -2422,7 +2425,7 @@ const VELLUM_CSS = [
   ".vlc-mem-body{padding:0 13px 12px}",
   ".vlc-mem-h{margin-bottom:5px}",
   ".vlc-mem-span{flex:none;font-size:8.5px;letter-spacing:1px;text-transform:uppercase;color:rgba(180,142,208,.85)}",
-  ".vlc-mem-t{font-size:11px;line-height:1.5;color:#e3d6bb}",
+  ".vlc-mem-t{font-size:13px;line-height:1.55;color:#e3d6bb}",
   ".vlc-mem-kw{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}",
   ".vlc-mem-del{flex:none;margin-left:auto;width:18px;height:18px;border:none;border-radius:5px;cursor:pointer;background:rgba(201,138,138,.14);color:#c98a8a;font-size:9px;line-height:1;display:grid;place-items:center;transition:background .15s}",
   ".vlc-mem-edit{flex:none;margin-left:auto;width:18px;height:18px;border:none;border-radius:5px;cursor:pointer;background:rgba(var(--vacc,205,168,78),.14);color:var(--vsolid,#cda84e);font-size:9px;line-height:1;display:grid;place-items:center;transition:background .15s}",
@@ -2611,45 +2614,71 @@ const VELLUM_CSS = [
   ".vls-grimoire .vlm-av{box-shadow:0 0 14px rgba(var(--vacc,205,168,78),.5)}",
   ".vlc-lore-bar{display:flex;gap:6px;margin-bottom:10px}",
   ".vlc-know-h{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(205,168,78,.7);margin:4px 0 6px}",
-  ".vlc-know{display:flex;gap:8px;align-items:baseline;padding:6px 0;border-bottom:1px solid rgba(205,168,78,.07);font-size:10.5px;line-height:1.45}",
-  ".vlc-know-rel{flex:none;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 7px;border-radius:5px;color:#1a1610}",
-  ".k-knows{background:#8fa67e}",".k-believes{background:#7fa8c9}",".k-suspects{background:#cda84e}",".k-wrong{background:#c98a8a}",".k-unaware{background:#8c8478}",
-  ".vlc-know-who{flex:none;font-weight:600;color:#ecdcb6}",
-  ".vlc-know-fact{flex:1;color:#cdbf9e}",".vlc-know-x{color:#c98a8a;font-style:italic;font-size:9px}",
-  ".vlc-secret{background:rgba(0,0,0,.24);border:1px solid rgba(201,138,138,.2);border-left:3px solid #c98a8a;border-radius:9px;padding:9px 11px;margin-bottom:8px}",
+  ".vlc-know-grid{display:flex;flex-direction:column;gap:7px;margin-bottom:4px}",
+  ".vlc-know{background:rgba(0,0,0,.2);border:1px solid rgba(205,168,78,.12);border-left:3px solid #8c8478;border-radius:9px;padding:8px 11px;overflow-wrap:anywhere}",
+  ".vlc-know.k-knows{border-left-color:#8fa67e}",".vlc-know.k-believes{border-left-color:#7fa8c9}",".vlc-know.k-suspects{border-left-color:#cda84e}",".vlc-know.k-wrong{border-left-color:#c98a8a}",".vlc-know.k-unaware{border-left-color:#8c8478}",
+  ".vlc-know-top{display:flex;gap:7px;align-items:center;margin-bottom:4px}",
+  ".vlc-know-who{font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;font-weight:600;color:#ecdcb6;line-height:1.1}",
+  ".vlc-know-rel{font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 7px;border-radius:5px;color:#1a1610}",
+  ".k-knows .vlc-know-rel{background:#8fa67e}",".k-believes .vlc-know-rel{background:#7fa8c9}",".k-suspects .vlc-know-rel{background:#cda84e}",".k-wrong .vlc-know-rel{background:#c98a8a}",".k-unaware .vlc-know-rel{background:#8c8478}",
+  ".vlc-know-x{font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px;text-transform:uppercase;color:#1a1610;background:#c96a6a;padding:2px 6px;border-radius:5px}",
+  ".vlc-know-ctl{margin-left:auto;display:inline-flex;gap:3px;flex:none}",
+  ".vlc-know-fact{font-size:13px;line-height:1.5;color:#e3d6bb}",
+  ".vlc-know-src{font-size:10px;font-style:italic;opacity:.55;margin-top:3px}",
+  ".vlc-sec-grid{display:flex;flex-direction:column;gap:7px}",
+  ".vlc-secret{background:rgba(0,0,0,.24);border:1px solid rgba(201,138,138,.2);border-left:3px solid #c98a8a;border-radius:9px;padding:9px 12px;overflow-wrap:anywhere}",
   ".vlc-secret.s-minor{border-left-color:#8c8478}",".vlc-secret.s-major{border-left-color:#cda84e}",".vlc-secret.s-explosive{border-left-color:#c96a6a}",
-  ".vlc-secret-top{display:flex;gap:6px;align-items:baseline;font-size:10px;margin-bottom:4px}",
-  ".vlc-secret-keeper{font-weight:600;color:#ecdcb6}",".vlc-secret-arrow{opacity:.6;font-size:9px}",".vlc-secret-from{color:#bdc9d4}",
-  ".vlc-secret-danger{margin-left:auto;font-size:8px;text-transform:uppercase;letter-spacing:.5px;color:#c98a8a}",
-  ".vlc-secret-body{font-size:11px;line-height:1.5;color:#e3d6bb}",".vlc-secret-exp{font-size:9.5px;opacity:.65;margin-top:4px;font-style:italic}",
+  ".vlc-secret-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;margin-bottom:5px}",
+  ".vlc-secret-keeper{font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;font-weight:600;color:#ecdcb6}",".vlc-secret-arrow{opacity:.55;font-size:10px;font-style:italic}",".vlc-secret-from{font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;color:#bdc9d4}",
+  ".vlc-secret-danger{margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.5px;font-weight:600;color:#1a1610;background:#c98a8a;padding:2px 6px;border-radius:5px}",".s-minor .vlc-secret-danger{background:#8c8478}",".s-major .vlc-secret-danger{background:#cda84e}",".s-explosive .vlc-secret-danger{background:#c96a6a}",
+  ".vlc-secret-body{font-size:13px;line-height:1.5;color:#e3d6bb}",".vlc-secret-exp{font-size:11px;opacity:.65;margin-top:5px;font-style:italic}",
   ".vlc-mj{background:rgba(0,0,0,.22);border:1px solid rgba(205,168,78,.14);border-radius:9px;margin-bottom:8px;overflow:hidden}",
   ".vlc-mj-sum{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:9px 12px;background:linear-gradient(90deg,rgba(205,168,78,.1),transparent)}",
   ".vlc-mj-sum::-webkit-details-marker{display:none}",".vlc-mj-sum::before{content:'\u25B8';color:rgba(205,168,78,.7);font-size:10px;transition:transform .15s}",
   ".vlc-mj[open] .vlc-mj-sum::before{transform:rotate(90deg)}",
   ".vlc-mj-name{flex:1;font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;font-weight:600;color:#ecdcb6}",
   ".vlc-mj-body{padding:4px 12px 10px}",
-  ".vlc-mj-row{display:flex;gap:8px;align-items:baseline;padding:5px 0;border-bottom:1px solid rgba(205,168,78,.06);font-size:10.5px;line-height:1.45}",
+  ".vlc-mj-row{display:flex;gap:8px;align-items:baseline;padding:7px 0;border-bottom:1px solid rgba(205,168,78,.06);font-size:13px;line-height:1.5}",
   ".vlc-mj-row:last-child{border-bottom:none}",
-  ".vlc-mj-w{flex:none;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:4px;color:#1a1610;background:#8c8478}",
+  ".vlc-mj-w{flex:none;font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:4px;color:#1a1610;background:#8c8478}",
   ".w-trivial{background:#6c6c6c}",".w-minor{background:#8c8478}",".w-sig{background:#cda84e}",".w-def{background:#c96a6a}",
-  ".vlc-mj-t{flex:1;color:#d6c8a6}",".vlc-mj-about{opacity:.6;font-style:italic}",
+  ".vlc-mj-t{flex:1;color:#e0d2b2}",".vlc-mj-about{opacity:.6;font-style:italic}",
   ".vlc-mj-row.s-pos{border-left:2px solid rgba(143,166,126,.5);padding-left:6px}",".vlc-mj-row.s-neg{border-left:2px solid rgba(201,138,138,.5);padding-left:6px}",".vlc-mj-row.s-cx{border-left:2px solid rgba(180,142,208,.5);padding-left:6px}",".vlc-mj-row.s-neu{border-left:2px solid rgba(140,132,120,.4);padding-left:6px}",
   ".vlc-mini-del{flex:none;margin-left:auto;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(201,138,138,.14);color:#c98a8a;font-size:8px;line-height:1;display:grid;place-items:center}",
   ".vlc-mini-del:hover{background:rgba(201,138,138,.34)}",
   /* relations */
-  ".vlc-rel-row{display:flex;gap:7px;align-items:center;padding:6px 0;border-bottom:1px solid rgba(205,168,78,.07);font-size:10.5px;line-height:1.4}",
-  ".vlc-rel-row:last-child{border-bottom:none}",
-  ".vlc-rel-t{flex:1;color:#e6d9bd}",
-  ".vlc-rel-b{opacity:.6;font-size:9.5px}",
-  ".vlc-rel-cat{flex:none;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:4px;color:#1a1610;background:#8c8478}",
-  ".r-fam{background:#cda84e}",".r-rom{background:#c97a9a}",".r-all{background:#8fa67e}",".r-riv{background:#c96a6a}",".r-soc{background:#7ea6b0}",".r-neu{background:#8c8478}",
-  ".vlc-rel-st{flex:none;font-size:8px;letter-spacing:.5px;text-transform:uppercase;padding:2px 5px;border-radius:4px;color:#cda84e;background:rgba(205,168,78,.14);border:1px solid rgba(205,168,78,.25)}",
-  ".vlc-rel-sent{flex:none;font-size:8px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:2px 6px;border-radius:4px;border:1px solid transparent}",
+﻿  ".vlc-rel-grid{display:flex;flex-direction:column;gap:9px}",
+  ".vlc-rel-card{background:rgba(0,0,0,.22);border:1px solid rgba(205,168,78,.14);border-left:3px solid #8c8478;border-radius:11px;padding:10px 12px;overflow:hidden}",
+  ".vlc-rel-card.se-warm{border-left-color:#d8a05a}",".vlc-rel-card.se-host{border-left-color:#c96a6a}",".vlc-rel-card.se-strain{border-left-color:#cda84e}",".vlc-rel-card.se-cx{border-left-color:#b48ed0}",".vlc-rel-card.se-neu{border-left-color:#8c8478}",
+  ".vlc-rel-top{display:flex;align-items:flex-start;gap:8px}",
+  ".vlc-rel-pair{flex:1;min-width:0;display:flex;align-items:center;gap:7px;flex-wrap:wrap}",
+  ".vlc-rel-a{font-family:'Cormorant Garamond',Georgia,serif;font-size:16px;font-weight:600;color:#ecdcb6}",
+  ".vlc-rel-arrow{color:var(--vsolid,#cda84e);font-size:13px;opacity:.8}",
+  ".vlc-rel-bn{font-family:'Cormorant Garamond',Georgia,serif;font-size:16px;font-weight:600;color:#cbb78a}",
+  ".vlc-rel-ctl{flex:none;display:inline-flex;gap:3px}",
+  ".vlc-rel-label{font-size:12.5px;font-style:italic;color:#cdbf9e;margin:5px 0 7px;line-height:1.45}",
+  ".vlc-rel-tags{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:9px}",
+  ".vlc-rel-sent{font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:2px 7px;border-radius:5px;border:1px solid transparent}",
   ".se-warm{color:#e6b89a;background:rgba(216,160,90,.16);border-color:rgba(216,160,90,.4)}",
   ".se-host{color:#e09090;background:rgba(201,106,106,.18);border-color:rgba(201,106,106,.45)}",
   ".se-strain{color:#d8c98a;background:rgba(205,168,78,.16);border-color:rgba(205,168,78,.4)}",
   ".se-cx{color:#c9a8e0;background:rgba(180,142,208,.16);border-color:rgba(180,142,208,.4)}",
   ".se-neu{color:#9aa0a6;background:rgba(140,132,120,.16);border-color:rgba(140,132,120,.35)}",
+  ".vlc-rel-cat{font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 7px;border-radius:5px;color:#1a1610;background:#8c8478}",
+  ".r-fam{background:#cda84e}",".r-rom{background:#c97a9a}",".r-all{background:#8fa67e}",".r-riv{background:#c96a6a}",".r-soc{background:#7ea6b0}",".r-neu{background:#8c8478}",
+  ".vlc-rel-st{font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:5px;color:#cda84e;background:rgba(205,168,78,.14);border:1px solid rgba(205,168,78,.25)}",
+  ".vlc-rel-scores{display:flex;flex-direction:column;gap:6px}",
+  ".vlc-rel-score{display:flex;gap:8px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px}",
+  ".vlc-rel-score-l{flex:none;width:62px;color:rgba(220,200,150,.7);text-transform:uppercase;letter-spacing:.5px}",
+  ".vlc-rel-track{position:relative;flex:1;min-width:0;height:8px;border-radius:5px;background:rgba(120,110,90,.22);overflow:hidden}",
+  ".vlc-rel-mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.28)}",
+  ".vlc-rel-fill{position:absolute;top:0;bottom:0}",
+  ".vlc-rel-fill.pos{background:linear-gradient(90deg,rgba(143,166,126,.45),#8fa67e)}",
+  ".vlc-rel-fill.neg{background:linear-gradient(270deg,rgba(201,106,106,.45),#c96a6a)}",
+  ".vlc-rel-score-v{flex:none;width:34px;text-align:right;font-weight:600}",".vlc-rel-score-v.pos{color:#a9c089}",".vlc-rel-score-v.neg{color:#e09090}",
+  ".vlc-rel-sparkwrap{margin-top:8px;border-top:1px solid rgba(205,168,78,.1);padding-top:6px}",
+  ".vlc-rel-spark{width:100%;height:24px;display:block}",
+  ".vlc-rel-spark polyline{fill:none;stroke:var(--vsolid,#cda84e);stroke-width:2;opacity:.75}",
   ".vlc-mini-edit{flex:none;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(205,168,78,.14);color:#cda84e;font-size:9px;line-height:1;display:grid;place-items:center;margin-left:4px}",
   ".vlc-mini-edit:hover{background:rgba(205,168,78,.34)}",
   ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",
