@@ -908,11 +908,17 @@ const RECALL = {
 // bounds; the allocator hands leftover budget down the priority chain so a quiet
 // scene still fills with the most relevant material.
 const INJECT_BUDGET = {
-  total: 5200,        // hard ceiling for the entire injected recall system message
+  total: 6400,        // hard ceiling for the entire injected recall system message
   cast: 1400,         // cast roster digest
   knowledge: 1100,    // knowledge + secrets digest
   recall: 2600,       // scene-relevant chronicle recall (mirrors RECALL.budgetChars)
   graph: 900,         // entity-graph multi-hop additions (#12)
+  memory: 1800,       // dedicated Story Memory slice (chapter summaries) — never crowded out
+};
+const MEMORY_RECALL = {
+  recencyFloor: 2,    // always include the N most-recent summaries (bridge over hidden turns)
+  maxItems: 8,
+  minScore: 1.5,      // lower gate than general recall — summaries are precious
 };
 // Conversation-phase budget multipliers (#7) applied to the recall slice.
 const PHASE_BUDGET_MULT = { action: 1.15, dialogue: 1.0, intro: 0.85, transition: 0.7, unknown: 1.0 };
@@ -1076,6 +1082,173 @@ function selectRelevant(ch, queryText, pinnedArcIds, pinnedThreadIds, opts) {
   return { lines, trace, ids };
 }
 
+// ============================================================================
+// STORY MEMORY — a dedicated, smart summary-only selector (Option B).
+// Chapter summaries are memory, not trivia: they get their own budget, their
+// own scoring tuned for summaries (recency floor + entity/tag-aware, no density
+// penalty), and a multi-axis index that an optional LLM can traverse to drill
+// from an axis (character/topic/plot/day) to a concrete chapter finding.
+// ============================================================================
+
+// Tag-aware relevance score for a single summary against the scene.
+function scoreMemory(m, layers, qtokens, qphrase, nc) {
+  let s = 0;
+  const why = [];
+  // keyword + phrase (existing signal)
+  const kw = (m.keywords || []).join(' ');
+  const kwS = layeredScore(kw, layers) * 2;
+  const ph = phraseBonus(kw, layers);
+  const body = layeredScore(m.text, layers);
+  if (kwS) { s += kwS; why.push('keywords'); }
+  if (ph) { s += ph; why.push('phrase'); }
+  if (body) s += body * 0.5;
+  // ENTITY overlap (#2): a character named in the scene → strong boost.
+  for (const c of (m.characters || [])) {
+    const cn = normForPhrase(c).trim();
+    if (cn.length >= 3 && qphrase.includes(' ' + cn + ' ')) { s += 5; why.push('character ' + c); }
+    else { const toks = recallTokens(c).filter((t) => t.length >= 3 && !RECALL_STOP.has(t)); for (const t of toks) if (qtokens.includes(t)) { s += 2.5; break; } }
+  }
+  // TOPIC overlap (#7): a recurring motif/topic echoed in the scene.
+  for (const t of (m.topics || [])) {
+    const tn = normForPhrase(t).trim();
+    if (tn.length >= 3 && qphrase.includes(' ' + tn + ' ')) { s += 4; why.push('topic "' + t + '"'); }
+    else { const toks = recallTokens(t).filter((w) => w.length >= 4 && !RECALL_STOP.has(w)); for (const w of toks) if (qtokens.includes(w)) { s += 1.5; break; } }
+  }
+  // PLOT / location overlap.
+  for (const p of (m.plots || [])) { const toks = recallTokens(p).filter((w) => w.length >= 4 && !RECALL_STOP.has(w)); for (const w of toks) if (qtokens.includes(w)) { s += 2; why.push('plot'); break; } }
+  if (m.location) { const ln = normForPhrase(m.location).trim(); if (ln.length >= 3 && qphrase.includes(' ' + ln + ' ')) { s += 2; why.push('location'); } }
+  return { score: s, why: why.slice(0, 3).join(', ') };
+}
+
+// One injectable line for a summary (compact, dated, titled).
+function memoryLine(m) {
+  const dl = m.day ? 'Day ' + m.day : 't' + m.fromTurn + '-' + m.toTurn;
+  const head = m.title ? (m.title + ' — ') : '';
+  return '\u2756 [' + dl + '] ' + head + (m.text || '').trim();
+}
+
+// selectMemories(): the smart summary injector. Recency floor (#1) + tag/entity
+// scoring (#2) + dedup (#5), in its own budget. Returns { lines, trace, ids }.
+function selectMemories(ch, queryText, opts) {
+  const o = opts || {};
+  const mems = (ch.memories || []);
+  if (!mems.length) return { lines: [], trace: [], ids: [] };
+  const budget = Number.isFinite(o.budgetChars) ? o.budgetChars : INJECT_BUDGET.memory;
+  const layers = buildLayersFromQuery(queryText);
+  const qtokens = uniqTokens(recallTokens(queryText));
+  const qphrase = normForPhrase(queryText);
+  const nc = o.nc || null;
+  const approved = o.approved instanceof Set ? o.approved : null; // ids the LLM traversal chose
+
+  const byTurn = mems.slice().sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0));
+  const floorN = Math.max(0, MEMORY_RECALL.recencyFloor);
+  const recentIds = new Set(byTurn.slice(-floorN).map((m) => m.id));
+
+  const scored = mems.map((m) => {
+    const r = scoreMemory(m, layers, qtokens, qphrase, nc);
+    let score = r.score;
+    let why = r.why;
+    if (recentIds.has(m.id)) { score += 100; why = 'recent chapter'; }      // recency floor
+    if (approved && approved.has(m.id)) { score += 60; why = 'memory-tree relevant' + (why ? '; ' + why : ''); }
+    return { m, score, why };
+  }).filter((x) => x.score >= MEMORY_RECALL.minScore || recentIds.has(x.m.id) || (approved && approved.has(x.m.id)));
+
+  // order: recency-floor + approved first (by turn), then by score; ties by recency
+  scored.sort((a, b) => {
+    const ap = (recentIds.has(a.m.id) || (approved && approved.has(a.m.id))) ? 1 : 0;
+    const bp = (recentIds.has(b.m.id) || (approved && approved.has(b.m.id))) ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    return (b.score - a.score) || ((b.m.fromTurn || 0) - (a.m.fromTurn || 0));
+  });
+
+  const lines = [], trace = [], ids = [], seen = [];
+  let used = 0;
+  for (const { m, score, why } of scored) {
+    if (lines.length >= MEMORY_RECALL.maxItems) break;
+    const line = memoryLine(m);
+    if (used + line.length + 1 > budget) continue;
+    // dedup (#5): skip a summary that strongly overlaps one already chosen
+    const toks = new Set(recallTokens(m.text).filter((t) => t.length >= 4 && !RECALL_STOP.has(t)));
+    let dup = false;
+    for (const prev of seen) { if (!toks.size || !prev.size) continue; let inter = 0; for (const t of toks) if (prev.has(t)) inter++; if (inter / Math.min(toks.size, prev.size) >= 0.7) { dup = true; break; } }
+    if (dup) continue;
+    seen.push(toks);
+    lines.push(line); ids.push(m.id);
+    trace.push({ id: m.id, kind: 'memory', label: m.title || ('t' + m.fromTurn + '-' + m.toTurn), score: Math.round(score * 10) / 10, why: why || 'relevant chapter' });
+    used += line.length + 1;
+  }
+  // chronological order in the injected block reads as a timeline
+  const order = new Map(byTurn.map((m, i) => [m.id, i]));
+  const zipped = lines.map((l, i) => ({ l, id: ids[i], t: trace[i] })).sort((a, b) => (order.get(a.id) || 0) - (order.get(b.id) || 0));
+  return { lines: zipped.map((z) => z.l), trace: zipped.map((z) => z.t), ids: zipped.map((z) => z.id) };
+}
+
+// Build the multi-axis index (the queryable "tree") from summary tags.
+// Axes: characters, topics, plots, days. Each maps an axis-value -> memory ids.
+function buildMemoryIndex(ch) {
+  const idx = { characters: {}, topics: {}, plots: {}, days: {} };
+  const add = (axis, key, id) => { const k = String(key || '').trim(); if (!k) return; const a = idx[axis]; (a[k] || (a[k] = [])).push(id); };
+  for (const m of (ch.memories || [])) {
+    (m.characters || []).forEach((c) => add('characters', c, m.id));
+    (m.topics || []).forEach((t) => add('topics', t, m.id));
+    (m.plots || []).forEach((p) => add('plots', p, m.id));
+    if (m.day != null) add('days', 'Day ' + m.day, m.id);
+  }
+  return idx;
+}
+
+// ============================================================================
+// DEEP MEMORY — optional LLM tree-traversal over the summary index.
+// Instead of scoring all summaries, the controller is shown the AXES (the
+// character/topic/plot/day branches) + a compact chapter list, and asked which
+// chapters answer the current scene — drilling from an axis to a concrete
+// finding ("A has called B 'honey' since Day 2; A hated it, now loves it").
+// Returns a Set of memory ids to guarantee, fed into selectMemories(approved).
+// Opt-in (rides the Deep Recall toggle); falls back to flat scoring on any miss.
+// ============================================================================
+const MEM_TREE_SYS = 'You are a story librarian. You are given the BRANCHES of a story\'s memory index (characters, topics, plot threads, days) and a compact list of CHAPTERS (id · title · day · who · topics). Given the CURRENT SCENE, decide which chapters hold the history most relevant to what is happening NOW — especially recurring things the scene echoes (a pet name, a promise, an object, a grudge). Output STRICT JSON only: {"chapters":["id","id"],"reason":"one clause on what thread you followed"}. Pick 1-6 chapter ids, the ones whose past directly informs this moment. Prefer following a specific topic/character branch to its origin and evolution over generic matches. No prose outside the JSON.';
+
+const _memTreeCache = new Map(); // chatId -> { sig, ids:Set, at }
+function _memSceneSig(q) { return vhash(String(q || '').slice(-800)); }
+
+async function runMemoryTree(chatId, queryText, userId) {
+  try {
+    const ch = await loadChronicle(chatId);
+    const mems = ch.memories || [];
+    if (mems.length < 4) return null; // not enough to bother; flat scoring suffices
+    if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) return null;
+    const sig = _memSceneSig(queryText);
+    const cached = _memTreeCache.get(chatId);
+    if (cached && cached.sig === sig && Date.now() - cached.at < 90000) return cached.ids;
+
+    const idx = buildMemoryIndex(ch);
+    const axisLines = [];
+    const top = (axis, n) => Object.entries(idx[axis]).sort((a, b) => b[1].length - a[1].length).slice(0, n).map(([k, v]) => k + ' (' + v.length + ')').join(', ');
+    if (Object.keys(idx.characters).length) axisLines.push('Characters: ' + top('characters', 16));
+    if (Object.keys(idx.topics).length) axisLines.push('Topics: ' + top('topics', 20));
+    if (Object.keys(idx.plots).length) axisLines.push('Plots: ' + top('plots', 12));
+    if (Object.keys(idx.days).length) axisLines.push('Days: ' + Object.keys(idx.days).join(', '));
+    const chapterList = mems.slice().sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0)).map((m) =>
+      m.id + ' \u00b7 ' + (m.title || ('t' + m.fromTurn + '-' + m.toTurn)) + (m.day ? ' \u00b7 Day ' + m.day : '')
+      + (m.characters && m.characters.length ? ' \u00b7 ' + m.characters.slice(0, 4).join('/') : '')
+      + (m.topics && m.topics.length ? ' \u00b7 [' + m.topics.slice(0, 4).join(', ') + ']' : '')
+    ).join('\n');
+    const user = 'MEMORY INDEX (branches):\n' + axisLines.join('\n') + '\n\nCHAPTERS:\n' + chapterList + '\n\nCURRENT SCENE:\n' + String(queryText || '').slice(-1400);
+    let raw = '';
+    try { raw = await internalGenerate([{ role: 'system', content: MEM_TREE_SYS }, { role: 'user', content: user }], { temperature: 0.1, max_tokens: 400 }, userId); }
+    catch (e) { return null; }
+    let obj = null;
+    try { obj = JSON.parse(String(raw).replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim().match(/\{[\s\S]*\}/)[0]); } catch (e) { return null; }
+    const valid = new Set(mems.map((m) => m.id));
+    const ids = new Set((Array.isArray(obj.chapters) ? obj.chapters : []).map((x) => String(x)).filter((x) => valid.has(x)));
+    if (!ids.size) return null;
+    _memTreeCache.set(chatId, { sig, ids, at: Date.now() });
+    _prewarmCache.delete(chatId); // new memory-tree picks → next generation re-assembles
+    spindle.log.info('[vellum_tracker] memory-tree picked ' + ids.size + ' chapters' + (obj.reason ? ': ' + obj.reason : ''));
+    return ids;
+  } catch (e) { spindle.log.warn('[vellum_tracker] runMemoryTree: ' + (e && e.message)); return null; }
+}
+
 // Stable id for a candidate so the controller can approve specific entries.
 function vhash(s) { let h = 0; const t = String(s); for (let i = 0; i < t.length; i++) { h = (h * 31 + t.charCodeAt(i)) | 0; } return (h >>> 0).toString(36); }
 
@@ -1128,20 +1301,9 @@ function gatherCandidates(ch, queryText, pinnedArcIds, pinnedThreadIds) {
     const r = rate(s.text, '', '');
     if (r.score > 0) push('shift:' + vhash(s.text), r.score, i, 'shift', s.text.slice(0, 48), r.why, '⚲ ' + dl(s.day) + ': ' + s.text, s.text);
   });
-  (ch.memories || []).forEach((m, i) => {
-    const kw = (m.keywords || []).join(' ');
-    const kwScore = layeredScore(kw, layers) * 2;
-    const bodyScore = layeredScore(m.text, layers);
-    const ph = phraseBonus(kw, layers);
-    const score = kwScore + bodyScore + ph;
-    if (score > 0) {
-      const why = [];
-      if (kwScore > 0) why.push('memory keyword match');
-      if (ph > 0) why.push('keyword phrase in scene');
-      if (bodyScore > 0 && !why.length) why.push('summary keyword hit');
-      push('mem:' + (m.id || ('t' + m.fromTurn)), score + 0.25, 1000 + i, 'memory', 't' + m.fromTurn + '-' + m.toTurn, why.join('; '), '✦ ' + dl(m.day) + ' (t' + m.fromTurn + '-' + m.toTurn + '): ' + m.text, kw);
-    }
-  });
+  // Chapter summaries are NOT pooled here — they have their own dedicated
+  // selectMemories() with a recency floor + tag-aware scoring + own budget, so
+  // they're never crowded out by short events in the shared recall pool.
   cands.sort((a, b) => (b.score - a.score) || (b.recency - a.recency));
   return cands;
 }
@@ -1554,7 +1716,7 @@ function cleanForSummary(s) {
   return stripVtk(stripBts(stripLedger(stripReverie(String(s || ''))))).replace(/\n{3,}/g, '\n\n').trim();
 }
 
-const SUMMARY_SYS = 'You are a story archivist compressing a roleplay excerpt into one dense, factual chapter-memory for long-term recall. Output STRICT JSON only, no prose outside it: {"summary":"3-6 tight past-tense sentences covering EVERYTHING that matters from the excerpt — who was involved, where, key actions, decisions, revelations, emotional turns, and what changed by the end; pack facts, drop atmosphere and filler","keywords":["8-14 lowercase names/places/objects/topics a future scene might key on"],"day":<integer story-day if stated else null>}. Rules: ALWAYS use the real character names provided — never write "{{user}}", "User", "{{char}}", or "you"; be comprehensive but compact (no repetition, no vibes, no commentary); every distinct beat in the excerpt should be recoverable from the summary.';
+const SUMMARY_SYS = 'You are a story archivist compressing a roleplay excerpt into one dense, factual chapter-memory for long-term recall AND indexing it for retrieval. Output STRICT JSON only, no prose outside it: {"summary":"3-6 tight past-tense sentences covering EVERYTHING that matters from the excerpt — who was involved, where, key actions, decisions, revelations, emotional turns, and what changed by the end; pack facts, drop atmosphere and filler","title":"a 3-6 word chapter title","keywords":["8-14 lowercase names/places/objects/topics a future scene might key on"],"characters":["exact names of every character involved"],"location":"primary place, short","topics":["3-8 lowercase themes/motifs/recurring-things this chapter is about, e.g. \\"pet name\\", \\"the betrothal\\", \\"the hidden dragon\\""],"plots":["1-4 plot threads/arcs this chapter advances, short labels"],"stakes":"one clause: what is at risk or changing","day":<integer story-day if stated else null>}. Rules: ALWAYS use the real character names provided — never write "{{user}}", "User", "{{char}}", or "you"; be comprehensive but compact (no repetition, no vibes); every distinct beat must be recoverable from the summary; topics should capture SPECIFIC recurring things (a pet name, an object, a promise) a future scene might echo, not generic words.';
 
 function parseSummaryJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -1566,9 +1728,20 @@ function parseSummaryJson(text) {
   if (!obj || typeof obj !== 'object') return null;
   const summary = String(obj.summary || '').trim();
   if (!summary) return null;
-  const keywords = Array.isArray(obj.keywords) ? obj.keywords.map((k) => String(k).toLowerCase().trim()).filter(Boolean).slice(0, 14) : [];
+  const lowList = (v, n) => Array.isArray(v) ? v.map((k) => String(k).toLowerCase().trim()).filter(Boolean).slice(0, n) : [];
+  const strList = (v, n) => Array.isArray(v) ? v.map((k) => String(k).trim()).filter(Boolean).slice(0, n) : [];
   const day = Number.isFinite(obj.day) ? obj.day : null;
-  return { summary: summary.slice(0, SUMMARY.maxChars), keywords, day };
+  return {
+    summary: summary.slice(0, SUMMARY.maxChars),
+    title: String(obj.title || '').trim().slice(0, 60),
+    keywords: lowList(obj.keywords, 14),
+    characters: strList(obj.characters, 12),
+    location: String(obj.location || '').trim().slice(0, 60),
+    topics: lowList(obj.topics, 8),
+    plots: strList(obj.plots, 4),
+    stakes: String(obj.stakes || '').trim().slice(0, 120),
+    day,
+  };
 }
 
 // Try to summarize the next uncovered window. Background, best-effort, no overlap.
@@ -1632,7 +1805,13 @@ async function summarizeOneWindow(chatId, opts, userId) {
     fromTurn, toTurn,
     day: windowDay || parsed.day || null,
     text: parsed.summary,
+    title: parsed.title || '',
     keywords: parsed.keywords,
+    characters: parsed.characters || [],
+    location: parsed.location || '',
+    topics: parsed.topics || [],
+    plots: parsed.plots || [],
+    stakes: parsed.stakes || '',
   });
   if (SUMMARY.maxMemories && ch.memories.length > SUMMARY.maxMemories) ch.memories.shift();
   ch.covered = toTurn;
@@ -3060,6 +3239,16 @@ const vellumInterceptor = async (messages, context) => {
         // Pre-warm reuse (#10): identical scene query (swipe/regeneration) → reuse
         // the already-assembled injection without re-scoring or re-recording.
         const fp = sceneFingerprint(query);
+        // Deep Memory: when Deep Recall is on, refresh the LLM memory-tree pick in
+        // the background for this scene (non-blocking; warms _memTreeCache for the
+        // next generation). selectMemories uses the cached result if present.
+        if (ch.deepRecall && (ch.memories || []).length >= 4) {
+          const mc = _memTreeCache.get(chatId);
+          if (!mc || mc.sig !== _memSceneSig(query)) {
+            const uid = context && (context.userId || context.user_id);
+            setTimeout(() => { runMemoryTree(chatId, query, uid); }, 50);
+          }
+        }
         const warm = _prewarmCache.get(chatId);
         if (warm && warm.fp === fp && warm.content) {
           injectedContent = warm.content;
@@ -3090,9 +3279,15 @@ const vellumInterceptor = async (messages, context) => {
         const graphRoom = Math.min(INJECT_BUDGET.graph, Math.max(0, INJECT_BUDGET.total - usedSoFar));
         const graph = graphRoom > 80 ? buildGraphRecall(ch, query, sel.ids, { budgetChars: graphRoom }) : { lines: [], trace: [], ids: [] };
 
+        // Story Memory (chapter summaries) — own budget, recency floor + tag scoring.
+        // If Deep Recall is on, use the cached memory-tree picks (LLM traversal).
+        const memTreeIds = ch.deepRecall ? (_memTreeCache.get(chatId) && _memTreeCache.get(chatId).ids) : null;
+        const mem = selectMemories(ch, query, { budgetChars: INJECT_BUDGET.memory, nc: null, approved: memTreeIds || null });
+
         let content = '';
         if (castBlock) content += '[CAST — established characters, for continuity. Keep ages, looks, and roles consistent; do not contradict these.]\n' + castBlock + '\n\n';
         if (knowBlock) content += '[KNOWLEDGE & SECRETS — the information state, for dramatic irony. Honor exactly who knows, believes, suspects, or is ignorant of what; never let a character act on knowledge they do not have, and never casually expose a secret unless the scene earns it.]\n' + knowBlock + '\n\n';
+        if (mem.lines.length) content += '[STORY MEMORY — distilled chapters of what already happened, newest understanding of the past. Treat as established history; weave it in, do not recite it.]\n' + mem.lines.join('\n') + '\n\n';
         if (lines.length) content += '[CHRONICLE RECALL — entries relevant to the current scene, retrieved from long-term memory. Honor them as established history; do not recite them in prose.]\n' + lines.join('\n');
         if (graph.lines.length) content += (lines.length ? '\n' : '') + '\n[CONNECTED CONTEXT — tied to characters in the scene via the story graph.]\n' + graph.lines.join('\n');
         content = content.trim();
@@ -3101,7 +3296,7 @@ const vellumInterceptor = async (messages, context) => {
         if (content) {
           injectedContent = content;
           // Record what we injected into the cooldown ring (#2) + feedback (#1).
-          const injIds = sel.ids.concat(graph.ids);
+          const injIds = sel.ids.concat(graph.ids).concat(mem.ids);
           recordInjection(ch, injIds);
           noteInjectedForFeedback(ch, injIds);
           try { await saveChronicle(chatId, ch); } catch (eSave) {}
@@ -3111,12 +3306,12 @@ const vellumInterceptor = async (messages, context) => {
             cast: castBlock || '',
             castCount: castBlock ? castBlock.split('\n').filter(Boolean).length : 0,
             castTrace: cast.trace || [],
-            recall: lines.concat(graph.lines),
-            recallTrace: (sel.trace || []).concat(graph.trace || []),
+            recall: mem.lines.concat(lines).concat(graph.lines),
+            recallTrace: (mem.trace || []).concat(sel.trace || []).concat(graph.trace || []),
             chars: content.length,
           });
           try { await spindle.variables.chat.set(chatId, 'vellum_injection_json', JSON.stringify(lastInjectionByChat.get(chatId)).slice(0, 40000)); } catch (e3) {}
-          _prewarmCache.set(chatId, { fp, content, ids: injIds, recall: lines.concat(graph.lines), recallTrace: (sel.trace || []).concat(graph.trace || []), castBlock: castBlock || '', castCount: castBlock ? castBlock.split('\n').filter(Boolean).length : 0, castTrace: cast.trace || [], phase });
+          _prewarmCache.set(chatId, { fp, content, ids: injIds, recall: mem.lines.concat(lines).concat(graph.lines), recallTrace: (mem.trace || []).concat(sel.trace || []).concat(graph.trace || []), castBlock: castBlock || '', castCount: castBlock ? castBlock.split('\n').filter(Boolean).length : 0, castTrace: cast.trace || [], phase });
           spindle.log.info(`[vellum_tracker] injected ${content.length} chars (${lines.length} recall +${graph.lines.length} graph, cast=${!!castBlock}, phase=${phase})`);
         } else {
           lastInjectionByChat.set(chatId, { at: Date.now(), cast: '', castCount: 0, recall: [], chars: 0 });
