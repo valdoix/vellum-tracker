@@ -1580,8 +1580,9 @@ const CAST_HTML =
   + '<button class="vlc-btn" data-cast-filter="present">\u25C9 Present</button>'
   + '<button class="vlc-btn" data-cast-filter="active">\u25CB Active</button>'
   + '<button class="vlc-btn" data-cast-filter="mentioned">\u2027 Mentioned</button>'
-  + '<button class="vlc-btn" data-cast-filter="added">\u2605 Added</button>'
-  + '<button class="vlc-btn" data-cast-filter="journal">\uD83D\uDCD6 Journal</button>'
+    + '<button class="vlc-btn" data-cast-filter="added">\u2605 Added</button>'
+    + '<button class="vlc-btn" data-cast-filter="relations">\u21CE Relations</button>'
+    + '<button class="vlc-btn" data-cast-filter="journal">\uD83D\uDCD6 Journal</button>'
   + '<button class="vlc-btn ghost" data-cast-refresh title="Refresh">\u27F3</button>'
   + '<button class="vlc-btn" data-cast-scan>\u2756 Scan</button>'
   + '<button class="vlc-btn" data-cast-add>+ Add</button>'
@@ -2022,6 +2023,7 @@ const VELLUM_CSS = [
   ".vlc-root[data-view='active'] [data-grp]:not([data-grp='active']){display:none}",
   ".vlc-root[data-view='mentioned'] [data-grp]:not([data-grp='mentioned']){display:none}",
   ".vlc-root[data-view='added'] [data-grp]:not([data-grp='added']){display:none}",
+  ".vlc-root[data-view='relations'] [data-grp]:not([data-grp='relations']){display:none}",
   /* chapter memories */
   ".vlc-mem{background:rgba(0,0,0,.24);border:1px solid rgba(var(--vacc,205,168,78),.16);border-left:3px solid #b48ed0;border-radius:9px;margin-bottom:9px;overflow:hidden}",
   ".vlc-mem-sum{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:9px;padding:10px 13px}",
