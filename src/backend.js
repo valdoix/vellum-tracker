@@ -399,7 +399,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, hideSummarized: false, living: false, pulse: [], pulseSeen: 0, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], memTree: { arcs: [], builtAt: 0 }, cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, hideSummarized: false, living: false, pulse: [], pulseSeen: 0, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
 }
 
 function normKey(s) {
@@ -790,6 +790,8 @@ async function loadChronicle(chatId) {
   }
   // migrate older chronicles missing the memory fields
   if (!Array.isArray(ch.memories)) ch.memories = [];
+  if (!ch.memTree || typeof ch.memTree !== 'object') ch.memTree = { arcs: [], builtAt: 0 }; // persisted arc-node tree
+  if (!Array.isArray(ch.memTree.arcs)) ch.memTree.arcs = [];
   if (typeof ch.covered !== 'number') ch.covered = 0;
   if (!ch.cast || typeof ch.cast !== 'object') ch.cast = {};
   if (!Array.isArray(ch.present)) ch.present = [];
@@ -1197,6 +1199,123 @@ function buildMemoryIndex(ch) {
   return idx;
 }
 
+// A compact text view of the persisted arc tree for the traversal controller.
+function arcTreeBlock(ch) {
+  const arcs = (ch.memTree && ch.memTree.arcs) || [];
+  if (!arcs.length) return '';
+  return arcs.map((a) => '\u25C8 ' + a.title + (a.day ? ' (Day ' + a.day + ')' : '') + (a.gist ? ' — ' + a.gist : '') + '  {chapters: ' + (a.chapterIds || []).join(', ') + '}').join('\n');
+}
+
+
+// A serializable view of the memory tree for the UI: arcs with their chapters,
+// the unassigned chapters, and the axis index counts.
+function memTreeView(ch) {
+  const memById = (id) => (ch.memories || []).find((m) => m.id === id);
+  const lite = (m) => m ? { id: m.id, title: m.title || ('t' + m.fromTurn + '-' + m.toTurn), day: m.day || null, fromTurn: m.fromTurn, toTurn: m.toTurn, characters: m.characters || [], topics: m.topics || [], text: (m.text || '').slice(0, 240) } : null;
+  const arcs = (ch.memTree && ch.memTree.arcs || []).map((a) => ({ id: a.id, title: a.title, gist: a.gist || '', from: a.from || null, to: a.to || null, day: a.day || null, userEdited: !!a.userEdited, chapters: (a.chapterIds || []).map(memById).filter(Boolean).map(lite) }));
+  const inArc = new Set(); for (const a of (ch.memTree && ch.memTree.arcs || [])) for (const id of (a.chapterIds || [])) inArc.add(id);
+  const unassigned = (ch.memories || []).filter((m) => !inArc.has(m.id)).map(lite);
+  const idx = buildMemoryIndex(ch);
+  const counts = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v.length]));
+  const index = { characters: counts(idx.characters), topics: counts(idx.topics), plots: counts(idx.plots), days: counts(idx.days) };
+  return { arcs, unassigned, index, builtAt: (ch.memTree && ch.memTree.builtAt) || 0, chapters: (ch.memories || []).length };
+}
+// ============================================================================
+// MEMORY TREE (persisted) — arc nodes grouping chapter summaries (tier 2).
+// ch.memTree = { arcs: [{ id, title, gist, chapterIds:[], from, to, day }], builtAt }.
+// An arc node bundles consecutive chapters under a label + 1-2 sentence gist,
+// so traversal/coverage works at the arc level and the deep past compresses.
+// Built by an LLM (build/rebuild), fully user-editable (rename/gist/move/delete).
+// ============================================================================
+function memArcId() { return 'arc' + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36); }
+
+// Recompute an arc's derived span (from/to/day) from its current chapters.
+function refreshArcSpan(ch, arc) {
+  const mems = (arc.chapterIds || []).map((id) => (ch.memories || []).find((m) => m.id === id)).filter(Boolean);
+  if (!mems.length) { arc.from = null; arc.to = null; arc.day = null; return; }
+  arc.from = Math.min(...mems.map((m) => m.fromTurn || 0));
+  arc.to = Math.max(...mems.map((m) => m.toTurn || 0));
+  arc.day = mems[0].day || null;
+}
+
+// Chapters not assigned to any arc.
+function unassignedChapters(ch) {
+  const inArc = new Set();
+  for (const a of (ch.memTree.arcs || [])) for (const id of (a.chapterIds || [])) inArc.add(id);
+  return (ch.memories || []).filter((m) => !inArc.has(m.id));
+}
+
+const MEMTREE_SYS = 'You are a story editor organizing a roleplay\'s chapter summaries into ARCS — contiguous groups that form one movement of the story (a phase, a storyline, an act). You are given the chapters in order (id · title · day · characters · topics). Output STRICT JSON only: {"arcs":[{"title":"3-6 word arc name","gist":"1-2 sentences: what this arc is about and what changed across it","chapterIds":["id","id"]}]}. Rules: cover EVERY chapter exactly once, in order; arcs are CONTIGUOUS runs of chapters (no interleaving); make 2-8 arcs depending on length; name them for their dramatic content (e.g. "The Reluctant Betrothal", "Discovering the Dragon"), not "Chapters 1-4"; the gist must capture the arc\'s throughline. No prose outside the JSON.';
+
+const buildingTree = new Set();
+async function buildMemoryTree(chatId, userId) {
+  if (buildingTree.has(chatId)) return { ok: false, reason: 'busy' };
+  if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) return { ok: false, reason: 'no_generation' };
+  buildingTree.add(chatId);
+  try {
+    const ch = await loadChronicle(chatId);
+    const mems = (ch.memories || []).slice().sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0));
+    if (mems.length < 2) return { ok: false, reason: 'too_few' };
+    const list = mems.map((m) => m.id + ' \u00b7 ' + (m.title || ('t' + m.fromTurn + '-' + m.toTurn)) + (m.day ? ' \u00b7 Day ' + m.day : '')
+      + (m.characters && m.characters.length ? ' \u00b7 ' + m.characters.slice(0, 4).join('/') : '')
+      + (m.topics && m.topics.length ? ' \u00b7 [' + m.topics.slice(0, 4).join(', ') + ']' : '')).join('\n');
+    let raw = '';
+    try { raw = await internalGenerate([{ role: 'system', content: MEMTREE_SYS }, { role: 'user', content: 'Chapters in order:\n' + list }], { temperature: 0.2, max_tokens: 1800 }, userId); }
+    catch (e) { return { ok: false, reason: (e && e.permDenied) ? 'no_generation' : 'error' }; }
+    let obj = null;
+    try { obj = JSON.parse(String(raw).replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim().match(/\{[\s\S]*\}/)[0]); } catch (e) { return { ok: false, reason: 'parse' }; }
+    const valid = new Set(mems.map((m) => m.id));
+    const used = new Set();
+    const arcs = [];
+    for (const a of (Array.isArray(obj.arcs) ? obj.arcs : [])) {
+      const chapterIds = (Array.isArray(a.chapterIds) ? a.chapterIds : []).map(String).filter((id) => valid.has(id) && !used.has(id));
+      chapterIds.forEach((id) => used.add(id));
+      if (!chapterIds.length) continue;
+      const arc = { id: memArcId(), title: String(a.title || 'Untitled Arc').slice(0, 60), gist: String(a.gist || '').slice(0, 400), chapterIds };
+      refreshArcSpan(ch, arc);
+      arcs.push(arc);
+    }
+    // sweep any chapter the model missed into a trailing arc so coverage is total
+    const missed = mems.filter((m) => !used.has(m.id));
+    if (missed.length) { const arc = { id: memArcId(), title: 'Unsorted', gist: '', chapterIds: missed.map((m) => m.id) }; refreshArcSpan(ch, arc); arcs.push(arc); }
+    arcs.sort((a, b) => (a.from || 0) - (b.from || 0));
+    ch.memTree = { arcs, builtAt: Date.now() };
+    await saveChronicle(chatId, ch);
+    broadcastChronicle(chatId, ch, userId);
+    spindle.log.info('[vellum_tracker] memory tree built: ' + arcs.length + ' arcs over ' + mems.length + ' chapters');
+    return { ok: true, arcs: arcs.length, chapters: mems.length };
+  } catch (e) { spindle.log.warn('[vellum_tracker] buildMemoryTree: ' + (e && e.message)); return { ok: false, reason: 'error' }; }
+  finally { buildingTree.delete(chatId); }
+}
+
+// ---- user edits ----
+function memTreeEditArc(ch, arcId, patch) {
+  const a = (ch.memTree.arcs || []).find((x) => x.id === arcId);
+  if (!a) return false;
+  if (typeof patch.title === 'string') a.title = patch.title.slice(0, 60);
+  if (typeof patch.gist === 'string') a.gist = patch.gist.slice(0, 400);
+  a.userEdited = true;
+  return true;
+}
+function memTreeAddArc(ch, title) {
+  const a = { id: memArcId(), title: String(title || 'New Arc').slice(0, 60), gist: '', chapterIds: [], userEdited: true };
+  ch.memTree.arcs.push(a);
+  return a;
+}
+function memTreeDeleteArc(ch, arcId) {
+  const i = (ch.memTree.arcs || []).findIndex((x) => x.id === arcId);
+  if (i < 0) return false;
+  ch.memTree.arcs.splice(i, 1); // its chapters become unassigned
+  return true;
+}
+// Move a chapter into an arc (or out, if arcId is falsy). Removes from any other arc.
+function memTreeMoveChapter(ch, chapterId, arcId) {
+  for (const a of (ch.memTree.arcs || [])) { const i = (a.chapterIds || []).indexOf(chapterId); if (i >= 0) { a.chapterIds.splice(i, 1); refreshArcSpan(ch, a); } }
+  if (arcId) { const a = (ch.memTree.arcs || []).find((x) => x.id === arcId); if (!a) return false; if (!a.chapterIds.includes(chapterId)) a.chapterIds.push(chapterId); refreshArcSpan(ch, a); }
+  ch.memTree.arcs.sort((a, b) => (a.from || 0) - (b.from || 0));
+  return true;
+}
+
 // ============================================================================
 // DEEP MEMORY — optional LLM tree-traversal over the summary index.
 // Instead of scoring all summaries, the controller is shown the AXES (the
@@ -1233,7 +1352,9 @@ async function runMemoryTree(chatId, queryText, userId) {
       + (m.characters && m.characters.length ? ' \u00b7 ' + m.characters.slice(0, 4).join('/') : '')
       + (m.topics && m.topics.length ? ' \u00b7 [' + m.topics.slice(0, 4).join(', ') + ']' : '')
     ).join('\n');
-    const user = 'MEMORY INDEX (branches):\n' + axisLines.join('\n') + '\n\nCHAPTERS:\n' + chapterList + '\n\nCURRENT SCENE:\n' + String(queryText || '').slice(-1400);
+    const user = 'MEMORY INDEX (branches):\n' + axisLines.join('\n')
+      + (arcTreeBlock(ch) ? ('\n\nARCS (curated story movements):\n' + arcTreeBlock(ch)) : '')
+      + '\n\nCHAPTERS:\n' + chapterList + '\n\nCURRENT SCENE:\n' + String(queryText || '').slice(-1400);
     let raw = '';
     try { raw = await internalGenerate([{ role: 'system', content: MEM_TREE_SYS }, { role: 'user', content: user }], { temperature: 0.1, max_tokens: 400 }, userId); }
     catch (e) { return null; }
@@ -3549,6 +3670,35 @@ spindle.onFrontendMessage(async (payload, userId) => {
     if (payload?.type === 'run_living') {
       const chatId = await resolveChatId(payload.chatId, userId);
       if (chatId) { const ch = await loadChronicle(chatId); if (!ch.living) { ch.living = true; await saveChronicle(chatId, ch); } await runLivingUpdate(chatId, userId); }
+      return;
+    }
+    if (payload?.type === 'get_memtree') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      const ch = chatId ? await loadChronicle(chatId) : null;
+      const view = ch ? memTreeView(ch) : { arcs: [], unassigned: [], index: {}, builtAt: 0, chapters: 0 };
+      spindle.sendToFrontend(Object.assign({ type: 'vellum_memtree' }, view), userId);
+      return;
+    }
+    if (payload?.type === 'build_memtree') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (!chatId) { spindle.sendToFrontend({ type: 'vellum_memtree_done', ok: false, reason: 'no_active_chat' }, userId); return; }
+      spindle.sendToFrontend({ type: 'vellum_memtree_building' }, userId);
+      const r = await buildMemoryTree(chatId, userId);
+      const ch = await loadChronicle(chatId);
+      spindle.sendToFrontend(Object.assign({ type: 'vellum_memtree_done' }, r, memTreeView(ch)), userId);
+      return;
+    }
+    if (payload?.type === 'memtree_edit' || payload?.type === 'memtree_add_arc' || payload?.type === 'memtree_delete_arc' || payload?.type === 'memtree_move') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (!chatId) return;
+      const ch = await loadChronicle(chatId);
+      let ok = false;
+      if (payload.type === 'memtree_edit') ok = memTreeEditArc(ch, payload.arcId, payload.patch || payload);
+      else if (payload.type === 'memtree_add_arc') ok = !!memTreeAddArc(ch, payload.title);
+      else if (payload.type === 'memtree_delete_arc') ok = memTreeDeleteArc(ch, payload.arcId);
+      else if (payload.type === 'memtree_move') ok = memTreeMoveChapter(ch, payload.chapterId, payload.arcId || null);
+      if (ok) { await saveChronicle(chatId, ch); }
+      spindle.sendToFrontend(Object.assign({ type: 'vellum_memtree' }, memTreeView(ch)), userId);
       return;
     }
     if (payload?.type === 'get_pulse') {

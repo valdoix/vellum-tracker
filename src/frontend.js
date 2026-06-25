@@ -261,7 +261,7 @@ function _setupImpl(ctx) {
     }
   });
 
-  function requestChronicle() { ctx.sendToBackend({ type: 'get_chronicle', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_injection', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_deep_recall', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_hide_summarized', chatId: currentChatId }); }
+  function requestChronicle() { ctx.sendToBackend({ type: 'get_chronicle', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_injection', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_deep_recall', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_hide_summarized', chatId: currentChatId }); ctx.sendToBackend({ type: 'get_memtree', chatId: currentChatId }); }
 
   // Best-effort scrape of the visible transcript so a rebuild has data even if
   // the backend's cached interceptor array is empty (e.g. just after reload).
@@ -579,6 +579,17 @@ function _setupImpl(ctx) {
       _hideInfo = { covered: p.covered || 0, memories: p.memories || 0 };
       const host = chronicleBody && chronicleBody.querySelector('[data-vlc-inj]');
       if (host) host.innerHTML = injectionHtml(_lastInjection);
+    } else if (p?.type === 'vellum_memtree' || p?.type === 'vellum_memtree_done') {
+      _memTree = { arcs: p.arcs || [], unassigned: p.unassigned || [], index: p.index || {}, builtAt: p.builtAt || 0, chapters: p.chapters || 0 };
+      const mh = chronicleBody && chronicleBody.querySelector('[data-vlc-memtree]');
+      if (mh) mh.innerHTML = memTreeHtml(_memTree);
+      if (p.type === 'vellum_memtree_done') {
+        const b = chronicleBody && chronicleBody.querySelector('[data-memtree-build]');
+        if (b) { b.textContent = p.ok ? '⟲ Build / Rebuild' : ('⚠ ' + (p.reason || 'error')); setTimeout(() => { b.textContent = '⟲ Build / Rebuild'; }, 3500); }
+      }
+    } else if (p?.type === 'vellum_memtree_building') {
+      const b = chronicleBody && chronicleBody.querySelector('[data-memtree-build]');
+      if (b) b.textContent = '⏳ Building…';
     } else if (p?.type === 'vellum_chronicle_empty') {
       if (chronicleBody && !chronicleData) renderChronicle(chronicleBody, null);
       if (castBody && !castData) renderCast(castBody, null);
@@ -684,7 +695,20 @@ function _setupImpl(ctx) {
   try {
     const onChat = (p) => {
       const id = p?.chatId || p?.chat_id || p?.id || null;
-      currentChatId = id; lastData = null; chronicleData = null;
+      if (id === currentChatId) return; // no-op on same chat
+      currentChatId = id;
+      // Reset ALL per-chat cached state so a new chat starts visually fresh and
+      // never shows the previous chat's chronicle/cast/tree/pulse for a frame.
+      lastData = null; chronicleData = null; castData = null;
+      _memTree = null; _lastInjection = null; _pulse = []; _unseen = 0;
+      _hideInfo = { covered: 0, memories: 0 };
+      try {
+        render(body, dot, null);
+        if (chronicleBody) renderChronicle(chronicleBody, null);
+        if (castBody) renderCast(castBody, null);
+        renderPulsePanel();
+        setUnseen(0);
+      } catch (e) {}
       requestRefresh();
       requestChronicle();
     };
@@ -1214,6 +1238,8 @@ let _knowFilter = 'all';   // all | knows | believes | suspects | wrong | unawar
 let _secFilter = 'all';    // all | minor | major | explosive
 const _mjFilter = {};      // per-character key -> weight filter (all|defining|significant|minor|trivial)
 let _relFilter = 'all';    // all | familial | romantic | alliance | rivalry | social | neutral
+let _memTree = null;       // last vellum_memtree view { arcs, unassigned, index, builtAt, chapters }
+let _memTreeAxis = '';     // which axis index is expanded in the UI
 // Module refs so render helpers can message the backend (set once in setup()).
 let _ctx = null;
 let _getChatId = () => null;
@@ -1362,6 +1388,56 @@ function memJournalHtml(ch) {
   }).join('');
 }
 
+
+// Memory Tree render: arc cards (editable title/gist, chapter chips with a
+// "move" affordance), an Unassigned bucket, and a collapsible axis index.
+function memTreeHtml(t) {
+  if (!t) return '<div class="vlc-empty">Loading…</div>';
+  if (!t.chapters) {
+    return '<div class="vlc-empty">No chapters to organize yet.<br><span style="opacity:.7;font-size:10px">Chapters are auto-summarized as the story grows; then hit Build to cluster them into arcs.</span></div>';
+  }
+  const arcOpts = (t.arcs || []).map((a) => '<option value="' + escapeHtml(a.id) + '">' + escapeHtml(a.title) + '</option>').join('');
+  const chip = (m) => {
+    const dl = m.day ? 'D' + m.day : 't' + m.fromTurn;
+    return '<div class="vlc-mt-chip" title="' + escapeHtml(m.text) + '">'
+      + '<span class="vlc-mt-chip-d">' + escapeHtml(dl) + '</span>'
+      + '<span class="vlc-mt-chip-t">' + escapeHtml(m.title) + '</span>'
+      + '<button class="vlc-mt-move" data-mt-move data-id="' + escapeHtml(m.id) + '" title="Move to arc…">⇄</button>'
+      + '</div>';
+  };
+  let html = '';
+  if (t.builtAt) html += '<div class="vlc-mt-meta">' + (t.arcs || []).length + ' arcs · ' + t.chapters + ' chapters · built ' + new Date(t.builtAt).toLocaleString() + '</div>';
+  html += (t.arcs || []).map((a) => {
+    const span = (a.day ? 'Day ' + a.day + ' · ' : '') + 't' + (a.from || '?') + '–' + (a.to || '?');
+    return '<details class="vlc-mt-arc" open><summary class="vlc-mt-sum">'
+      + '<span class="vlc-mt-title">' + escapeHtml(a.title) + '</span>'
+      + '<span class="vlc-mt-span">' + escapeHtml(span) + '</span>'
+      + '<span class="vlc-mt-n">' + (a.chapters || []).length + '</span>'
+      + '<button class="vlc-mini-edit" data-mt-edit data-id="' + escapeHtml(a.id) + '" data-title="' + escapeHtml(a.title) + '" data-gist="' + escapeHtml(a.gist || '') + '" title="Edit arc">✎</button>'
+      + '<button class="vlc-mini-del" data-mt-del data-id="' + escapeHtml(a.id) + '" title="Delete arc">✕</button>'
+      + '</summary>'
+      + '<div class="vlc-mt-body">'
+      + (a.gist ? '<div class="vlc-mt-gist">' + escapeHtml(a.gist) + '</div>' : '')
+      + '<div class="vlc-mt-chips">' + (a.chapters || []).map(chip).join('') + '</div>'
+      + '</div></details>';
+  }).join('');
+  if ((t.unassigned || []).length) {
+    html += '<details class="vlc-mt-arc unassigned" open><summary class="vlc-mt-sum"><span class="vlc-mt-title">Unassigned</span><span class="vlc-mt-n">' + t.unassigned.length + '</span></summary>'
+      + '<div class="vlc-mt-body"><div class="vlc-mt-chips">' + t.unassigned.map(chip).join('') + '</div></div></details>';
+  }
+  // collapsible axis index
+  const idx = t.index || {};
+  const axisBtn = (k, label) => { const n = Object.keys(idx[k] || {}).length; return n ? '<button class="vlc-fchip' + (_memTreeAxis === k ? ' on' : '') + '" data-mt-axis="' + k + '">' + label + ' <span class="vlc-fchip-n">' + n + '</span></button>' : ''; };
+  html += '<div class="vlc-mt-axes"><div class="vlc-fbar">' + axisBtn('characters', 'Characters') + axisBtn('topics', 'Topics') + axisBtn('plots', 'Plots') + axisBtn('days', 'Days') + '</div>';
+  if (_memTreeAxis && idx[_memTreeAxis]) {
+    const entries = Object.entries(idx[_memTreeAxis]).sort((a, b) => b[1] - a[1]);
+    html += '<div class="vlc-mt-axislist">' + entries.map(([k, n]) => '<span class="vlc-mt-axitem">' + escapeHtml(k) + ' <em>' + n + '</em></span>').join('') + '</div>';
+  }
+  html += '</div>';
+  // stash arc options for the move prompt
+  html += '<div data-mt-arcopts hidden>' + arcOpts + '</div>';
+  return html;
+}
 
 function memoryList(memories) {
   if (!memories || !memories.length) {
@@ -1552,6 +1628,8 @@ function renderChronicle(host, ch) {
 
   host.innerHTML = stat
     + '<section data-grp="memories"><h3 class="vlc-h">✦ Chapter Memories <span class="vlc-h-n">' + ((ch.memories || []).length) + '</span><button class="vlc-add-btn" data-memory-add>+ Add</button></h3>' + memoryList(ch.memories) + '</section>'
+    + '<div class="vlc-break"></div>'
+    + '<section data-grp="memtree"><h3 class="vlc-h">🌳 Memory Tree <button class="vlc-add-btn" data-memtree-build>⟲ Build / Rebuild</button><button class="vlc-add-btn" data-memtree-addarc>+ Arc</button></h3><div data-vlc-memtree>' + memTreeHtml(_memTree) + '</div></section>'
     + '<div class="vlc-break"></div>'
     + trackSection('arcs', '📜', 'Character Arcs', arcs, 'No character arcs tracked yet.')
     + '<div class="vlc-break"></div>'
@@ -1765,6 +1843,30 @@ function wireChronicleControls(host) {
           { key: 'keywords', label: 'Keywords', type: 'text', placeholder: 'comma-separated (optional)' },
         ], (v) => { if (v.text && v.text.trim()) send({ type: 'memory_add', entry: v }); });
         return; }
+      // ---- Memory Tree ----
+      b = t.closest('[data-memtree-build]');
+      if (b) { send({ type: 'build_memtree' }); return; }
+      b = t.closest('[data-memtree-addarc]');
+      if (b) { const title = ''; vlcFormModal('New Arc', [{ key: 'title', label: 'Arc name', type: 'text', placeholder: 'e.g. The Reluctant Betrothal' }], (v) => { if (v.title && v.title.trim()) send({ type: 'memtree_add_arc', title: v.title.trim() }); }); return; }
+      b = t.closest('[data-mt-edit]');
+      if (b) { e.preventDefault(); e.stopPropagation(); const id = A(b, 'data-id'); vlcFormModal('Edit Arc', [
+          { key: 'title', label: 'Arc name', type: 'text', value: A(b, 'data-title') },
+          { key: 'gist', label: 'Gist', type: 'textarea', value: A(b, 'data-gist') },
+        ], (v) => send({ type: 'memtree_edit', arcId: id, patch: v })); return; }
+      b = t.closest('[data-mt-del]');
+      if (b) { e.preventDefault(); e.stopPropagation(); if (confirm('Delete this arc? Its chapters become unassigned.')) send({ type: 'memtree_delete_arc', arcId: A(b, 'data-id') }); return; }
+      b = t.closest('[data-mt-move]');
+      if (b) {
+        const id = A(b, 'data-id');
+        const opts = (_memTree && _memTree.arcs || []).map((a, i) => (i + 1) + '. ' + a.title);
+        const pick = prompt('Move chapter to which arc?\n0. (Unassigned)\n' + opts.join('\n') + '\n\nEnter number:');
+        if (pick === null) return;
+        const n = parseInt(pick, 10);
+        const arcId = (n >= 1 && _memTree.arcs[n - 1]) ? _memTree.arcs[n - 1].id : null;
+        send({ type: 'memtree_move', chapterId: id, arcId });
+        return; }
+      b = t.closest('[data-mt-axis]');
+      if (b) { _memTreeAxis = (_memTreeAxis === A(b, 'data-mt-axis')) ? '' : A(b, 'data-mt-axis'); const mh = host.querySelector('[data-vlc-memtree]'); if (mh) mh.innerHTML = memTreeHtml(_memTree); return; }
     });
   }
 }
@@ -2415,6 +2517,27 @@ const VELLUM_CSS = [
   ".vlc-root[data-view='added'] [data-grp]:not([data-grp='added']){display:none}",
   ".vlc-root[data-view='relations'] [data-grp]:not([data-grp='relations']){display:none}",
   /* chapter memories */
+﻿  ".vlc-mt-meta{font-size:10px;opacity:.55;margin-bottom:8px;font-style:italic}",
+  ".vlc-mt-arc{background:rgba(0,0,0,.2);border:1px solid rgba(205,168,78,.14);border-left:3px solid #8fa67e;border-radius:10px;margin-bottom:8px;overflow:hidden}",
+  ".vlc-mt-arc.unassigned{border-left-color:#8c8478;opacity:.92}",
+  ".vlc-mt-sum{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:9px 11px;background:linear-gradient(90deg,rgba(143,166,126,.1),transparent)}",
+  ".vlc-mt-sum::-webkit-details-marker{display:none}",".vlc-mt-sum::before{content:'\u25B8';color:rgba(205,168,78,.7);font-size:10px;transition:transform .15s}",
+  ".vlc-mt-arc[open] .vlc-mt-sum::before{transform:rotate(90deg)}",
+  ".vlc-mt-title{flex:1;font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;font-weight:600;color:#ecdcb6}",
+  ".vlc-mt-span{font-family:'JetBrains Mono',monospace;font-size:8.5px;opacity:.5;letter-spacing:.5px}",
+  ".vlc-mt-n{font-family:'JetBrains Mono',monospace;font-size:9px;color:#1a1610;background:rgba(205,168,78,.7);border-radius:9px;padding:1px 7px}",
+  ".vlc-mt-body{padding:8px 11px 10px}",
+  ".vlc-mt-gist{font-size:12px;font-style:italic;color:#cdbf9e;margin-bottom:7px;line-height:1.45}",
+  ".vlc-mt-chips{display:flex;flex-wrap:wrap;gap:5px}",
+  ".vlc-mt-chip{display:inline-flex;align-items:center;gap:5px;background:rgba(205,168,78,.1);border:1px solid rgba(205,168,78,.2);border-radius:7px;padding:3px 4px 3px 8px;font-size:11px}",
+  ".vlc-mt-chip-d{font-family:'JetBrains Mono',monospace;font-size:8px;color:#1a1610;background:rgba(205,168,78,.6);border-radius:4px;padding:1px 5px}",
+  ".vlc-mt-chip-t{color:#e0d2b2;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".vlc-mt-move{border:none;background:rgba(205,168,78,.16);color:#cda84e;border-radius:4px;width:18px;height:16px;cursor:pointer;font-size:9px;line-height:1}",
+  ".vlc-mt-move:hover{background:rgba(205,168,78,.34)}",
+  ".vlc-mt-axes{margin-top:10px;border-top:1px solid rgba(205,168,78,.12);padding-top:8px}",
+  ".vlc-mt-axislist{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}",
+  ".vlc-mt-axitem{font-size:10.5px;color:#cdbf9e;background:rgba(0,0,0,.2);border:1px solid rgba(205,168,78,.12);border-radius:6px;padding:2px 7px}",
+  ".vlc-mt-axitem em{font-style:normal;opacity:.5;font-size:9px}",
   ".vlc-mem{background:rgba(0,0,0,.24);border:1px solid rgba(var(--vacc,205,168,78),.16);border-left:3px solid #b48ed0;border-radius:9px;margin-bottom:9px;overflow:hidden}",
   ".vlc-mem-sum{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:9px;padding:10px 13px}",
   ".vlc-mem-sum::-webkit-details-marker{display:none}",
