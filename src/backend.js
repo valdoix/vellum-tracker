@@ -522,12 +522,38 @@ function foldTurn(ch, turn, day, led, bts) {
   }
   // Plot threads / shifts / world events <- [BTS]
   if (bts) {
+    let _btsActor = '';
     String(bts).split('\n').map((l) => l.trim()).filter(Boolean).forEach((line) => {
       if (/^\+?\s*thread\s*[:→]/i.test(line) || /^thread→/i.test(line)) {
         const th = parseThreadLine(line);
         upsertTrack(ch.threads, th.name, th.detail, turn, day);
-      } else if (/^rel→/i.test(line)) {
-        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel→\s*/i, '').trim(), kind: 'rel' }, 0);
+      } else if (/^rel[A-Za-z]*→/i.test(line)) {
+        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel[A-Za-z]*→\s*/i, '').trim(), kind: 'rel' }, 0);
+        try {
+          const two = line.match(/^rel([A-Za-z][\w' .-]*?)→\s*([^:]+):(.*)$/i);
+          const one = line.match(/^rel→\s*([^:]+):(.*)$/i);
+          let aName = null, bName = null, tail = null;
+          if (two) { aName = two[1].trim(); bName = two[2].trim(); tail = two[3]; }
+          else if (one) { aName = _btsActor; bName = one[1].trim(); tail = one[2]; }
+          if (aName && bName) {
+            const ax = parseRelAxes(tail);
+            if (ax) {
+              const ma = resolveOrAddCast(ch, aName), mb = resolveOrAddCast(ch, bName);
+              if (ma && mb && ma.id !== mb.id) {
+                let r = (ch.relations || []).find((x) => (x.a === ma.id && x.b === mb.id) || (x.a === mb.id && x.b === ma.id));
+                if (!r) r = relationAdd(ch, { a: aName, b: bName, category: 'neutral', sentiment: 'neutral' }, { source: 'auto' });
+                if (r && !(r.userEdited && r.lockScores)) {
+                  const beforeS = r.sentiment;
+                  if (ax.abs) { r.affection = REL_CLAMP(ax.dAff); r.trust = REL_CLAMP(ax.dTr); r.sentiment = deriveSentiment(r.affection, r.trust); r.lastTurn = turn; r.history.push({ turn, day, affection: r.affection, trust: r.trust, reason: ax.reason }); if (r.history.length > 60) r.history.shift(); }
+                  else { applyRelDelta(r, ax.dAff, ax.dTr, ax.reason, turn); }
+                  const na = ch.cast[r.a] ? ch.cast[r.a].name : aName, nb = ch.cast[r.b] ? ch.cast[r.b].name : bName;
+                  const moved = beforeS !== r.sentiment;
+                  pushPulse(ch, { kind: 'relation', icon: (ax.dAff + ax.dTr) >= 0 ? '▲' : '▼', who: na, text: na + ' → ' + nb + ': ' + (moved ? (beforeS + ' → ' + r.sentiment + ' ') : '') + '(aff ' + (ax.abs ? '=' : (ax.dAff >= 0 ? '+' : '')) + ax.dAff + ', trust ' + (ax.abs ? '=' : (ax.dTr >= 0 ? '+' : '')) + ax.dTr + ')' + (ax.reason ? ' — ' + ax.reason : ''), relId: r.id, sentiment: r.sentiment, big: moved });
+                }
+              }
+            }
+          }
+        } catch (eRel) {}
       } else if (/^world\b/i.test(line)) {
         const t = line.replace(/^world[:\s]*/i, '').trim();
         if (t) pushLog(ch.events, { turn, day, text: t }, 0);
@@ -535,8 +561,8 @@ function foldTurn(ch, turn, day, led, bts) {
         // Off-screen / present cast mentioned in BTS actor lines: ":: Name ::" or ":: OFF :: Name"
         const off = line.match(/^::\s*OFF\s*::\s*([^|>]+)/i);
         const on = line.match(/^::\s*([^:|>]+?)\s*::/);
-        if (off && off[1]) touchCast(ch, off[1].trim(), turn, day, 'active');
-        else if (on && on[1] && !/^OFF$/i.test(on[1].trim())) touchCast(ch, on[1].trim(), turn, day, 'active');
+        if (off && off[1]) { _btsActor = off[1].trim(); touchCast(ch, _btsActor, turn, day, 'active'); }
+        else if (on && on[1] && !/^OFF$/i.test(on[1].trim())) { _btsActor = on[1].trim(); touchCast(ch, _btsActor, turn, day, 'active'); }
       }
     });
   }
@@ -544,6 +570,23 @@ function foldTurn(ch, turn, day, led, bts) {
 }
 
 // Split a [present] field into clean character names.
+﻿// Parse signed/absolute affection+trust from a BTS rel line tail, e.g.
+// "aff +12, trust -8 (the lie)" or "aff 55, trust 30". Returns {dAff,dTr,abs,reason} or null.
+function parseRelAxes(tail) {
+  const s = String(tail || '');
+  const affM = s.match(/aff(?:ection)?\s*([+-]?\d{1,3})/i);
+  const trM = s.match(/trust\s*([+-]?\d{1,3})/i);
+  if (!affM && !trM) return null;
+  const signed = /[+-]\s*\d/.test(s); // any explicit sign => treat as delta
+  const reasonM = s.match(/\(([^)]+)\)/);
+  return {
+    dAff: affM ? parseInt(affM[1], 10) : 0,
+    dTr: trM ? parseInt(trM[1], 10) : 0,
+    abs: !signed,
+    reason: reasonM ? reasonM[1].trim() : '',
+  };
+}
+
 function parsePresentNames(raw) {
   if (!raw) return [];
   return String(raw)
@@ -2654,7 +2697,7 @@ async function readStoredMessages(chatId) {
             const cand = slot || m.swipes.find((s) => /<ledger>|\[BTS/i.test(String(s)));
             if (cand) content = String(cand);
           }
-          return { role: m.role, content, name: (m.name || '').trim(), isUser: m.is_user === true || m.role === 'user' };
+          return { id: m.id, role: m.role, content, name: (m.name || '').trim(), isUser: m.is_user === true || m.role === 'user', hidden: !!(m.extra && m.extra.hidden) };
         });
       }
     }
@@ -2857,6 +2900,8 @@ async function clearAllData(chatId, userId) {
   const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_cleared', ok }, extra || {}), userId);
   if (!chatId) { done(false, { reason: 'no_active_chat' }); return; }
   try {
+    // restore any messages we hid before wiping, so none are stranded hidden
+    try { const old = await loadChronicle(chatId); await restoreHidden(chatId, old); } catch (e) {}
     const fresh = freshChronicle();
     chronicleByChat.set(chatId, fresh);
     await saveChronicle(chatId, fresh);
@@ -2904,50 +2949,59 @@ function mergeEnrich(base, extra) {
 /* ---------- interceptor: lean the older context + inject scene-relevant recall ---------- */
 let lastInterceptedMessages = null;
 
-// "Hide summarized turns" (#token-saving): when enabled, drop the old
-// user/assistant turns that have ALREADY been distilled into chapter memories
-// (turn index <= ch.covered) from the outgoing context, and prepend one compact
-// STORY SO FAR block built from those covering memories. Recent turns are never
-// touched — ch.covered always lags the live tail by SUMMARY.triggerLead. Only
-// drops when covering memories exist, so continuity is preserved. A safety floor
-// always keeps the most recent KEEP_RECENT turns verbatim regardless.
+﻿// "Hide summarized turns" (token-saving, LumiBooks-style hide-on-file):
+// Once early turns are distilled into chapter memories, mark the corresponding
+// chat messages HIDDEN via spindle.chat.setMessagesHidden. The host assembler
+// excludes hidden messages from the outgoing prompt, the breakdown, AND vector
+// retrieval (unlike dropping them in the interceptor, which the host snapshots
+// BEFORE interceptors run, so the breakdown never shrinks). A recent tail stays
+// verbatim and a compact STORY SO FAR recap is injected by the interceptor.
 const HIDE_KEEP_RECENT = 4;
-function buildStorySoFar(ch, uptoTurn) {
-  const mems = (ch.memories || []).filter((m) => typeof m.toTurn === 'number' && m.toTurn <= uptoTurn)
-    .sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0));
+function buildStorySoFar(ch) {
+  const mems = (ch.memories || []).slice().sort((a, b) => (a.fromTurn || 0) - (b.fromTurn || 0));
   if (!mems.length) return '';
   const dl = (d) => (d ? 'Day ' + d + ': ' : '');
-  const lines = mems.map((m) => '• ' + dl(m.day) + (m.text || '').trim());
+  const lines = mems.map((m) => '\u2022 ' + dl(m.day) + (m.text || '').trim());
   let out = lines.join('\n');
-  if (out.length > 9000) out = out.slice(0, 9000) + '…';
+  if (out.length > 12000) out = out.slice(0, 12000) + '\u2026';
   return out;
 }
-function applyHideSummarized(messages, ch) {
+async function syncHideOnFile(chatId, ch) {
+  if (!spindle.chat || !spindle.chat.setMessagesHidden) return { hid: 0, shown: 0 };
+  let msgs;
+  try { msgs = await readStoredMessages(chatId); } catch (e) { return { hid: 0, shown: 0 }; }
+  if (!msgs || !msgs.length) return { hid: 0, shown: 0 };
+  if (!Array.isArray(ch.hiddenByVellum)) ch.hiddenByVellum = [];
+  const ours = new Set(ch.hiddenByVellum);
   const covered = ch.covered || 0;
-  if (covered <= 0) return messages;
-  const story = buildStorySoFar(ch, covered);
-  if (!story) return messages; // nothing distilled yet → never drop blind
-  // Total assistant turns present in this context.
-  let totalAsst = 0;
-  for (const m of messages) if (m && m.role === 'assistant') totalAsst++;
-  // Never drop into the recent tail.
-  const dropUpToTurn = Math.min(covered, Math.max(0, totalAsst - HIDE_KEEP_RECENT));
-  if (dropUpToTurn <= 0) return messages;
-  const kept = [];
-  let asstSeen = 0;
-  let droppedAny = false;
-  for (const m of messages) {
-    if (!m || (m.role !== 'user' && m.role !== 'assistant')) { kept.push(m); continue; }
-    // The turn this message belongs to: an assistant message owns the turn it
-    // closes; a user message belongs to the upcoming assistant turn.
-    const ownTurn = m.role === 'assistant' ? (asstSeen + 1) : (asstSeen + 1);
-    if (m.role === 'assistant') asstSeen++;
-    if (ownTurn <= dropUpToTurn) { droppedAny = true; continue; } // drop summarized turn
-    kept.push(m);
+  let totalAsst = 0; for (const m of msgs) if (m.role === 'assistant') totalAsst++;
+  const dropUpTo = Math.min(covered, Math.max(0, totalAsst - HIDE_KEEP_RECENT));
+  const toHide = [], toShow = [];
+  let asst = 0;
+  for (const m of msgs) {
+    if (!m.id || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    const turn = asst + 1;
+    if (m.role === 'assistant') asst++;
+    const shouldHide = ch.hideSummarized && turn <= dropUpTo;
+    if (shouldHide) { if (!m.hidden) toHide.push(m.id); ours.add(m.id); }
+    else if (ours.has(m.id) && m.hidden) { toShow.push(m.id); ours.delete(m.id); }
   }
-  if (!droppedAny) return messages;
-  const block = { role: 'system', content: '[STORY SO FAR — the earlier chapters of this scene, condensed to save context. Treat as established, already-happened history; do not recap it in prose.]\n' + story };
-  return [block, ...kept];
+  try {
+    for (let i = 0; i < toHide.length; i += 500) await spindle.chat.setMessagesHidden(chatId, toHide.slice(i, i + 500), true);
+    for (let i = 0; i < toShow.length; i += 500) await spindle.chat.setMessagesHidden(chatId, toShow.slice(i, i + 500), false);
+  } catch (e) { spindle.log.warn('[vellum_tracker] hide-on-file: ' + (e && e.message)); }
+  ch.hiddenByVellum = Array.from(ours);
+  if (toHide.length || toShow.length) spindle.log.info('[vellum_tracker] hide-on-file: hid ' + toHide.length + ', restored ' + toShow.length + ' (covered=' + covered + ')');
+  return { hid: toHide.length, shown: toShow.length };
+}
+async function restoreHidden(chatId, ch) {
+  if (!spindle.chat || !spindle.chat.setMessagesHidden) return;
+  const ids = Array.isArray(ch.hiddenByVellum) ? ch.hiddenByVellum.slice() : [];
+  if (!ids.length) return;
+  try { for (let i = 0; i < ids.length; i += 500) await spindle.chat.setMessagesHidden(chatId, ids.slice(i, i + 500), false); }
+  catch (e) { spindle.log.warn('[vellum_tracker] restoreHidden: ' + (e && e.message)); }
+  ch.hiddenByVellum = [];
+  spindle.log.info('[vellum_tracker] hide-on-file: restored ' + ids.length + ' hidden messages');
 }
 
 const lastInjectionByChat = new Map();
@@ -3152,6 +3206,11 @@ async function handle(chatId, content, userId) {
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).
       if (userId) setTimeout(() => { maybeSummarize(chatId, userId); }, 1500);
+      // Hide-on-file: once summaries advance, hide the now-covered raw turns so
+      // they leave the prompt + breakdown + embeddings (real token savings).
+      if (ch.hideSummarized) setTimeout(async () => {
+        try { const c2 = await loadChronicle(chatId); const r = await syncHideOnFile(chatId, c2); if (r.hid || r.shown) await saveChronicle(chatId, c2); } catch (e) {}
+      }, 2600);
       // Living tracker: auto-update relations/knowledge/secrets/memories from the
       // recent turn and emit pulse notifications (opt-in, background, throttled).
       if (userId && ch.living) setTimeout(() => { runLivingUpdate(chatId, userId); }, 2200);
@@ -3276,9 +3335,12 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (payload.type === 'set_hide_summarized') {
         ch.hideSummarized = !!payload.enabled;
         _prewarmCache.delete(chatId); // affects outgoing context → invalidate cache
+        // Apply immediately: hide now-covered turns, or restore everything on off.
+        if (ch.hideSummarized) { try { await syncHideOnFile(chatId, ch); } catch (e) { spindle.log.warn('[vellum_tracker] toggle-hide: ' + (e && e.message)); } }
+        else { try { await restoreHidden(chatId, ch); } catch (e) {} }
         await saveChronicle(chatId, ch);
       }
-      spindle.sendToFrontend({ type: 'vellum_hide_summarized', enabled: !!ch.hideSummarized, covered: ch.covered || 0, memories: (ch.memories || []).length }, userId);
+      spindle.sendToFrontend({ type: 'vellum_hide_summarized', enabled: !!ch.hideSummarized, covered: ch.covered || 0, memories: (ch.memories || []).length, hidden: (ch.hiddenByVellum || []).length }, userId);
       return;
     }
     if (payload?.type === 'set_living' || payload?.type === 'get_living') {
