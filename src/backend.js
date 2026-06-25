@@ -631,6 +631,24 @@ function touchCast(ch, name, turn, day, status) {
 
 function sigOf(led, bts) { return (led ? led.raw : '') + '|' + (bts || ''); }
 
+// Short stable id generator for chronicle entries (events/shifts/knowledge/etc.)
+let _vidCounter = 0;
+function vid(prefix) { return (prefix || 'v') + Date.now().toString(36) + (_vidCounter++).toString(36) + Math.floor(Math.random() * 1296).toString(36); }
+
+// Stamp stable ids on every entry that lacks one. Called in saveChronicle so
+// ALL creation paths (fold, scan, import, manual add) get ids uniformly — this
+// is what lets the UI edit/delete by id, immune to sort/filter index drift.
+function ensureIds(ch) {
+  (ch.events || []).forEach((e) => { if (e && !e.id) e.id = vid('ev'); });
+  (ch.shifts || []).forEach((s) => { if (s && !s.id) s.id = vid('sh'); });
+  (ch.knowledge || []).forEach((k) => { if (k && !k.id) k.id = vid('kn'); });
+  (ch.secrets || []).forEach((s) => { if (s && !s.id) s.id = vid('sc'); });
+  for (const k of Object.keys(ch.memJournal || {})) {
+    (ch.memJournal[k].entries || []).forEach((e) => { if (e && !e.id) e.id = vid('mj'); });
+  }
+  (ch.memories || []).forEach((m) => { if (m && !m.id) m.id = vid('m'); });
+}
+
 // No structural prune: the chronicle now lives on the per-extension virtual
 // disk (spindle.storage), which has no 90KB chat-var ceiling, so arcs/threads/
 // events/etc. are unbounded. Kept as a no-op hook for clarity.
@@ -685,6 +703,7 @@ async function loadChronicle(chatId) {
 
 async function saveChronicle(chatId, ch) {
   ch.updatedAt = Date.now();
+  ensureIds(ch);
   chronicleByChat.set(chatId, ch);
   // Persist to the per-extension virtual disk (spindle.storage) — file-backed,
   // free-tier, NO 90KB chat-var ceiling, so the chronicle is effectively
@@ -2019,6 +2038,159 @@ function applyCastEdit(ch, input) {
   return m;
 }
 
+/* ============================================================================
+ * MANUAL CRUD for arcs, threads, events, shifts, knowledge, secrets,
+ * memory-journal entries, and chapter memories. Every chronicle data type gets
+ * add / edit / delete. Edits set a `userEdited` flag so future auto-scans don't
+ * overwrite them; deletes record a tombstone where one exists so re-import /
+ * re-scan never resurrects them. All operate by stable id.
+ * ========================================================================== */
+
+// ---- arcs & threads (tracks) ----
+function trackAdd(ch, group, title, status) {
+  const map = group === 'thread' ? (ch.threads || (ch.threads = {})) : (ch.arcs || (ch.arcs = {}));
+  const t = String(title || '').trim();
+  if (!t) return null;
+  const key = normKey(t) || vid('tk');
+  const turn = ch.turns || 0;
+  if (!map[key]) map[key] = { id: key, title: t, firstTurn: turn, firstDay: ch.lastDay, lastTurn: turn, lastDay: ch.lastDay, status: '', history: [], source: 'user' };
+  const m = map[key];
+  m.title = t;
+  const st = String(status || '').trim();
+  if (st && (!m.history.length || m.history[m.history.length - 1].status !== st)) m.history.push({ turn, day: ch.lastDay, status: st });
+  if (st) m.status = st;
+  m.userEdited = true;
+  return m;
+}
+function trackEdit(ch, group, id, title, status) {
+  const map = group === 'thread' ? ch.threads : ch.arcs;
+  const m = map && map[id];
+  if (!m) return null;
+  if (typeof title === 'string' && title.trim()) m.title = title.trim().slice(0, 200);
+  if (typeof status === 'string') {
+    m.status = status.trim().slice(0, 400);
+    const turn = ch.turns || 0;
+    m.history.push({ turn, day: ch.lastDay, status: m.status });
+    m.lastTurn = turn; m.lastDay = ch.lastDay;
+  }
+  m.userEdited = true;
+  return m;
+}
+function trackDelete(ch, group, id) {
+  const map = group === 'thread' ? ch.threads : ch.arcs;
+  if (map && map[id]) { delete map[id]; return true; }
+  return false;
+}
+
+// ---- events & shifts (logs) ----
+function logAdd(ch, kind, text, day) {
+  const arr = kind === 'shift' ? (ch.shifts || (ch.shifts = [])) : (ch.events || (ch.events = []));
+  const t = String(text || '').trim();
+  if (!t) return null;
+  const entry = { id: vid(kind === 'shift' ? 'sh' : 'ev'), turn: ch.turns || 0, day: Number.isFinite(day) ? day : (ch.lastDay || 1), text: t, source: 'user' };
+  arr.push(entry);
+  return entry;
+}
+function logEdit(ch, kind, id, text, day) {
+  const arr = kind === 'shift' ? ch.shifts : ch.events;
+  const e = Array.isArray(arr) && arr.find((x) => x.id === id);
+  if (!e) return null;
+  if (typeof text === 'string' && text.trim()) e.text = text.trim().slice(0, 600);
+  if (Number.isFinite(day)) e.day = day;
+  e.userEdited = true;
+  return e;
+}
+function logDelete(ch, kind, id) {
+  const key = kind === 'shift' ? 'shifts' : 'events';
+  if (!Array.isArray(ch[key])) return false;
+  const i = ch[key].findIndex((x) => x.id === id);
+  if (i < 0) return false;
+  ch[key].splice(i, 1);
+  return true;
+}
+
+// ---- knowledge & secrets ----
+function knowledgeAdd(ch, input) {
+  if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
+  const who = String(input.who || '').trim(), fact = String(input.fact || '').trim();
+  if (!who || !fact) return null;
+  const REL = new Set(['knows', 'believes', 'suspects', 'wrong', 'unaware']);
+  const e = { id: vid('kn'), who: who.slice(0, 60), fact: fact.slice(0, 240), reliability: REL.has(input.reliability) ? input.reliability : 'knows', truth: ['true', 'false', 'unknown'].includes(input.truth) ? input.truth : 'unknown', source: String(input.source || '').slice(0, 120), turn: ch.turns || 0, lastTurn: ch.turns || 0, userEdited: true };
+  ch.knowledge.push(e);
+  return e;
+}
+function knowledgeEditEntry(ch, id, input) {
+  const e = Array.isArray(ch.knowledge) && ch.knowledge.find((x) => x.id === id);
+  if (!e) return null;
+  if (typeof input.who === 'string' && input.who.trim()) e.who = input.who.trim().slice(0, 60);
+  if (typeof input.fact === 'string' && input.fact.trim()) e.fact = input.fact.trim().slice(0, 240);
+  if (['knows', 'believes', 'suspects', 'wrong', 'unaware'].includes(input.reliability)) e.reliability = input.reliability;
+  if (['true', 'false', 'unknown'].includes(input.truth)) e.truth = input.truth;
+  if (typeof input.source === 'string') e.source = input.source.slice(0, 120);
+  e.userEdited = true;
+  return e;
+}
+function secretAdd(ch, input) {
+  if (!Array.isArray(ch.secrets)) ch.secrets = [];
+  const secret = String(input.secret || '').trim(), keeper = String(input.keeper || '').trim();
+  if (!secret || !keeper) return null;
+  const DG = new Set(['minor', 'major', 'explosive']);
+  const e = { id: vid('sc'), secret: secret.slice(0, 240), keeper: keeper.slice(0, 60), from: String(input.from || '').slice(0, 120), method: String(input.method || 'omission').slice(0, 30), exposure: String(input.exposure || '').slice(0, 160), danger: DG.has(input.danger) ? input.danger : 'major', revealed: false, turn: ch.turns || 0, lastTurn: ch.turns || 0, userEdited: true };
+  ch.secrets.push(e);
+  return e;
+}
+function secretEditEntry(ch, id, input) {
+  const e = Array.isArray(ch.secrets) && ch.secrets.find((x) => x.id === id);
+  if (!e) return null;
+  if (typeof input.secret === 'string' && input.secret.trim()) e.secret = input.secret.trim().slice(0, 240);
+  if (typeof input.keeper === 'string' && input.keeper.trim()) e.keeper = input.keeper.trim().slice(0, 60);
+  if (typeof input.from === 'string') e.from = input.from.slice(0, 120);
+  if (typeof input.exposure === 'string') e.exposure = input.exposure.slice(0, 160);
+  if (['minor', 'major', 'explosive'].includes(input.danger)) e.danger = input.danger;
+  if (typeof input.revealed === 'boolean') e.revealed = input.revealed;
+  e.userEdited = true;
+  return e;
+}
+
+// ---- memory journal entries ----
+function memJournalAdd(ch, input) {
+  if (!ch.memJournal) ch.memJournal = {};
+  const who = String(input.who || '').trim(), memory = String(input.memory || '').trim();
+  if (!who || !memory) return null;
+  const m = findCastMember(ch, who);
+  const key = m ? m.id : castKey(who);
+  if (!key) return null;
+  if (!ch.memJournal[key]) ch.memJournal[key] = { name: m ? m.name : who, entries: [] };
+  const W = new Set(['trivial', 'minor', 'significant', 'defining']);
+  const S = new Set(['positive', 'negative', 'neutral', 'complex']);
+  const e = { id: vid('mj'), about: String(input.about || '').slice(0, 60), memory: memory.slice(0, 400), kind: String(input.kind || 'interaction').slice(0, 20), weight: W.has(input.weight) ? input.weight : 'minor', sentiment: S.has(input.sentiment) ? input.sentiment : 'neutral', day: Number.isFinite(input.day) ? input.day : null, turn: ch.turns || 0, userEdited: true };
+  ch.memJournal[key].entries.push(e);
+  return { key, entry: e };
+}
+function memJournalEdit(ch, charKey, id, input) {
+  const bucket = ch.memJournal && ch.memJournal[charKey];
+  const e = bucket && (bucket.entries || []).find((x) => x.id === id);
+  if (!e) return null;
+  if (typeof input.memory === 'string' && input.memory.trim()) e.memory = input.memory.trim().slice(0, 400);
+  if (typeof input.about === 'string') e.about = input.about.slice(0, 60);
+  if (['trivial', 'minor', 'significant', 'defining'].includes(input.weight)) e.weight = input.weight;
+  if (['positive', 'negative', 'neutral', 'complex'].includes(input.sentiment)) e.sentiment = input.sentiment;
+  if (typeof input.kind === 'string') e.kind = input.kind.slice(0, 20);
+  e.userEdited = true;
+  return e;
+}
+
+// ---- chapter memories (manual add; edit/delete already exist) ----
+function chapterMemoryAdd(ch, input) {
+  if (!Array.isArray(ch.memories)) ch.memories = [];
+  const text = String(input.text || '').trim();
+  if (!text) return null;
+  const kw = Array.isArray(input.keywords) ? input.keywords : String(input.keywords || '').split(/[,;]/);
+  const e = { id: vid('m'), fromTurn: null, toTurn: null, day: Number.isFinite(input.day) ? input.day : null, text: text.slice(0, 2000), keywords: kw.map((k) => String(k).toLowerCase().trim()).filter(Boolean).slice(0, 14), userAdded: true, edited: true };
+  ch.memories.push(e);
+  return e;
+}
+
 function broadcastChronicle(chatId, ch, userId) {
   const msg = { type: 'vellum_chronicle', chatId, chronicle: ch, updatedAt: Date.now() };
   if (userId) spindle.sendToFrontend(msg, userId); else spindle.sendToFrontend(msg);
@@ -2658,12 +2830,12 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const chatId = await resolveChatId(payload.chatId, userId);
       if (!chatId) return;
       const ch = await loadChronicle(chatId);
-      if (payload.kind === 'knowledge' && Array.isArray(ch.knowledge) && typeof payload.index === 'number') {
-        const e = ch.knowledge[payload.index];
-        if (e) { addTombstone(ch, 'know', knowSig(e)); ch.knowledge.splice(payload.index, 1); }
-      } else if (payload.kind === 'secret' && Array.isArray(ch.secrets) && typeof payload.index === 'number') {
-        const e = ch.secrets[payload.index];
-        if (e) { addTombstone(ch, 'sec', secSig(e)); ch.secrets.splice(payload.index, 1); }
+      if (payload.kind === 'knowledge' && Array.isArray(ch.knowledge)) {
+        let idx = (typeof payload.id === 'string' && payload.id) ? ch.knowledge.findIndex((x) => x.id === payload.id) : (typeof payload.index === 'number' ? payload.index : -1);
+        if (idx >= 0 && ch.knowledge[idx]) { addTombstone(ch, 'know', knowSig(ch.knowledge[idx])); ch.knowledge.splice(idx, 1); }
+      } else if (payload.kind === 'secret' && Array.isArray(ch.secrets)) {
+        let idx = (typeof payload.id === 'string' && payload.id) ? ch.secrets.findIndex((x) => x.id === payload.id) : (typeof payload.index === 'number' ? payload.index : -1);
+        if (idx >= 0 && ch.secrets[idx]) { addTombstone(ch, 'sec', secSig(ch.secrets[idx])); ch.secrets.splice(idx, 1); }
       } else if (payload.kind === 'clear_knowledge') {
         (ch.knowledge || []).forEach((e) => addTombstone(ch, 'know', knowSig(e)));
         ch.knowledge = [];
@@ -2760,6 +2932,33 @@ spindle.onFrontendMessage(async (payload, userId) => {
     if (payload?.type === 'import_history') {
       const chatId = await resolveChatId(payload.chatId, userId);
       await importHistory(chatId, payload.text || '', userId);
+      return;
+    }
+    if (payload?.type === 'track_add' || payload?.type === 'track_edit' || payload?.type === 'track_delete'
+      || payload?.type === 'log_add' || payload?.type === 'log_edit' || payload?.type === 'log_delete'
+      || payload?.type === 'knowledge_add' || payload?.type === 'knowledge_edit'
+      || payload?.type === 'secret_add' || payload?.type === 'secret_edit'
+      || payload?.type === 'mem_add' || payload?.type === 'mem_edit'
+      || payload?.type === 'memory_add') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (!chatId) return;
+      const ch = await loadChronicle(chatId);
+      let ok = false;
+      const tp = payload.type;
+      if (tp === 'track_add') ok = !!trackAdd(ch, payload.group, payload.title, payload.status);
+      else if (tp === 'track_edit') ok = !!trackEdit(ch, payload.group, payload.id, payload.title, payload.status);
+      else if (tp === 'track_delete') ok = trackDelete(ch, payload.group, payload.id);
+      else if (tp === 'log_add') ok = !!logAdd(ch, payload.kind, payload.text, payload.day);
+      else if (tp === 'log_edit') ok = !!logEdit(ch, payload.kind, payload.id, payload.text, payload.day);
+      else if (tp === 'log_delete') ok = logDelete(ch, payload.kind, payload.id);
+      else if (tp === 'knowledge_add') ok = !!knowledgeAdd(ch, payload.entry || payload);
+      else if (tp === 'knowledge_edit') ok = !!knowledgeEditEntry(ch, payload.id, payload.entry || payload);
+      else if (tp === 'secret_add') ok = !!secretAdd(ch, payload.entry || payload);
+      else if (tp === 'secret_edit') ok = !!secretEditEntry(ch, payload.id, payload.entry || payload);
+      else if (tp === 'mem_add') ok = !!memJournalAdd(ch, payload.entry || payload);
+      else if (tp === 'mem_edit') ok = !!memJournalEdit(ch, payload.charKey, payload.id, payload.entry || payload);
+      else if (tp === 'memory_add') ok = !!chapterMemoryAdd(ch, payload.entry || payload);
+      if (ok) { await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId); }
       return;
     }
     if (payload?.type === 'clear_all') {

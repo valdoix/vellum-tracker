@@ -87,7 +87,7 @@ function _setupImpl(ctx) {
     }
     const delK = e.target.closest('[data-know-del]');
     if (delK) {
-      ctx.sendToBackend({ type: 'knowledge_delete', chatId: currentChatId, kind: delK.getAttribute('data-know-del'), index: parseInt(delK.getAttribute('data-i'), 10) });
+      ctx.sendToBackend({ type: 'knowledge_delete', chatId: currentChatId, kind: delK.getAttribute('data-know-del'), id: delK.getAttribute('data-id') || undefined, index: parseInt(delK.getAttribute('data-i'), 10) });
       return;
     }
   });
@@ -926,7 +926,8 @@ function knowledgeHtml(ch) {
       + '<span class="vlc-know-rel ' + (relCls[k.reliability] || 'k-knows') + '">' + escapeHtml(relLbl[k.reliability] || k.reliability) + '</span>'
       + '<span class="vlc-know-who">' + escapeHtml(k.who) + '</span>'
       + '<span class="vlc-know-fact">' + escapeHtml(k.fact) + (k.reliability === 'wrong' && k.truth === 'false' ? ' <em class="vlc-know-x">(untrue)</em>' : '') + '</span>'
-      + '<button class="vlc-mini-del" data-know-del="knowledge" data-i="' + i + '" title="Delete">\u2715</button>'
+      + '<button class="vlc-mini-edit" data-know-edit data-id="' + escapeHtml(k.id || '') + '" data-who="' + escapeHtml(k.who) + '" data-fact="' + escapeHtml(k.fact) + '" data-reliability="' + escapeHtml(k.reliability || '') + '" data-truth="' + escapeHtml(k.truth || '') + '" data-source="' + escapeHtml(k.source || '') + '" title="Edit">\u270E</button>'
+      + '<button class="vlc-mini-del" data-know-del="knowledge" data-id="' + escapeHtml(k.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button>'
       + '</div>';
     }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(relLbl[_knowFilter] || _knowFilter) + '\u201d entries.</div>';
   }
@@ -947,7 +948,8 @@ function knowledgeHtml(ch) {
       + '<div class="vlc-secret-top"><span class="vlc-secret-keeper">' + escapeHtml(x.keeper) + '</span>'
       + '<span class="vlc-secret-arrow">hides from</span><span class="vlc-secret-from">' + escapeHtml(x.from || 'others') + '</span>'
       + '<span class="vlc-secret-danger">' + escapeHtml(x.danger) + '</span>'
-      + '<button class="vlc-mini-del" data-know-del="secret" data-i="' + i + '" title="Delete">\u2715</button></div>'
+      + '<button class="vlc-mini-edit" data-secret-edit data-id="' + escapeHtml(x.id || '') + '" data-secret="' + escapeHtml(x.secret) + '" data-keeper="' + escapeHtml(x.keeper) + '" data-from="' + escapeHtml(x.from || '') + '" data-exposure="' + escapeHtml(x.exposure || '') + '" data-danger="' + escapeHtml(x.danger || '') + '" title="Edit">\u270E</button>'
+      + '<button class="vlc-mini-del" data-know-del="secret" data-id="' + escapeHtml(x.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button></div>'
       + '<div class="vlc-secret-body">' + escapeHtml(x.secret) + '</div>'
       + (x.exposure ? '<div class="vlc-secret-exp">may surface: ' + escapeHtml(x.exposure) + '</div>' : '')
       + '</div>';
@@ -987,11 +989,12 @@ function memJournalHtml(ch) {
       return '<div class="vlc-mj-row ' + (sCls[e.sentiment] || 's-neu') + '">'
       + '<span class="vlc-mj-w ' + (wCls[e.weight] || 'w-minor') + '">' + escapeHtml(e.weight) + '</span>'
       + '<span class="vlc-mj-t">' + escapeHtml(e.memory) + (e.about ? ' <em class="vlc-mj-about">\u2014 ' + escapeHtml(e.about) + '</em>' : '') + '</span>'
+      + '<button class="vlc-mini-edit" data-mj-edit data-key="' + escapeHtml(k) + '" data-id="' + escapeHtml(e.id || '') + '" data-memory="' + escapeHtml(e.memory) + '" data-about="' + escapeHtml(e.about || '') + '" data-weight="' + escapeHtml(e.weight || '') + '" data-sentiment="' + escapeHtml(e.sentiment || '') + '" title="Edit">\u270E</button>'
       + '<button class="vlc-mini-del" data-mj-del="' + escapeHtml(k) + '" data-id="' + escapeHtml(e.id || '') + '" data-i="' + i + '" title="Delete">\u2715</button>'
       + '</div>';
     }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(active) + '\u201d memories.</div>';
     const bar = (W_ORDER.filter((w) => cnt[w]).length > 1) ? ('<div class="vlc-fbar" data-mj-fbar>' + chips + '</div>') : '';
-    return '<details class="vlc-mj" open><summary class="vlc-mj-sum"><span class="vlc-mj-name">' + escapeHtml(c.name || k) + '</span><span class="vlc-h-n">' + all.length + '</span></summary><div class="vlc-mj-body">' + bar + rows + '</div></details>';
+    return '<details class="vlc-mj" open><summary class="vlc-mj-sum"><span class="vlc-mj-name">' + escapeHtml(c.name || k) + '</span><span class="vlc-h-n">' + all.length + '</span><button class="vlc-add-btn" data-mj-add data-who="' + escapeHtml(c.name || k) + '">+ Add</button></summary><div class="vlc-mj-body">' + bar + rows + '</div></details>';
   }).join('');
 }
 
@@ -1023,7 +1026,7 @@ function memoryList(memories) {
 }
 
 // One track (arc or thread) with its evolution timeline.
-function trackCard(t) {
+function trackCard(t, grp) {
   const hist = (t.history || []);
   const current = t.status || (hist.length ? hist[hist.length - 1].status : '');
   const span = (t.firstDay && t.lastDay && t.firstDay !== t.lastDay)
@@ -1038,32 +1041,39 @@ function trackCard(t) {
     }).join('') + '</div>';
   }
   const toggle = hist.length > 1 ? '<button class="vlc-evo-toggle" data-evo>▾ ' + hist.length + ' beats</button>' : '';
+  const g = grp === 'threads' ? 'thread' : 'arc';
+  const ctl = '<span class="vlc-row-ctl">'
+    + '<button class="vlc-mini-edit" data-track-edit data-group="' + g + '" data-id="' + escapeHtml(t.id) + '" data-title="' + escapeHtml(t.title || '') + '" data-status="' + escapeHtml(current || '') + '" title="Edit">✎</button>'
+    + '<button class="vlc-mini-del" data-track-del data-group="' + g + '" data-id="' + escapeHtml(t.id) + '" title="Delete">✕</button></span>';
   return '<div class="vlc-track">'
     + '<div class="vlc-track-h"><span class="vlc-track-name">' + escapeHtml(t.title || t.id) + '</span>'
-    + '<span class="vlc-track-span">' + escapeHtml(span) + '</span></div>'
+    + '<span class="vlc-track-span">' + escapeHtml(span) + '</span>' + ctl + '</div>'
     + '<div class="vlc-track-now">' + escapeHtml(current || '—') + '</div>'
     + toggle + steps + '</div>';
 }
 
 // Paginated chronological log (events or shifts), newest first.
-function logList(items, icon, key) {
+function logList(items, icon, key, kind) {
   if (!items || !items.length) return '<div class="vlc-empty">Nothing recorded yet.</div>';
   // Group near-identical entries so a recurring event/shift reads as ONE topic
   // evolving across days, instead of many repeated rows.
   const groups = logGroup(items);
   const { slice, pager } = paginate(groups, key, PER_LOG);
+  const ctl = (e) => '<span class="vlc-row-ctl">'
+    + '<button class="vlc-mini-edit" data-log-edit data-kind="' + kind + '" data-id="' + escapeHtml(e.id || '') + '" data-text="' + escapeHtml(e.text || '') + '" data-day="' + (e.day || '') + '" title="Edit">✎</button>'
+    + '<button class="vlc-mini-del" data-log-del data-kind="' + kind + '" data-id="' + escapeHtml(e.id || '') + '" title="Delete">✕</button></span>';
   const html = slice.map((g) => {
     const ents = g.entries.slice().sort((a, b) => a.idx - b.idx); // oldest→newest (evolution reads downward)
     if (ents.length === 1) {
       const e = ents[0];
       return '<div class="vlc-log-row"><span class="vlc-log-d">' + escapeHtml(dayLabel(e.day)) + '</span>'
         + '<span class="vlc-log-x">' + icon + '</span>'
-        + '<span class="vlc-log-t">' + escapeHtml(e.text) + '</span></div>';
+        + '<span class="vlc-log-t">' + escapeHtml(e.text) + '</span>' + ctl(e) + '</div>';
     }
     const steps = ents.map((e, i) =>
       '<div class="vlc-eg-step' + (i === ents.length - 1 ? ' now' : '') + '">'
       + '<span class="vlc-eg-d">' + escapeHtml(dayLabel(e.day)) + '</span>'
-      + '<span class="vlc-eg-t">' + escapeHtml(e.text) + '</span></div>'
+      + '<span class="vlc-eg-t">' + escapeHtml(e.text) + '</span>' + ctl(e) + '</div>'
     ).join('');
     return '<details class="vlc-eg" open><summary class="vlc-eg-sum">'
       + '<span class="vlc-log-x">' + icon + '</span>'
@@ -1119,11 +1129,11 @@ function logGroup(items) {
     }
     const bar = subject ? 1 : 0.34;
     if (best && bestScore >= bar) {
-      best.entries.push({ day: e.day, text: e.text, idx });
+      best.entries.push({ day: e.day, text: e.text, idx, id: e.id });
       best.tokens = Array.from(new Set(best.tokens.concat(toks)));
       best.lastIdx = Math.max(best.lastIdx, idx);
     } else {
-      groups.push({ subject, tokens: toks, entries: [{ day: e.day, text: e.text, idx }], lastIdx: idx });
+      groups.push({ subject, tokens: toks, entries: [{ day: e.day, text: e.text, idx, id: e.id }], lastIdx: idx });
     }
   });
   groups.sort((a, b) => b.lastIdx - a.lastIdx);
@@ -1148,10 +1158,12 @@ function logGroupLabel(ents) {
 }
 // Paginated section of track cards (arcs or threads).
 function trackSection(grp, icon, title, tracks, emptyMsg) {
-  const head = '<h3 class="vlc-h">' + icon + ' ' + title + ' <span class="vlc-h-n">' + tracks.length + '</span></h3>';
+  const g = grp === 'threads' ? 'thread' : 'arc';
+  const addBtn = '<button class="vlc-add-btn" data-track-add data-group="' + g + '">+ Add</button>';
+  const head = '<h3 class="vlc-h">' + icon + ' ' + title + ' <span class="vlc-h-n">' + tracks.length + '</span>' + addBtn + '</h3>';
   if (!tracks.length) return '<section data-grp="' + grp + '">' + head + '<div class="vlc-empty">' + emptyMsg + '</div></section>';
   const { slice, pager } = paginate(tracks, 'pg_' + grp, PER_TRACK);
-  return '<section data-grp="' + grp + '">' + head + slice.map(trackCard).join('') + pager + '</section>';
+  return '<section data-grp="' + grp + '">' + head + slice.map((t) => trackCard(t, grp)).join('') + pager + '</section>';
 }
 
 function renderChronicle(host, ch) {
@@ -1175,20 +1187,20 @@ function renderChronicle(host, ch) {
     + '</div>';
 
   host.innerHTML = stat
-    + '<section data-grp="memories"><h3 class="vlc-h">✦ Chapter Memories <span class="vlc-h-n">' + ((ch.memories || []).length) + '</span></h3>' + memoryList(ch.memories) + '</section>'
+    + '<section data-grp="memories"><h3 class="vlc-h">✦ Chapter Memories <span class="vlc-h-n">' + ((ch.memories || []).length) + '</span><button class="vlc-add-btn" data-memory-add>+ Add</button></h3>' + memoryList(ch.memories) + '</section>'
     + '<div class="vlc-break"></div>'
     + trackSection('arcs', '📜', 'Character Arcs', arcs, 'No character arcs tracked yet.')
     + '<div class="vlc-break"></div>'
     + trackSection('threads', '🧵', 'Plot Threads', threads, 'No plot threads tracked yet.')
     + '<div class="vlc-break"></div>'
-    + '<section data-grp="events"><h3 class="vlc-h">🌊 Parallel & Off-screen Events <span class="vlc-h-n">' + (ch.events || []).length + '</span></h3>' + logList(ch.events, '▸', 'pg_events') + '</section>'
+    + '<section data-grp="events"><h3 class="vlc-h">🌊 Parallel & Off-screen Events <span class="vlc-h-n">' + (ch.events || []).length + '</span><button class="vlc-add-btn" data-log-add data-kind="event">+ Add</button></h3>' + logList(ch.events, '▸', 'pg_events', 'event') + '</section>'
     + '<div class="vlc-break"></div>'
-    + '<section data-grp="shifts"><h3 class="vlc-h">⚲ Narrative Shifts <span class="vlc-h-n">' + (ch.shifts || []).length + '</span></h3>' + logList(ch.shifts, '⚲', 'pg_shifts') + '</section>'
+    + '<section data-grp="shifts"><h3 class="vlc-h">⚲ Narrative Shifts <span class="vlc-h-n">' + (ch.shifts || []).length + '</span><button class="vlc-add-btn" data-log-add data-kind="shift">+ Add</button></h3>' + logList(ch.shifts, '⚲', 'pg_shifts', 'shift') + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="date"><h3 class="vlc-h">🗓 Timeline by Day</h3>' + byDateHtml(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="lore"><h3 class="vlc-h">🔑 Knowledge &amp; Secrets <span class="vlc-h-n">' + ((ch.knowledge || []).length + (ch.secrets || []).length) + '</span></h3>'
-      + '<div class="vlc-lore-bar"><button class="vlc-btn" data-scan-knowledge>🔑 Scan knowledge</button></div>'
+      + '<div class="vlc-lore-bar"><button class="vlc-btn" data-scan-knowledge>🔑 Scan knowledge</button><button class="vlc-btn" data-knowledge-add>+ Knowledge</button><button class="vlc-btn" data-secret-add>+ Secret</button></div>'
       + knowledgeHtml(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="injection"><h3 class="vlc-h">⇲ Injected into Chat</h3><div data-vlc-inj>' + injectionHtml(_lastInjection) + '</div></section>';
@@ -1277,6 +1289,48 @@ function wireChronicleControls(host) {
   host.querySelectorAll('[data-sec-filter]').forEach((btn) => {
     btn.addEventListener('click', () => { _secFilter = btn.getAttribute('data-sec-filter') || 'all'; renderChronicle(); });
   });
+
+  // ---- manual CRUD across all chronicle types (delegated; prompt-driven) ----
+  if (!host._vlcCrudWired) {
+    host._vlcCrudWired = true;
+    const send = (msg) => { if (_ctx) _ctx.sendToBackend(Object.assign({ chatId: _getChatId() }, msg)); };
+    const A = (el, n) => el.getAttribute(n) || '';
+    host.addEventListener('click', (e) => {
+      const t = e.target;
+      // Arcs / threads
+      let b = t.closest('[data-track-add]');
+      if (b) { const g = A(b, 'data-group'); const title = prompt((g === 'thread' ? 'New plot thread' : 'New character arc') + ' — title:'); if (title && title.trim()) { const status = prompt('Current status / beat (optional):') || ''; send({ type: 'track_add', group: g, title: title.trim(), status }); } return; }
+      b = t.closest('[data-track-edit]');
+      if (b) { const title = prompt('Edit title:', A(b, 'data-title')); if (title === null) return; const status = prompt('Edit current status / beat:', A(b, 'data-status')); send({ type: 'track_edit', group: A(b, 'data-group'), id: A(b, 'data-id'), title: title.trim(), status: status == null ? undefined : status }); return; }
+      b = t.closest('[data-track-del]');
+      if (b) { if (confirm('Delete this ' + (A(b, 'data-group') === 'thread' ? 'thread' : 'arc') + '?')) send({ type: 'track_delete', group: A(b, 'data-group'), id: A(b, 'data-id') }); return; }
+      // Events / shifts
+      b = t.closest('[data-log-add]');
+      if (b) { const kind = A(b, 'data-kind'); const text = prompt('New ' + kind + ' text:'); if (text && text.trim()) { const day = parseInt(prompt('Story day (number, optional):') || '', 10); send({ type: 'log_add', kind, text: text.trim(), day: Number.isFinite(day) ? day : undefined }); } return; }
+      b = t.closest('[data-log-edit]');
+      if (b) { e.preventDefault(); e.stopPropagation(); const text = prompt('Edit text:', A(b, 'data-text')); if (text === null) return; const dayStr = prompt('Story day (number, blank = keep):', A(b, 'data-day')); const day = parseInt(dayStr || '', 10); send({ type: 'log_edit', kind: A(b, 'data-kind'), id: A(b, 'data-id'), text: text.trim(), day: Number.isFinite(day) ? day : undefined }); return; }
+      b = t.closest('[data-log-del]');
+      if (b) { e.preventDefault(); e.stopPropagation(); if (confirm('Delete this entry?')) send({ type: 'log_delete', kind: A(b, 'data-kind'), id: A(b, 'data-id') }); return; }
+      // Knowledge
+      b = t.closest('[data-knowledge-add]');
+      if (b) { const who = prompt('Who holds this knowledge? (character name)'); if (!who || !who.trim()) return; const fact = prompt('What do they know/believe? (the fact)'); if (!fact || !fact.trim()) return; const reliability = (prompt('Reliability: knows / believes / suspects / wrong / unaware', 'knows') || 'knows').trim(); send({ type: 'knowledge_add', entry: { who: who.trim(), fact: fact.trim(), reliability } }); return; }
+      b = t.closest('[data-know-edit]');
+      if (b) { const who = prompt('Who:', A(b, 'data-who')); if (who === null) return; const fact = prompt('Fact:', A(b, 'data-fact')); if (fact === null) return; const reliability = (prompt('Reliability: knows / believes / suspects / wrong / unaware', A(b, 'data-reliability')) || A(b, 'data-reliability')).trim(); send({ type: 'knowledge_edit', id: A(b, 'data-id'), entry: { who: who.trim(), fact: fact.trim(), reliability } }); return; }
+      // Secrets
+      b = t.closest('[data-secret-add]');
+      if (b) { const secret = prompt('The concealed thing (the secret):'); if (!secret || !secret.trim()) return; const keeper = prompt('Who keeps it? (character name)'); if (!keeper || !keeper.trim()) return; const from = prompt('Hidden from whom? (optional)') || ''; const danger = (prompt('Danger: minor / major / explosive', 'major') || 'major').trim(); send({ type: 'secret_add', entry: { secret: secret.trim(), keeper: keeper.trim(), from, danger } }); return; }
+      b = t.closest('[data-secret-edit]');
+      if (b) { const secret = prompt('Secret:', A(b, 'data-secret')); if (secret === null) return; const keeper = prompt('Keeper:', A(b, 'data-keeper')); if (keeper === null) return; const from = prompt('Hidden from:', A(b, 'data-from')); const danger = (prompt('Danger: minor / major / explosive', A(b, 'data-danger')) || A(b, 'data-danger')).trim(); send({ type: 'secret_edit', id: A(b, 'data-id'), entry: { secret: secret.trim(), keeper: keeper.trim(), from: from == null ? undefined : from, danger } }); return; }
+      // Memory journal
+      b = t.closest('[data-mj-add]');
+      if (b) { const who = A(b, 'data-who'); const memory = prompt('New memory for ' + who + ':'); if (!memory || !memory.trim()) return; const weight = (prompt('Weight: trivial / minor / significant / defining', 'minor') || 'minor').trim(); send({ type: 'mem_add', entry: { who, memory: memory.trim(), weight } }); return; }
+      b = t.closest('[data-mj-edit]');
+      if (b) { e.preventDefault(); e.stopPropagation(); const memory = prompt('Edit memory:', A(b, 'data-memory')); if (memory === null) return; const weight = (prompt('Weight: trivial / minor / significant / defining', A(b, 'data-weight')) || A(b, 'data-weight')).trim(); send({ type: 'mem_edit', charKey: A(b, 'data-key'), id: A(b, 'data-id'), entry: { memory: memory.trim(), weight } }); return; }
+      // Chapter memory add
+      b = t.closest('[data-memory-add]');
+      if (b) { const text = prompt('New chapter memory (summary text):'); if (!text || !text.trim()) return; const kw = prompt('Keywords (comma-separated, optional):') || ''; send({ type: 'memory_add', entry: { text: text.trim(), keywords: kw } }); return; }
+    });
+  }
 }
 // Group every dated entry (arc beats, thread beats, events, shifts) by story day.
 function groupByDate(ch) {
@@ -1927,4 +1981,9 @@ const VELLUM_CSS = [
   ".vlc-mj-row.s-pos{border-left:2px solid rgba(143,166,126,.5);padding-left:6px}",".vlc-mj-row.s-neg{border-left:2px solid rgba(201,138,138,.5);padding-left:6px}",".vlc-mj-row.s-cx{border-left:2px solid rgba(180,142,208,.5);padding-left:6px}",".vlc-mj-row.s-neu{border-left:2px solid rgba(140,132,120,.4);padding-left:6px}",
   ".vlc-mini-del{flex:none;margin-left:auto;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(201,138,138,.14);color:#c98a8a;font-size:8px;line-height:1;display:grid;place-items:center}",
   ".vlc-mini-del:hover{background:rgba(201,138,138,.34)}",
+  ".vlc-mini-edit{flex:none;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(205,168,78,.14);color:#cda84e;font-size:9px;line-height:1;display:grid;place-items:center;margin-left:4px}",
+  ".vlc-mini-edit:hover{background:rgba(205,168,78,.34)}",
+  ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",
+  ".vlc-add-btn{margin-left:8px;font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid2,#8fa67e);background:rgba(143,166,126,.14);border:1px solid rgba(143,166,126,.3);border-radius:6px;padding:3px 8px;cursor:pointer;vertical-align:middle}",
+  ".vlc-add-btn:hover{background:rgba(143,166,126,.28)}",
 ].join("\n");
