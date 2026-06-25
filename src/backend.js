@@ -276,40 +276,62 @@ function extractDay(timeStr) {
 // Build the present-character RAPPORT strip from the relations system: for each
 // character currently on stage, their affection/trust toward the player ({{user}}),
 // derived (not model-guessed). Replaces the old single [bond] meter.
-function computeRapport(ch) {
+// `userName` is the resolved {{user}} persona name (authoritative).
+function computeRapport(ch, userName) {
   if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) return [];
-  const nc = _nameCtxCache.get(ch._cid) && _nameCtxCache.get(ch._cid).ctx;
-  const userName = nc && nc.user;
-  const userKey = userName ? castKey(userName) : null;
   const presentIds = new Set(ch.presentIds || []);
   if (!presentIds.size) return [];
-  // identify the player's cast id: a card explicitly sourced as the user, else
-  // the card whose name/alias matches the resolved {{user}} persona.
+  const userKey = userName ? castKey(userName) : null;
+  if (!userKey) return []; // can't identify the player → don't guess
+  // The player's cast id = the card matching the {{user}} persona name/alias.
+  // NOTE: do NOT use source==='user' — that flags user-ADDED cards too, not the
+  // player. Identify strictly by persona name.
   let userId = null;
-  for (const k of Object.keys(ch.cast || {})) { if (ch.cast[k].source === 'user') { userId = ch.cast[k].id; break; } }
-  if (!userId && userKey) {
-    for (const k of Object.keys(ch.cast || {})) {
-      const c = ch.cast[k];
-      if (castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey)) { userId = c.id; break; }
-    }
+  for (const k of Object.keys(ch.cast || {})) {
+    const c = ch.cast[k];
+    if (castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey)) { userId = c.id; break; }
   }
   const out = [];
+  const seen = new Set();
   for (const r of ch.relations) {
-    // a relation between a present character and the player
-    let other = null, dir = null;
-    if (userId && r.a === userId && presentIds.has(r.b)) { other = r.b; dir = 'b'; }
-    else if (userId && r.b === userId && presentIds.has(r.a)) { other = r.a; dir = 'a'; }
-    else continue;
+    let other = null;
+    if (userId && r.a === userId && presentIds.has(r.b)) other = r.b;
+    else if (userId && r.b === userId && presentIds.has(r.a)) other = r.a;
+    // fallback when the player has no cast card: a relation where exactly one
+    // side is a present character and the OTHER side name is the persona.
+    else if (!userId) {
+      const an = ch.cast[r.a] ? ch.cast[r.a].name : '', bn = ch.cast[r.b] ? ch.cast[r.b].name : '';
+      if (castKey(an) === userKey && presentIds.has(r.b)) other = r.b;
+      else if (castKey(bn) === userKey && presentIds.has(r.a)) other = r.a;
+    }
+    if (!other) continue;
     const oc = ch.cast[other];
     if (!oc) continue;
+    if (castKey(oc.name) === userKey) continue; // never show the player as a rapport row
+    if (seen.has(other)) continue; seen.add(other);
     out.push({ name: oc.name, affection: r.affection || 0, trust: r.trust || 0, sentiment: r.sentiment || 'neutral' });
   }
   return out.slice(0, 6);
 }
 
-function broadcast(chatId, parsed, btsRaw, chArg) {
+// Resolve the {{user}} persona name for rapport (cheap, cached via macros).
+async function resolveUserName(chatId) {
+  const cached = _nameCtxCache.get(chatId);
+  if (cached && cached.ctx && cached.ctx.user) return cached.ctx.user;
+  try {
+    if (spindle.macros && spindle.macros.resolve) {
+      const r = await spindle.macros.resolve('{{user}}', { chatId, commit: false });
+      const txt = (r && (r.text || r.result || r)) || '';
+      const n = String(txt).trim();
+      if (n && !/\{\{|\}\}/.test(n)) return n;
+    }
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+function broadcast(chatId, parsed, btsRaw, chArg, userName) {
   let rapport = [];
-  try { const ch = chArg || chronicleByChat.get(chatId); if (ch) { ch._cid = chatId; rapport = computeRapport(ch); } } catch (e) {}
+  try { const ch = chArg || chronicleByChat.get(chatId); if (ch) { rapport = computeRapport(ch, userName); } } catch (e) {}
   spindle.sendToFrontend({
     type: 'vellum_tracker_update',
     chatId,
@@ -3121,7 +3143,7 @@ async function resyncFromTranscript(chatId, userId) {
     const ledger = lastLed || { raw: '', time: '', location: '', weather: '', present: '', thoughts: '', arcs: '', offscreen: '', sceneTension: '', bondTension: '' };
     lastStateByChat.set(chatId, { ledger, bts: lastBts, updatedAt: Date.now() });
     try { await syncChatVars(chatId, ledger, lastBts); } catch (e) {}
-    broadcast(chatId, ledger, lastBts);
+    broadcast(chatId, ledger, lastBts, ch, await resolveUserName(chatId));
   } else {
     // no ledgered turns left → clear the live window
     lastStateByChat.delete(chatId);
@@ -3638,7 +3660,8 @@ async function handle(chatId, content, userId) {
   lastStateByChat.set(chatId, { ledger, bts: btsRaw, updatedAt: Date.now() });
   await syncChatVars(chatId, ledger, btsRaw);
   const chForRapport = await loadChronicle(chatId); // present-character rapport for the window
-  broadcast(chatId, ledger, btsRaw, chForRapport);
+  const userName = await resolveUserName(chatId);
+  broadcast(chatId, ledger, btsRaw, chForRapport, userName);
 
   // Fold this turn into the long-term chronicle (only when the state is new).
   try {
@@ -3749,7 +3772,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       }
       if (state) {
         let rapport = [];
-        try { const ch = await loadChronicle(chatId); ch._cid = chatId; rapport = computeRapport(ch); } catch (e) {}
+        try { const ch = await loadChronicle(chatId); const un = await resolveUserName(chatId); rapport = computeRapport(ch, un); } catch (e) {}
         spindle.sendToFrontend({ type: 'vellum_tracker_update', chatId, ledger: state.ledger, bts: state.bts, rapport, updatedAt: state.updatedAt }, userId);
       } else {
         spindle.sendToFrontend({ type: 'vellum_tracker_empty' }, userId);
