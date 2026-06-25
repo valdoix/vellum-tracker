@@ -3035,6 +3035,77 @@ function rebuildFromMessages(messages) {
   return ch;
 }
 
+
+// Rebuild structural data from the CURRENT transcript while preserving the
+// curated/LLM layers — used when turns are DELETED or swiped so the chronicle
+// stays true to what's actually in the chat (no stale arcs/events from turns
+// that no longer exist). Structural fold (arcs/threads/events/shifts) is rebuilt
+// from scratch; cast/knowledge/secrets/relations/memJournal/memTree are kept;
+// memories that covered now-deleted turns are clamped away.
+async function resyncFromTranscript(chatId, userId) {
+  if (!chatId) return false;
+  let msgs;
+  try { msgs = await readStoredMessages(chatId); } catch (e) { return false; }
+  if (!msgs) return false;
+  const ch = await loadChronicle(chatId);
+  const fresh = rebuildFromMessages(msgs);
+  // Replace structural fold with the truth from the transcript.
+  ch.arcs = fresh.arcs;
+  ch.threads = fresh.threads;
+  ch.events = fresh.events;
+  ch.shifts = fresh.shifts;
+  ch.present = fresh.present;
+  ch.presentIds = fresh.presentIds;
+  ch.turns = fresh.turns;
+  ch.lastDay = fresh.lastDay;
+  ch._sig = fresh._sig || ch._sig;
+  // Clamp distilled memories + coverage to the new turn count (drop chapters
+  // that summarized turns which no longer exist).
+  if (Array.isArray(ch.memories)) ch.memories = ch.memories.filter((m) => (m.toTurn || 0) <= fresh.turns);
+  if ((ch.covered || 0) > fresh.turns) ch.covered = fresh.turns;
+  // Prune memTree arc chapter refs that point at dropped memories.
+  if (ch.memTree && Array.isArray(ch.memTree.arcs)) {
+    const live = new Set((ch.memories || []).map((m) => m.id));
+    for (const a of ch.memTree.arcs) a.chapterIds = (a.chapterIds || []).filter((id) => live.has(id));
+    ch.memTree.arcs = ch.memTree.arcs.filter((a) => (a.chapterIds || []).length);
+  }
+  _prewarmCache.delete(chatId);
+  await saveChronicle(chatId, ch);
+  broadcastChronicle(chatId, ch, userId);
+  // Refresh the live window from the newest surviving ledger/BTS turn.
+  let lastLed = null, lastBts = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.role !== 'assistant' || typeof m.content !== 'string') continue;
+    const led = parseLedger(m.content), bts = parseBts(m.content);
+    if (led || bts) { lastLed = led; lastBts = bts; break; }
+  }
+  if (lastLed || lastBts) {
+    const ledger = lastLed || { raw: '', time: '', location: '', weather: '', present: '', thoughts: '', arcs: '', offscreen: '', sceneTension: '', bondTension: '' };
+    lastStateByChat.set(chatId, { ledger, bts: lastBts, updatedAt: Date.now() });
+    try { await syncChatVars(chatId, ledger, lastBts); } catch (e) {}
+    broadcast(chatId, ledger, lastBts);
+  } else {
+    // no ledgered turns left → clear the live window
+    lastStateByChat.delete(chatId);
+    try { spindle.sendToFrontend({ type: 'vellum_tracker_empty' }, userId); } catch (e) {}
+  }
+  spindle.log.info('[vellum_tracker] resynced from transcript: ' + fresh.turns + ' turns');
+  return true;
+}
+
+// Debounce per chat so a burst of deletes/swipes triggers one resync.
+const _resyncTimers = new Map();
+function scheduleResync(chatId, userId) {
+  if (!chatId) return;
+  rememberUser(userId);
+  if (_resyncTimers.has(chatId)) clearTimeout(_resyncTimers.get(chatId));
+  _resyncTimers.set(chatId, setTimeout(() => {
+    _resyncTimers.delete(chatId);
+    resyncFromTranscript(chatId, userId || _lastUserId).catch((e) => spindle.log.warn('[vellum_tracker] resync: ' + (e && e.message)));
+  }, 1200));
+}
+
 // ===== IMPORT CHAT HISTORY =====
 // Parse a user-supplied chat export into a normalized [{role, content, name}].
 // Supports: Lumiverse/array JSON, SillyTavern JSONL (one msg per line), a
@@ -3506,9 +3577,25 @@ try {
 const lastStateByChat = new Map();
 
 async function handle(chatId, content, userId) {
-  if (!content || !chatId) return;
-  const parsed = parseLedger(content);
-  const btsRaw = parseBts(content);
+  if (!chatId) return;
+  let parsed = content ? parseLedger(content) : null;
+  let btsRaw = content ? parseBts(content) : null;
+  // Fallback: the event payload sometimes lacks the final content (empty,
+  // streamed, or content-stripped). Read the newest stored assistant message so
+  // the live window + cast still update on a new turn.
+  if (!parsed && !btsRaw) {
+    try {
+      const msgs = await readStoredMessages(chatId);
+      if (msgs && msgs.length) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (!m || m.role !== 'assistant' || typeof m.content !== 'string') continue;
+          const led = parseLedger(m.content), bts = parseBts(m.content);
+          if (led || bts) { parsed = led; btsRaw = bts; content = m.content; break; }
+        }
+      }
+    } catch (e) { /* best effort */ }
+  }
   if (!parsed && !btsRaw) return;
   const ledger = parsed || { raw: '', time: '', location: '', weather: '', present: '', thoughts: '', arcs: '', offscreen: '', sceneTension: '', bondTension: '' };
   lastStateByChat.set(chatId, { ledger, bts: btsRaw, updatedAt: Date.now() });
@@ -3581,6 +3668,25 @@ spindle.on('MESSAGE_EDITED', async (payload) => {
   } catch (err) {
     spindle.log.warn(`[vellum_tracker] MESSAGE_EDITED: ${err?.message || err}`);
   }
+});
+
+// Deleting (or swiping away) turns must keep the chronicle/cast TRUE to the
+// actual transcript — resync from the real messages so stale data is purged.
+spindle.on('MESSAGE_DELETED', async (payload) => {
+  try {
+    const chatId = payload?.chatId || payload?.chat_id;
+    rememberUser(payload?.userId || payload?.user_id);
+    scheduleResync(chatId, payload?.userId || payload?.user_id);
+  } catch (err) { spindle.log.warn(`[vellum_tracker] MESSAGE_DELETED: ${err?.message || err}`); }
+});
+spindle.on('MESSAGE_SWIPED', async (payload) => {
+  try {
+    const chatId = payload?.chatId || payload?.chat_id;
+    rememberUser(payload?.userId || payload?.user_id);
+    // A swipe that adds/deletes/navigates changes the active content of a turn;
+    // resync so the tracker reflects the now-active swipe.
+    scheduleResync(chatId, payload?.userId || payload?.user_id);
+  } catch (err) { spindle.log.warn(`[vellum_tracker] MESSAGE_SWIPED: ${err?.message || err}`); }
 });
 
 /* ---------- frontend messages ----------

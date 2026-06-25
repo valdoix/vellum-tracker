@@ -1916,7 +1916,8 @@ const CHRONICLE_HTML =
   + '<div class="vlc-sub">Long-term continuity — arcs, threads, events & shifts, and how they evolved</div></div>'
   + '<div class="vlc-bar">'
   + '<button class="vlc-btn on" data-vlc-filter="all" data-view-btn>All</button>'
-  + '<button class="vlc-btn" data-vlc-filter="memories">Memories</button>'
+    + '<button class="vlc-btn" data-vlc-filter="memories">Memories</button>'
+    + '<button class="vlc-btn" data-vlc-filter="memtree">🌳 Tree</button>'
   + '<button class="vlc-btn" data-vlc-filter="arcs">Arcs</button>'
   + '<button class="vlc-btn" data-vlc-filter="threads">Threads</button>'
   + '<button class="vlc-btn" data-vlc-filter="events">Events</button>'
@@ -2510,6 +2511,7 @@ const VELLUM_CSS = [
   ".vlc-root[data-view='lore'] [data-grp]:not([data-grp='lore']){display:none}",
   ".vlc-root[data-view='journal'] [data-grp]:not([data-grp='journal']){display:none}",
   ".vlc-root[data-view='memories'] [data-grp]:not([data-grp='memories']){display:none}",
+  ".vlc-root[data-view='memtree'] [data-grp]:not([data-grp='memtree']){display:none}",
   ".vlc-root[data-view='injection'] [data-grp]:not([data-grp='injection']){display:none}",
   ".vlc-root[data-view='present'] [data-grp]:not([data-grp='present']){display:none}",
   ".vlc-root[data-view='active'] [data-grp]:not([data-grp='active']){display:none}",
