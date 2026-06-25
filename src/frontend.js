@@ -289,26 +289,93 @@ function _setupImpl(ctx) {
   makeDraggable(win, win.querySelector('[data-drag]'));
   makeResizable(win, win.querySelector('[data-resize]'));
 
-  // ---- Theme switcher: cycles a palette class across the window + tabs ----
-  const VELLUM_THEMES = ['gilt', 'moonlit', 'rose', 'emerald', 'mono', 'ember'];
-  function applyTheme(name) {
-    const t = VELLUM_THEMES.includes(name) ? name : 'gilt';
-    [win, tabPanel, castRoot].forEach((el) => {
-      if (!el) return;
-      VELLUM_THEMES.forEach((x) => el.classList.remove('vlt-' + x));
-      el.classList.add('vlt-' + t);
-    });
-    try { localStorage.setItem('vellum_theme', t); } catch (e) {}
+  // ---- Theming: skin (shape/layout) + custom accent color ----
+  const VELLUM_SKINS = ['vellum', 'parchment', 'phone', 'vn', 'codex', 'grimoire'];
+  const SKIN_LABEL = { vellum: 'Vellum', parchment: 'Parchment', phone: 'Phone', vn: 'Visual Novel', codex: 'Codex', grimoire: 'Grimoire' };
+  const themedEls = () => [win, tabPanel, castRoot].filter(Boolean);
+  // Fixed base palette (gilt) supplies the default CSS vars; the custom color
+  // picker overrides them. There is no palette cycle anymore.
+  themedEls().forEach((el) => el.classList.add('vlt-gilt'));
+
+  // hex -> "r,g,b" for the rgba(var(--vacc)) usages
+  function hexToRgb(hex) {
+    let h = String(hex || '').trim().replace(/^#/, '');
+    if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+    if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+    return parseInt(h.slice(0, 2), 16) + ',' + parseInt(h.slice(2, 4), 16) + ',' + parseInt(h.slice(4, 6), 16);
   }
-  let _themeIdx = 0;
-  try { const saved = localStorage.getItem('vellum_theme'); if (saved && VELLUM_THEMES.includes(saved)) _themeIdx = VELLUM_THEMES.indexOf(saved); } catch (e) {}
-  applyTheme(VELLUM_THEMES[_themeIdx]);
-  const themeBtn = win.querySelector('[data-theme]');
-  if (themeBtn) themeBtn.addEventListener('click', () => {
-    _themeIdx = (_themeIdx + 1) % VELLUM_THEMES.length;
-    applyTheme(VELLUM_THEMES[_themeIdx]);
-    themeBtn.title = 'Theme: ' + VELLUM_THEMES[_themeIdx];
+  // lighten a hex toward white by t (0..1) for the bright --vsolid tone
+  function lightenHex(hex, t) {
+    const rgb = hexToRgb(hex); if (!rgb) return hex;
+    const [r, g, b] = rgb.split(',').map(Number);
+    const mix = (c) => Math.round(c + (255 - c) * t);
+    return '#' + [mix(r), mix(g), mix(b)].map((c) => c.toString(16).padStart(2, '0')).join('');
+  }
+
+  let _customColor = null;
+  function applyCustomColor(hex) {
+    const rgb = hexToRgb(hex);
+    if (!rgb) return false;
+    const solid = lightenHex(hex, 0.18);
+    themedEls().forEach((el) => {
+      el.style.setProperty('--vacc', rgb);
+      el.style.setProperty('--vsolid', solid);
+      el.style.setProperty('--vsec', rgb);
+      el.style.setProperty('--vsolid2', solid);
+    });
+    _customColor = hex;
+    try { localStorage.setItem('vellum_color', hex); } catch (e) {}
+    return true;
+  }
+  function clearCustomColor() {
+    themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); });
+    _customColor = null;
+    try { localStorage.removeItem('vellum_color'); } catch (e) {}
+  }
+
+  function applySkin(name) {
+    const s = VELLUM_SKINS.includes(name) ? name : 'vellum';
+    themedEls().forEach((el) => {
+      VELLUM_SKINS.forEach((x) => el.classList.remove('vls-' + x));
+      el.classList.add('vls-' + s);
+    });
+    try { localStorage.setItem('vellum_skin', s); } catch (e) {}
+  }
+
+  let _skinIdx = 0;
+  try { const sv = localStorage.getItem('vellum_skin'); if (sv && VELLUM_SKINS.includes(sv)) _skinIdx = VELLUM_SKINS.indexOf(sv); } catch (e) {}
+  applySkin(VELLUM_SKINS[_skinIdx]);
+  try { const sc = localStorage.getItem('vellum_color'); if (sc) applyCustomColor(sc); } catch (e) {}
+
+  const skinBtn = win.querySelector('[data-skin]');
+  if (skinBtn) skinBtn.addEventListener('click', () => {
+    _skinIdx = (_skinIdx + 1) % VELLUM_SKINS.length;
+    applySkin(VELLUM_SKINS[_skinIdx]);
+    skinBtn.title = 'Skin: ' + (SKIN_LABEL[VELLUM_SKINS[_skinIdx]] || VELLUM_SKINS[_skinIdx]);
   });
+  // Custom color popover
+  const colorBtn = win.querySelector('[data-color]');
+  const colorPop = win.querySelector('[data-colorpop]');
+  const cpWheel = win.querySelector('[data-cp-wheel]');
+  const cpHex = win.querySelector('[data-cp-hex]');
+  const cpSwatches = win.querySelector('[data-cp-swatches]');
+  const PRESET_SWATCHES = ['#cda84e', '#9bc0e6', '#e89bb0', '#7fd0a0', '#c4ccd8', '#f0a05a', '#b48ed0', '#d86a6a', '#6fb0a6', '#e6c07a'];
+  if (cpSwatches) cpSwatches.innerHTML = PRESET_SWATCHES.map((c) => '<button class="vlm-cp-s" data-cp-pick="' + c + '" style="background:' + c + '" title="' + c + '"></button>').join('');
+  const syncPicker = (hex) => { if (cpWheel) cpWheel.value = hex; if (cpHex) cpHex.value = hex; };
+  if (colorBtn && colorPop) {
+    colorBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      colorPop.hidden = !colorPop.hidden;
+      if (!colorPop.hidden) syncPicker(_customColor || (cpWheel && cpWheel.value) || '#cda84e');
+    });
+    colorPop.addEventListener('click', (e) => e.stopPropagation());
+    if (cpWheel) cpWheel.addEventListener('input', () => { applyCustomColor(cpWheel.value); if (cpHex) cpHex.value = cpWheel.value; });
+    if (cpHex) cpHex.addEventListener('change', () => { const v = cpHex.value.trim().replace(/^#?/, '#'); if (applyCustomColor(v) && cpWheel) cpWheel.value = v; });
+    if (cpSwatches) cpSwatches.addEventListener('click', (e) => { const b = e.target.closest('[data-cp-pick]'); if (b) { const c = b.getAttribute('data-cp-pick'); applyCustomColor(c); syncPicker(c); } });
+    const applyB = win.querySelector('[data-cp-apply]'); if (applyB) applyB.addEventListener('click', () => { colorPop.hidden = true; });
+    const resetB = win.querySelector('[data-cp-reset]'); if (resetB) resetB.addEventListener('click', () => { clearCustomColor(); colorPop.hidden = true; });
+    document.addEventListener('click', () => { if (!colorPop.hidden) colorPop.hidden = true; });
+  }
 
   const unsubBackend = ctx.onBackendMessage((p) => {
     if (p?.type === 'vellum_tracker_update') {
@@ -1873,7 +1940,19 @@ function handleCastDone(root, p) {
 
 const ICON_SVG = '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 3.5h9l3 3V16.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z" stroke="#cda84e" stroke-width="1.4"/><path d="M12.5 3.5V6.5H15.5" stroke="#cda84e" stroke-width="1.4"/><path d="M6 9.5h8M6 12h6M6 14.5h4" stroke="#cda84e" stroke-width="1.2" stroke-linecap="round"/></svg>';
 
-const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" data-dot></span><span class="vlm-title">Vellum</span><button class="vlm-btn" data-theme title="Theme">◑</button><button class="vlm-btn" data-refresh title="Refresh">⟳</button><button class="vlm-btn" data-min title="Minimize">—</button><button class="vlm-btn" data-close title="Close">✕</button></div><div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
+const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" data-dot></span><span class="vlm-title">Vellum</span>'
+  + '<button class="vlm-btn" data-skin title="Skin">▦</button>'
+  + '<button class="vlm-btn" data-color title="Custom color">✦</button>'
+  + '<button class="vlm-btn" data-refresh title="Refresh">⟳</button>'
+  + '<button class="vlm-btn" data-min title="Minimize">—</button>'
+  + '<button class="vlm-btn" data-close title="Close">✕</button>'
+  + '<div class="vlm-colorpop" data-colorpop hidden>'
+  + '<div class="vlm-cp-h">Accent color</div>'
+  + '<div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-wheel value="#cda84e"><input type="text" class="vlm-cp-hex" data-cp-hex placeholder="#cda84e" maxlength="7"></div>'
+  + '<div class="vlm-cp-sw" data-cp-swatches></div>'
+  + '<div class="vlm-cp-btns"><button class="vlm-cp-apply" data-cp-apply>Apply</button><button class="vlm-cp-reset" data-cp-reset>Reset to palette</button></div>'
+  + '</div>'
+  + '</div><div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
 
 const VELLUM_CSS = [
   "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&display=swap');",
@@ -2185,6 +2264,58 @@ const VELLUM_CSS = [
   ".vlm-window.vlt-mono{--vacc:170,180,195;--vsolid:#c4ccd8;--vsec:150,160,175;--vsolid2:#aab4c0;color:#cdd2da;background:radial-gradient(130% 90% at 0% 0%,rgba(170,180,195,.1),transparent 55%),linear-gradient(165deg,rgba(18,19,22,.985),rgba(26,28,32,.975))}",
   ".vlc-root.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8}",
   ".vlm-window.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8;background:radial-gradient(130% 90% at 0% 0%,rgba(225,140,80,.12),transparent 55%),linear-gradient(165deg,rgba(22,14,10,.985),rgba(30,20,14,.975))}",
+﻿  ".vlm-colorpop{position:absolute;top:42px;right:10px;z-index:30;width:212px;padding:12px;background:linear-gradient(165deg,rgba(24,21,16,.99),rgba(18,16,12,.99));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.6)}",
+  ".vlm-cp-h{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.7);margin-bottom:8px}",
+  ".vlm-cp-row{display:flex;gap:7px;align-items:center;margin-bottom:9px}",
+  ".vlm-cp-wheel{flex:none;width:34px;height:34px;padding:0;border:1px solid rgba(var(--vacc,205,168,78),.3);border-radius:8px;background:none;cursor:pointer}",
+  ".vlm-cp-hex{flex:1;min-width:0;font-family:'JetBrains Mono',monospace;font-size:12px;color:#e6d9bd;background:rgba(0,0,0,.4);border:1px solid rgba(var(--vacc,205,168,78),.28);border-radius:8px;padding:8px 9px;outline:none}",
+  ".vlm-cp-hex:focus{border-color:rgba(var(--vacc,205,168,78),.6)}",
+  ".vlm-cp-sw{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:10px}",
+  ".vlm-cp-s{height:20px;border:1px solid rgba(255,255,255,.18);border-radius:5px;cursor:pointer;padding:0}",
+  ".vlm-cp-s:hover{outline:2px solid rgba(var(--vacc,205,168,78),.7);outline-offset:1px}",
+  ".vlm-cp-btns{display:flex;flex-direction:column;gap:6px}",
+  ".vlm-cp-apply,.vlm-cp-reset{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.5px;text-transform:uppercase;border-radius:7px;padding:7px;cursor:pointer}",
+  ".vlm-cp-apply{color:#1a1610;background:var(--vsolid,#cda84e);border:1px solid var(--vsolid,#cda84e)}",
+  ".vlm-cp-reset{color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.1);border:1px solid rgba(var(--vacc,205,168,78),.3)}",
+﻿  ".vlm-window.vls-parchment{border-radius:4px;border:1px solid #6b5836;background:linear-gradient(160deg,#efe2c4,#e4d2a8 55%,#d8c290);color:#42351c;box-shadow:0 18px 50px rgba(0,0,0,.5)}",
+  ".vls-parchment .vlm-titlebar{background:linear-gradient(90deg,rgba(120,90,40,.18),transparent);border-bottom:1px solid rgba(90,70,40,.35)}",
+  ".vls-parchment .vlm-title,.vls-parchment .vlm-card-h,.vls-parchment .vlm-actor-n,.vls-parchment .vlm-title-lg{color:#5a4420;text-shadow:none}",
+  ".vls-parchment .vlm-card,.vls-parchment .vlm-chip,.vls-parchment .vlm-actor,.vls-parchment .vlm-actor-dtls{background:rgba(255,250,235,.5);border:1px solid rgba(110,88,54,.3);border-radius:3px}",
+  ".vls-parchment .vlm-body{color:#42351c}",
+  ".vls-parchment .vlm-btn{color:#5a4420;background:rgba(110,88,54,.16)}",
+  ".vls-parchment .vlm-chip-v,.vls-parchment .vlm-attr-v,.vls-parchment .vlm-doing{color:#4a3c22}",
+  ".vlm-window.vls-phone{border-radius:34px;border:7px solid #1a1c22;background:linear-gradient(170deg,#15171d,#1d2027);box-shadow:0 20px 60px rgba(0,0,0,.7),inset 0 0 0 1px rgba(var(--vacc,205,168,78),.2)}",
+  ".vls-phone .vlm-titlebar{justify-content:flex-end;padding:10px 16px 8px;border-bottom:1px solid rgba(var(--vacc,205,168,78),.16);position:relative}",
+  ".vls-phone .vlm-title{position:absolute;left:0;right:0;text-align:center;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:3px;pointer-events:none}",
+  ".vls-phone .vlm-titlebar::before{content:'';position:absolute;top:6px;left:50%;transform:translateX(-50%);width:58px;height:5px;border-radius:3px;background:rgba(255,255,255,.18)}",
+  ".vls-phone .vlm-card,.vls-phone .vlm-actor,.vls-phone .vlm-actor-dtls,.vls-phone .vlm-chip{border-radius:18px}",
+  ".vls-phone .vlm-body{padding:14px 13px 20px}",
+  ".vls-phone .vlm-btn{border-radius:50%}",
+  ".vlm-window.vls-vn{border-radius:14px;border:1px solid rgba(var(--vacc,205,168,78),.5);background:linear-gradient(0deg,rgba(10,8,14,.985) 60%,rgba(28,20,40,.97));box-shadow:0 22px 70px rgba(0,0,0,.65)}",
+  ".vls-vn .vlm-body{display:flex;flex-direction:column;justify-content:flex-end}",
+  ".vls-vn .vlm-hero{order:-1}",
+  ".vls-vn .vlm-actor{background:linear-gradient(90deg,rgba(var(--vacc,205,168,78),.14),rgba(0,0,0,.3));border-left:3px solid var(--vsolid,#cda84e);border-radius:0 14px 14px 0}",
+  ".vls-vn .vlm-actor-n{font-size:17px}",
+  ".vls-vn .vlm-card{background:rgba(0,0,0,.45);border:1px solid rgba(var(--vacc,205,168,78),.22);border-radius:14px;backdrop-filter:blur(4px)}",
+  ".vls-vn .vlm-title{font-family:'Cormorant Garamond',serif;font-style:italic;letter-spacing:2px;text-transform:none;font-size:20px}",
+﻿  ".vlm-window.vls-codex{border-radius:6px;border:1px solid rgba(var(--vacc,205,168,78),.5);background:#0b0e0c;box-shadow:0 18px 50px rgba(0,0,0,.7),inset 0 0 60px rgba(var(--vacc,205,168,78),.04);font-family:'JetBrains Mono',monospace}",
+  ".vls-codex .vlm-titlebar{background:rgba(var(--vacc,205,168,78),.08);border-bottom:1px dashed rgba(var(--vacc,205,168,78),.4)}",
+  ".vls-codex .vlm-title{font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:2px}",
+  ".vls-codex .vlm-title::before{content:'> '}",
+  ".vls-codex .vlm-card,.vls-codex .vlm-actor,.vls-codex .vlm-actor-dtls,.vls-codex .vlm-chip{border-radius:2px;border:1px solid rgba(var(--vacc,205,168,78),.25);background:rgba(var(--vacc,205,168,78),.04)}",
+  ".vls-codex .vlm-card-h,.vls-codex .vlm-bts-h{font-family:'JetBrains Mono',monospace;letter-spacing:1.5px}",
+  ".vls-codex .vlm-card-h::before{content:'// '}",
+  ".vls-codex .vlm-title-lg,.vls-codex .vlm-actor-n{font-family:'JetBrains Mono',monospace;font-size:15px}",
+  ".vls-codex .vlm-av{border-radius:3px}",
+  ".vls-codex .vlm-btn{border-radius:2px}",
+  ".vlm-window.vls-grimoire{border-radius:18px 18px 14px 14px;border:2px solid #4a2f1a;background:radial-gradient(120% 80% at 50% 0%,rgba(var(--vacc,205,168,78),.16),transparent 60%),linear-gradient(165deg,#1a120c,#241810);box-shadow:0 22px 70px rgba(0,0,0,.7),inset 0 0 0 2px rgba(120,80,40,.3)}",
+  ".vls-grimoire .vlm-titlebar{background:linear-gradient(90deg,rgba(120,80,40,.3),transparent);border-bottom:2px solid rgba(120,80,40,.4)}",
+  ".vls-grimoire .vlm-title{font-family:'Cormorant Garamond',serif;font-size:19px;letter-spacing:3px;text-shadow:0 0 16px rgba(var(--vacc,205,168,78),.5)}",
+  ".vls-grimoire .vlm-card,.vls-grimoire .vlm-actor,.vls-grimoire .vlm-actor-dtls{border:1px solid rgba(150,100,50,.35);border-radius:10px;background:rgba(10,6,3,.4)}",
+  ".vls-grimoire .vlm-card-h{font-family:'Cormorant Garamond',serif;font-size:14px;text-align:center;border-bottom:1px solid rgba(150,100,50,.4)}",
+  ".vls-grimoire .vlm-card-h::before{content:'\\2766  '}",
+  ".vls-grimoire .vlm-card-h::after{content:'  \\2766'}",
+  ".vls-grimoire .vlm-av{box-shadow:0 0 14px rgba(var(--vacc,205,168,78),.5)}",
   ".vlc-lore-bar{display:flex;gap:6px;margin-bottom:10px}",
   ".vlc-know-h{font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(205,168,78,.7);margin:4px 0 6px}",
   ".vlc-know{display:flex;gap:8px;align-items:baseline;padding:6px 0;border-bottom:1px solid rgba(205,168,78,.07);font-size:10.5px;line-height:1.45}",
