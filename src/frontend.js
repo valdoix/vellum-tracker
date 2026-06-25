@@ -304,33 +304,54 @@ function _setupImpl(ctx) {
     if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
     return parseInt(h.slice(0, 2), 16) + ',' + parseInt(h.slice(2, 4), 16) + ',' + parseInt(h.slice(4, 6), 16);
   }
-  // lighten a hex toward white by t (0..1) for the bright --vsolid tone
-  function lightenHex(hex, t) {
+  // lighten/darken a hex toward white/black by t (-1..1); + lightens, - darkens
+  function shadeHex(hex, t) {
     const rgb = hexToRgb(hex); if (!rgb) return hex;
     const [r, g, b] = rgb.split(',').map(Number);
-    const mix = (c) => Math.round(c + (255 - c) * t);
-    return '#' + [mix(r), mix(g), mix(b)].map((c) => c.toString(16).padStart(2, '0')).join('');
+    const mix = (c) => t >= 0 ? Math.round(c + (255 - c) * t) : Math.round(c * (1 + t));
+    return '#' + [mix(r), mix(g), mix(b)].map((c) => Math.max(0, Math.min(255, c)).toString(16).padStart(2, '0')).join('');
   }
+  function lightenHex(hex, t) { return shadeHex(hex, t); }
 
-  let _customColor = null;
-  function applyCustomColor(hex) {
-    const rgb = hexToRgb(hex);
-    if (!rgb) return false;
-    const solid = lightenHex(hex, 0.18);
+  // Full custom theme: accent + background + text + font. Any subset may be set;
+  // unset keys fall back to the skin/base defaults. Persisted as JSON.
+  const FONT_STACKS = {
+    '': '',
+    serif: "'Cormorant Garamond', Georgia, serif",
+    mono: "'JetBrains Mono', Consolas, monospace",
+    sans: "'Inter', system-ui, sans-serif",
+    rounded: "'Quicksand', 'Comfortaa', system-ui, sans-serif",
+    slab: "'Roboto Slab', Georgia, serif",
+  };
+  let _theme = { accent: null, bg: null, text: null, font: '' };
+  function applyTheme2() {
     themedEls().forEach((el) => {
-      el.style.setProperty('--vacc', rgb);
-      el.style.setProperty('--vsolid', solid);
-      el.style.setProperty('--vsec', rgb);
-      el.style.setProperty('--vsolid2', solid);
+      // accent
+      if (_theme.accent && hexToRgb(_theme.accent)) {
+        const rgb = hexToRgb(_theme.accent), solid = shadeHex(_theme.accent, 0.18);
+        el.style.setProperty('--vacc', rgb);
+        el.style.setProperty('--vsolid', solid);
+        el.style.setProperty('--vsec', rgb);
+        el.style.setProperty('--vsolid2', solid);
+      } else { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); }
+      // text color
+      if (_theme.text && hexToRgb(_theme.text)) el.style.color = _theme.text; else el.style.removeProperty('color');
+      // font
+      const stack = FONT_STACKS[_theme.font] || '';
+      if (stack) el.style.fontFamily = stack; else el.style.removeProperty('font-family');
     });
-    _customColor = hex;
-    try { localStorage.setItem('vellum_color', hex); } catch (e) {}
-    return true;
+    // background only applies to the floating window (tabs live in the drawer)
+    if (_theme.bg && hexToRgb(_theme.bg)) {
+      const acc = _theme.accent && hexToRgb(_theme.accent) ? hexToRgb(_theme.accent) : '205,168,78';
+      win.style.background = 'radial-gradient(130% 90% at 0% 0%,rgba(' + acc + ',.12),transparent 55%),linear-gradient(165deg,' + shadeHex(_theme.bg, -0.12) + ',' + shadeHex(_theme.bg, 0.04) + ')';
+    } else { win.style.removeProperty('background'); }
+    try { localStorage.setItem('vellum_theme_custom', JSON.stringify(_theme)); } catch (e) {}
   }
-  function clearCustomColor() {
-    themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); });
-    _customColor = null;
-    try { localStorage.removeItem('vellum_color'); } catch (e) {}
+  function resetTheme2() {
+    _theme = { accent: null, bg: null, text: null, font: '' };
+    themedEls().forEach((el) => { ['--vacc', '--vsolid', '--vsec', '--vsolid2'].forEach((v) => el.style.removeProperty(v)); el.style.removeProperty('color'); el.style.removeProperty('font-family'); });
+    win.style.removeProperty('background');
+    try { localStorage.removeItem('vellum_theme_custom'); localStorage.removeItem('vellum_color'); } catch (e) {}
   }
 
   function applySkin(name) {
@@ -345,7 +366,13 @@ function _setupImpl(ctx) {
   let _skinIdx = 0;
   try { const sv = localStorage.getItem('vellum_skin'); if (sv && VELLUM_SKINS.includes(sv)) _skinIdx = VELLUM_SKINS.indexOf(sv); } catch (e) {}
   applySkin(VELLUM_SKINS[_skinIdx]);
-  try { const sc = localStorage.getItem('vellum_color'); if (sc) applyCustomColor(sc); } catch (e) {}
+  // Load saved custom theme (new multi-key, with legacy accent-only fallback).
+  try {
+    const j = localStorage.getItem('vellum_theme_custom');
+    if (j) { const o = JSON.parse(j); _theme = { accent: o.accent || null, bg: o.bg || null, text: o.text || null, font: o.font || '' }; }
+    else { const legacy = localStorage.getItem('vellum_color'); if (legacy) _theme.accent = legacy; }
+  } catch (e) {}
+  applyTheme2();
 
   const skinBtn = win.querySelector('[data-skin]');
   if (skinBtn) skinBtn.addEventListener('click', () => {
@@ -353,27 +380,43 @@ function _setupImpl(ctx) {
     applySkin(VELLUM_SKINS[_skinIdx]);
     skinBtn.title = 'Skin: ' + (SKIN_LABEL[VELLUM_SKINS[_skinIdx]] || VELLUM_SKINS[_skinIdx]);
   });
-  // Custom color popover
+  // Custom theme popover (accent / background / text / font)
   const colorBtn = win.querySelector('[data-color]');
   const colorPop = win.querySelector('[data-colorpop]');
-  const cpWheel = win.querySelector('[data-cp-wheel]');
-  const cpHex = win.querySelector('[data-cp-hex]');
-  const cpSwatches = win.querySelector('[data-cp-swatches]');
-  const PRESET_SWATCHES = ['#cda84e', '#9bc0e6', '#e89bb0', '#7fd0a0', '#c4ccd8', '#f0a05a', '#b48ed0', '#d86a6a', '#6fb0a6', '#e6c07a'];
-  if (cpSwatches) cpSwatches.innerHTML = PRESET_SWATCHES.map((c) => '<button class="vlm-cp-s" data-cp-pick="' + c + '" style="background:' + c + '" title="' + c + '"></button>').join('');
-  const syncPicker = (hex) => { if (cpWheel) cpWheel.value = hex; if (cpHex) cpHex.value = hex; };
   if (colorBtn && colorPop) {
-    colorBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      colorPop.hidden = !colorPop.hidden;
-      if (!colorPop.hidden) syncPicker(_customColor || (cpWheel && cpWheel.value) || '#cda84e');
-    });
+    const q = (sel) => colorPop.querySelector(sel);
+    const accW = q('[data-cp-accent]'), accH = q('[data-cp-accent-hex]');
+    const bgW = q('[data-cp-bg]'), bgH = q('[data-cp-bg-hex]');
+    const txW = q('[data-cp-text]'), txH = q('[data-cp-text-hex]');
+    const fontSel = q('[data-cp-font]');
+    const cpSwatches = q('[data-cp-swatches]');
+    const PRESET_SWATCHES = ['#cda84e', '#9bc0e6', '#e89bb0', '#7fd0a0', '#c4ccd8', '#f0a05a', '#b48ed0', '#d86a6a', '#6fb0a6', '#e6c07a'];
+    if (cpSwatches) cpSwatches.innerHTML = PRESET_SWATCHES.map((c) => '<button class="vlm-cp-s" data-cp-pick="' + c + '" style="background:' + c + '" title="' + c + '"></button>').join('');
+    const syncUI = () => {
+      if (accW) accW.value = _theme.accent || '#cda84e';
+      if (accH) accH.value = _theme.accent || '';
+      if (bgW) bgW.value = _theme.bg || '#171511';
+      if (bgH) bgH.value = _theme.bg || '';
+      if (txW) txW.value = _theme.text || '#d8c9a8';
+      if (txH) txH.value = _theme.text || '';
+      if (fontSel) fontSel.value = _theme.font || '';
+    };
+    const norm = (v) => { const s = String(v || '').trim(); if (!s) return null; const h = s.replace(/^#?/, '#'); return hexToRgb(h) ? h : null; };
+
+    colorBtn.addEventListener('click', (e) => { e.stopPropagation(); colorPop.hidden = !colorPop.hidden; if (!colorPop.hidden) syncUI(); });
     colorPop.addEventListener('click', (e) => e.stopPropagation());
-    if (cpWheel) cpWheel.addEventListener('input', () => { applyCustomColor(cpWheel.value); if (cpHex) cpHex.value = cpWheel.value; });
-    if (cpHex) cpHex.addEventListener('change', () => { const v = cpHex.value.trim().replace(/^#?/, '#'); if (applyCustomColor(v) && cpWheel) cpWheel.value = v; });
-    if (cpSwatches) cpSwatches.addEventListener('click', (e) => { const b = e.target.closest('[data-cp-pick]'); if (b) { const c = b.getAttribute('data-cp-pick'); applyCustomColor(c); syncPicker(c); } });
-    const applyB = win.querySelector('[data-cp-apply]'); if (applyB) applyB.addEventListener('click', () => { colorPop.hidden = true; });
-    const resetB = win.querySelector('[data-cp-reset]'); if (resetB) resetB.addEventListener('click', () => { clearCustomColor(); colorPop.hidden = true; });
+
+    if (accW) accW.addEventListener('input', () => { _theme.accent = accW.value; if (accH) accH.value = accW.value; applyTheme2(); });
+    if (accH) accH.addEventListener('change', () => { _theme.accent = norm(accH.value); applyTheme2(); syncUI(); });
+    if (bgW) bgW.addEventListener('input', () => { _theme.bg = bgW.value; if (bgH) bgH.value = bgW.value; applyTheme2(); });
+    if (bgH) bgH.addEventListener('change', () => { _theme.bg = norm(bgH.value); applyTheme2(); syncUI(); });
+    if (txW) txW.addEventListener('input', () => { _theme.text = txW.value; if (txH) txH.value = txW.value; applyTheme2(); });
+    if (txH) txH.addEventListener('change', () => { _theme.text = norm(txH.value); applyTheme2(); syncUI(); });
+    if (fontSel) fontSel.addEventListener('change', () => { _theme.font = fontSel.value; applyTheme2(); });
+    if (cpSwatches) cpSwatches.addEventListener('click', (e) => { const b = e.target.closest('[data-cp-pick]'); if (b) { _theme.accent = b.getAttribute('data-cp-pick'); applyTheme2(); syncUI(); } });
+
+    const applyB = q('[data-cp-apply]'); if (applyB) applyB.addEventListener('click', () => { colorPop.hidden = true; });
+    const resetB = q('[data-cp-reset]'); if (resetB) resetB.addEventListener('click', () => { resetTheme2(); syncUI(); });
     document.addEventListener('click', () => { if (!colorPop.hidden) colorPop.hidden = true; });
   }
 
@@ -1947,15 +1990,19 @@ const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" d
   + '<button class="vlm-btn" data-min title="Minimize">—</button>'
   + '<button class="vlm-btn" data-close title="Close">✕</button>'
   + '<div class="vlm-colorpop" data-colorpop hidden>'
-  + '<div class="vlm-cp-h">Accent color</div>'
-  + '<div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-wheel value="#cda84e"><input type="text" class="vlm-cp-hex" data-cp-hex placeholder="#cda84e" maxlength="7"></div>'
+  + '<div class="vlm-cp-h">Customize</div>'
+  + '<div class="vlm-cp-field"><label>Accent</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-accent value="#cda84e"><input type="text" class="vlm-cp-hex" data-cp-accent-hex placeholder="default" maxlength="7"></div></div>'
+  + '<div class="vlm-cp-field"><label>Background</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-bg value="#171511"><input type="text" class="vlm-cp-hex" data-cp-bg-hex placeholder="default" maxlength="7"></div></div>'
+  + '<div class="vlm-cp-field"><label>Text</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-text value="#d8c9a8"><input type="text" class="vlm-cp-hex" data-cp-text-hex placeholder="default" maxlength="7"></div></div>'
+  + '<div class="vlm-cp-field"><label>Font</label><select class="vlm-cp-font" data-cp-font><option value="">Skin default</option><option value="serif">Serif (Cormorant)</option><option value="sans">Sans (Inter)</option><option value="mono">Mono (JetBrains)</option><option value="rounded">Rounded (Quicksand)</option><option value="slab">Slab (Roboto Slab)</option></select></div>'
+  + '<div class="vlm-cp-h" style="margin-top:4px">Accent presets</div>'
   + '<div class="vlm-cp-sw" data-cp-swatches></div>'
-  + '<div class="vlm-cp-btns"><button class="vlm-cp-apply" data-cp-apply>Apply</button><button class="vlm-cp-reset" data-cp-reset>Reset to palette</button></div>'
+  + '<div class="vlm-cp-btns"><button class="vlm-cp-apply" data-cp-apply>Done</button><button class="vlm-cp-reset" data-cp-reset>Reset all</button></div>'
   + '</div>'
   + '</div><div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
 
 const VELLUM_CSS = [
-  "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&display=swap');",
+  "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;600&family=Quicksand:wght@400;600&family=Roboto+Slab:wght@400;600&display=swap');",
   ".vlm-window{position:fixed;z-index:99990;width:360px;height:560px;min-width:280px;min-height:240px;top:90px;right:28px;display:flex;flex-direction:column;background:radial-gradient(130% 90% at 0% 0%,rgba(var(--vacc,205,168,78),.12),transparent 55%),linear-gradient(165deg,rgba(19,17,13,.985),rgba(28,24,19,.975));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:16px;box-shadow:0 22px 70px rgba(0,0,0,.6),inset 0 0 70px rgba(var(--vacc,205,168,78),.05);color:#d8c9a8;overflow:hidden;backdrop-filter:blur(10px);transition:opacity .2s ease,transform .2s ease}",
   ".vlm-window.vlm-hidden{opacity:0;pointer-events:none;transform:translateY(10px) scale(.97)}",
   ".vlm-window.vlm-min{height:48px!important;min-height:48px}",
@@ -2264,12 +2311,16 @@ const VELLUM_CSS = [
   ".vlm-window.vlt-mono{--vacc:170,180,195;--vsolid:#c4ccd8;--vsec:150,160,175;--vsolid2:#aab4c0;color:#cdd2da;background:radial-gradient(130% 90% at 0% 0%,rgba(170,180,195,.1),transparent 55%),linear-gradient(165deg,rgba(18,19,22,.985),rgba(26,28,32,.975))}",
   ".vlc-root.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8}",
   ".vlm-window.vlt-ember{--vacc:225,140,80;--vsolid:#f0a05a;--vsec:210,110,90;--vsolid2:#e09070;color:#e8cdb8;background:radial-gradient(130% 90% at 0% 0%,rgba(225,140,80,.12),transparent 55%),linear-gradient(165deg,rgba(22,14,10,.985),rgba(30,20,14,.975))}",
-﻿  ".vlm-colorpop{position:absolute;top:42px;right:10px;z-index:30;width:212px;padding:12px;background:linear-gradient(165deg,rgba(24,21,16,.99),rgba(18,16,12,.99));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.6)}",
+  ".vlm-colorpop{position:absolute;top:42px;right:10px;z-index:30;width:228px;max-height:74vh;overflow-y:auto;padding:12px;background:linear-gradient(165deg,rgba(24,21,16,.99),rgba(18,16,12,.99));border:1px solid rgba(var(--vacc,205,168,78),.4);border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.6)}",
   ".vlm-cp-h{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.7);margin-bottom:8px}",
-  ".vlm-cp-row{display:flex;gap:7px;align-items:center;margin-bottom:9px}",
-  ".vlm-cp-wheel{flex:none;width:34px;height:34px;padding:0;border:1px solid rgba(var(--vacc,205,168,78),.3);border-radius:8px;background:none;cursor:pointer}",
-  ".vlm-cp-hex{flex:1;min-width:0;font-family:'JetBrains Mono',monospace;font-size:12px;color:#e6d9bd;background:rgba(0,0,0,.4);border:1px solid rgba(var(--vacc,205,168,78),.28);border-radius:8px;padding:8px 9px;outline:none}",
+  ".vlm-cp-field{margin-bottom:8px}",
+  ".vlm-cp-field>label{display:block;font-family:'JetBrains Mono',monospace;font-size:8.5px;letter-spacing:1px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.55);margin-bottom:3px}",
+  ".vlm-cp-row{display:flex;gap:7px;align-items:center}",
+  ".vlm-cp-wheel{flex:none;width:30px;height:30px;padding:0;border:1px solid rgba(var(--vacc,205,168,78),.3);border-radius:8px;background:none;cursor:pointer}",
+  ".vlm-cp-hex{flex:1;min-width:0;font-family:'JetBrains Mono',monospace;font-size:12px;color:#e6d9bd;background:rgba(0,0,0,.4);border:1px solid rgba(var(--vacc,205,168,78),.28);border-radius:8px;padding:7px 9px;outline:none}",
   ".vlm-cp-hex:focus{border-color:rgba(var(--vacc,205,168,78),.6)}",
+  ".vlm-cp-font{width:100%;font-family:'JetBrains Mono',monospace;font-size:11px;color:#e6d9bd;background:rgba(0,0,0,.4);border:1px solid rgba(var(--vacc,205,168,78),.28);border-radius:8px;padding:7px 9px;outline:none;cursor:pointer}",
+  ".vlm-cp-font option{background:#1c1812;color:#e6d9bd}",
   ".vlm-cp-sw{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:10px}",
   ".vlm-cp-s{height:20px;border:1px solid rgba(255,255,255,.18);border-radius:5px;cursor:pointer;padding:0}",
   ".vlm-cp-s:hover{outline:2px solid rgba(var(--vacc,205,168,78),.7);outline-offset:1px}",
@@ -2285,15 +2336,14 @@ const VELLUM_CSS = [
   ".vls-parchment .vlm-btn{color:#5a4420;background:rgba(110,88,54,.16)}",
   ".vls-parchment .vlm-chip-v,.vls-parchment .vlm-attr-v,.vls-parchment .vlm-doing{color:#4a3c22}",
   ".vlm-window.vls-phone{border-radius:34px;border:7px solid #1a1c22;background:linear-gradient(170deg,#15171d,#1d2027);box-shadow:0 20px 60px rgba(0,0,0,.7),inset 0 0 0 1px rgba(var(--vacc,205,168,78),.2)}",
-  ".vls-phone .vlm-titlebar{justify-content:flex-end;padding:10px 16px 8px;border-bottom:1px solid rgba(var(--vacc,205,168,78),.16);position:relative}",
-  ".vls-phone .vlm-title{position:absolute;left:0;right:0;text-align:center;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:3px;pointer-events:none}",
+  ".vls-phone .vlm-titlebar{padding:16px 14px 9px;border-bottom:1px solid rgba(var(--vacc,205,168,78),.16);position:relative}",
+  ".vls-phone .vlm-title{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:3px}",
   ".vls-phone .vlm-titlebar::before{content:'';position:absolute;top:6px;left:50%;transform:translateX(-50%);width:58px;height:5px;border-radius:3px;background:rgba(255,255,255,.18)}",
   ".vls-phone .vlm-card,.vls-phone .vlm-actor,.vls-phone .vlm-actor-dtls,.vls-phone .vlm-chip{border-radius:18px}",
   ".vls-phone .vlm-body{padding:14px 13px 20px}",
   ".vls-phone .vlm-btn{border-radius:50%}",
   ".vlm-window.vls-vn{border-radius:14px;border:1px solid rgba(var(--vacc,205,168,78),.5);background:linear-gradient(0deg,rgba(10,8,14,.985) 60%,rgba(28,20,40,.97));box-shadow:0 22px 70px rgba(0,0,0,.65)}",
-  ".vls-vn .vlm-body{display:flex;flex-direction:column;justify-content:flex-end}",
-  ".vls-vn .vlm-hero{order:-1}",
+  ".vls-vn .vlm-body{display:block}",
   ".vls-vn .vlm-actor{background:linear-gradient(90deg,rgba(var(--vacc,205,168,78),.14),rgba(0,0,0,.3));border-left:3px solid var(--vsolid,#cda84e);border-radius:0 14px 14px 0}",
   ".vls-vn .vlm-actor-n{font-size:17px}",
   ".vls-vn .vlm-card{background:rgba(0,0,0,.45);border:1px solid rgba(var(--vacc,205,168,78),.22);border-radius:14px;backdrop-filter:blur(4px)}",
