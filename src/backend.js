@@ -624,7 +624,6 @@ function foldTurn(ch, turn, day, led, bts) {
         const th = parseThreadLine(line);
         upsertTrack(ch.threads, th.name, th.detail, turn, day);
       } else if (/^rel(?:[:\s]|[^\u2192]*\u2192)/i.test(line)) {
-        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel[^\u2192]*\u2192\s*/i, '').replace(/^rel[:\s]+/i, '').trim(), kind: 'rel' }, 0);
         try {
           // Forms accepted:
           //   relNameA→NameB: aff +x, trust +y (reason)   (names may contain spaces)
@@ -635,6 +634,11 @@ function foldTurn(ch, turn, day, led, bts) {
           let aName = null, bName = null, tail = null;
           if (one) { aName = _btsActor; bName = one[1].trim(); tail = one[2]; }
           else if (two) { aName = two[1].trim(); bName = two[2].trim(); tail = two[3]; }
+          // Shift-log text: show the FULL "A → B: …" pair (don't drop the A side).
+          const shiftText = (aName && bName)
+            ? (aName + ' \u2192 ' + bName + ':' + (tail || ''))
+            : line.replace(/^rel[^\u2192]*\u2192\s*/i, '').replace(/^rel[:\s]+/i, '').trim();
+          pushLog(ch.shifts, { turn, day, text: shiftText.trim(), kind: 'rel' }, 0);
           if (aName && bName) {
             const ax = parseRelAxes(tail);
             if (ax) {
