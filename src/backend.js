@@ -278,11 +278,11 @@ function extractDay(timeStr) {
 // derived (not model-guessed). Replaces the old single [bond] meter.
 // `userName` is the resolved {{user}} persona name (authoritative).
 function computeRapport(ch, userName) {
-  if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) { spindle.log.info('[vellum_tracker] rapport: no relations (' + (ch && ch.relations ? ch.relations.length : 'n/a') + ')'); return []; }
+  if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) return [];
   const presentIds = new Set(ch.presentIds || []);
-  if (!presentIds.size) { spindle.log.info('[vellum_tracker] rapport: no presentIds'); return []; }
+  if (!presentIds.size) return [];
   const userKey = userName ? castKey(userName) : null;
-  if (!userKey) { spindle.log.info('[vellum_tracker] rapport: no userName resolved'); return []; }
+  if (!userKey) return []; // can't identify the player → don't guess
   // The player's cast id = the card matching the {{user}} persona name. Try the
   // strongest signal first (exact key / alias), then a distinctive-token match
   // (so short "Daeron" matches "Daeron Targaryen") — but a SHARED SURNAME alone
@@ -317,7 +317,6 @@ function computeRapport(ch, userName) {
     if (seen.has(other)) continue; seen.add(other);
     out.push({ name: oc.name, affection: r.affection || 0, trust: r.trust || 0, sentiment: r.sentiment || 'neutral' });
   }
-  spindle.log.info('[vellum_tracker] rapport: user="' + userName + '" userId=' + (userId || 'NONE') + ' present=' + presentIds.size + ' -> ' + out.length + ' rows');
   return out.slice(0, 6);
 }
 
@@ -325,6 +324,7 @@ function computeRapport(ch, userName) {
 async function resolveUserName(chatId) {
   const cached = _nameCtxCache.get(chatId);
   if (cached && cached.ctx && cached.ctx.user) return cached.ctx.user;
+  // 1) macro engine (authoritative when it resolves)
   try {
     if (spindle.macros && spindle.macros.resolve) {
       const r = await spindle.macros.resolve('{{user}}', { chatId, commit: false });
@@ -333,6 +333,27 @@ async function resolveUserName(chatId) {
       if (n && !/\{\{|\}\}/.test(n)) return n;
     }
   } catch (e) { /* fall through */ }
+  // 2) fallback: the persona name on stored USER messages (what the cast scanner
+  //    uses). Take the most frequent non-empty user-turn `name`.
+  try {
+    const msgs = await readStoredMessages(chatId);
+    if (msgs && msgs.length) {
+      const counts = new Map();
+      for (const m of msgs) {
+        if ((m.isUser || m.role === 'user') && m.name && m.name.trim() && !/\{\{|\}\}/.test(m.name)) {
+          const nm = m.name.trim(); counts.set(nm, (counts.get(nm) || 0) + 1);
+        }
+      }
+      let best = null, bn = 0; for (const [k, v] of counts) if (v > bn) { best = k; bn = v; }
+      if (best) return best;
+    }
+  } catch (e) { /* fall through */ }
+  // 3) last resort: the full name-context resolver (macro + message names, cached)
+  try {
+    const msgs = await readStoredMessages(chatId);
+    const nc = await resolveNameContext(chatId, msgs || []);
+    if (nc && nc.user) return nc.user;
+  } catch (e) { /* give up */ }
   return null;
 }
 
@@ -602,14 +623,18 @@ function foldTurn(ch, turn, day, led, bts) {
       if (/^\+?\s*thread\s*[:→]/i.test(line) || /^thread→/i.test(line)) {
         const th = parseThreadLine(line);
         upsertTrack(ch.threads, th.name, th.detail, turn, day);
-      } else if (/^rel[A-Za-z]*→/i.test(line)) {
-        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel[A-Za-z]*→\s*/i, '').trim(), kind: 'rel' }, 0);
+      } else if (/^rel(?:[:\s]|[^\u2192]*\u2192)/i.test(line)) {
+        pushLog(ch.shifts, { turn, day, text: line.replace(/^rel[^\u2192]*\u2192\s*/i, '').replace(/^rel[:\s]+/i, '').trim(), kind: 'rel' }, 0);
         try {
-          const two = line.match(/^rel([A-Za-z][\w' .-]*?)→\s*([^:]+):(.*)$/i);
-          const one = line.match(/^rel→\s*([^:]+):(.*)$/i);
+          // Forms accepted:
+          //   relNameA→NameB: aff +x, trust +y (reason)   (names may contain spaces)
+          //   rel NameA → NameB: ...                       (space after rel)
+          //   rel→NameB: ...                               (A = current :: actor :: section)
+          const two = line.match(/^rel[:\s]*([A-Za-z][^\u2192]*?)\s*\u2192\s*([^:]+):(.*)$/i);
+          const one = line.match(/^rel\s*\u2192\s*([^:]+):(.*)$/i);
           let aName = null, bName = null, tail = null;
-          if (two) { aName = two[1].trim(); bName = two[2].trim(); tail = two[3]; }
-          else if (one) { aName = _btsActor; bName = one[1].trim(); tail = one[2]; }
+          if (one) { aName = _btsActor; bName = one[1].trim(); tail = one[2]; }
+          else if (two) { aName = two[1].trim(); bName = two[2].trim(); tail = two[3]; }
           if (aName && bName) {
             const ax = parseRelAxes(tail);
             if (ax) {
@@ -3726,6 +3751,10 @@ async function handle(chatId, content, userId) {
       await saveChronicle(chatId, ch);
       _prewarmCache.delete(chatId); // chronicle changed → next interceptor re-scores
       broadcastChronicle(chatId, ch);
+      // Re-broadcast the live window with rapport recomputed from the JUST-FOLDED
+      // relations (the early broadcast ran before foldTurn applied this turn's
+      // narrative score deltas, so the window would otherwise lag a turn).
+      broadcast(chatId, ledger, btsRaw, ch, userName);
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).
       if (userId) setTimeout(() => { maybeSummarize(chatId, userId); }, 1500);
