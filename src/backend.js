@@ -273,12 +273,49 @@ function extractDay(timeStr) {
   return null;
 }
 
-function broadcast(chatId, parsed, btsRaw) {
+// Build the present-character RAPPORT strip from the relations system: for each
+// character currently on stage, their affection/trust toward the player ({{user}}),
+// derived (not model-guessed). Replaces the old single [bond] meter.
+function computeRapport(ch) {
+  if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) return [];
+  const nc = _nameCtxCache.get(ch._cid) && _nameCtxCache.get(ch._cid).ctx;
+  const userName = nc && nc.user;
+  const userKey = userName ? castKey(userName) : null;
+  const presentIds = new Set(ch.presentIds || []);
+  if (!presentIds.size) return [];
+  // identify the player's cast id: a card explicitly sourced as the user, else
+  // the card whose name/alias matches the resolved {{user}} persona.
+  let userId = null;
+  for (const k of Object.keys(ch.cast || {})) { if (ch.cast[k].source === 'user') { userId = ch.cast[k].id; break; } }
+  if (!userId && userKey) {
+    for (const k of Object.keys(ch.cast || {})) {
+      const c = ch.cast[k];
+      if (castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey)) { userId = c.id; break; }
+    }
+  }
+  const out = [];
+  for (const r of ch.relations) {
+    // a relation between a present character and the player
+    let other = null, dir = null;
+    if (userId && r.a === userId && presentIds.has(r.b)) { other = r.b; dir = 'b'; }
+    else if (userId && r.b === userId && presentIds.has(r.a)) { other = r.a; dir = 'a'; }
+    else continue;
+    const oc = ch.cast[other];
+    if (!oc) continue;
+    out.push({ name: oc.name, affection: r.affection || 0, trust: r.trust || 0, sentiment: r.sentiment || 'neutral' });
+  }
+  return out.slice(0, 6);
+}
+
+function broadcast(chatId, parsed, btsRaw, chArg) {
+  let rapport = [];
+  try { const ch = chArg || chronicleByChat.get(chatId); if (ch) { ch._cid = chatId; rapport = computeRapport(ch); } } catch (e) {}
   spindle.sendToFrontend({
     type: 'vellum_tracker_update',
     chatId,
     ledger: parsed,
     bts: btsRaw,
+    rapport,
     updatedAt: Date.now(),
   });
 }
@@ -3600,11 +3637,12 @@ async function handle(chatId, content, userId) {
   const ledger = parsed || { raw: '', time: '', location: '', weather: '', present: '', thoughts: '', arcs: '', offscreen: '', sceneTension: '', bondTension: '' };
   lastStateByChat.set(chatId, { ledger, bts: btsRaw, updatedAt: Date.now() });
   await syncChatVars(chatId, ledger, btsRaw);
-  broadcast(chatId, ledger, btsRaw);
+  const chForRapport = await loadChronicle(chatId); // present-character rapport for the window
+  broadcast(chatId, ledger, btsRaw, chForRapport);
 
   // Fold this turn into the long-term chronicle (only when the state is new).
   try {
-    const ch = await loadChronicle(chatId);
+    const ch = chForRapport;
     const sig = sigOf(ledger, btsRaw);
     if (sig !== ch._sig) {
       ch._sig = sig;
@@ -3710,7 +3748,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
         } catch (e) { /* fall through to empty */ }
       }
       if (state) {
-        spindle.sendToFrontend({ type: 'vellum_tracker_update', chatId, ledger: state.ledger, bts: state.bts, updatedAt: state.updatedAt }, userId);
+        let rapport = [];
+        try { const ch = await loadChronicle(chatId); ch._cid = chatId; rapport = computeRapport(ch); } catch (e) {}
+        spindle.sendToFrontend({ type: 'vellum_tracker_update', chatId, ledger: state.ledger, bts: state.bts, rapport, updatedAt: state.updatedAt }, userId);
       } else {
         spindle.sendToFrontend({ type: 'vellum_tracker_empty' }, userId);
       }

@@ -50,6 +50,9 @@ function _setupImpl(ctx) {
   function requestRefresh() {
     ctx.sendToBackend({ type: 'get_state', chatId: currentChatId });
     ctx.sendToBackend({ type: 'get_pulse', chatId: currentChatId });
+    // Window refresh also re-pulls the chronicle/cast/tree + toggles so the ⟳
+    // button fully refreshes everything, not just the live window state.
+    requestChronicle();
   }
 
   // ---- entry points: drawer tab + input-bar button both toggle the window ----
@@ -1144,6 +1147,25 @@ function btsHtml(raw) {
   return html;
 }
 
+// Rapport strip: per present character, their feeling toward {{user}} drawn from
+// the relations system (affection/trust), replacing the old single Bond meter.
+function rapportHtml(rapport) {
+  if (!Array.isArray(rapport) || !rapport.length) return '';
+  const sCls = { warm: 'se-warm', hostile: 'se-host', strained: 'se-strain', complex: 'se-cx', neutral: 'se-neu' };
+  const sGlyph = { warm: '\u2665', hostile: '\u2694', strained: '\u26A1', complex: '\u269C', neutral: '\u25CB' };
+  const bar = (v) => {
+    const n = Math.max(-100, Math.min(100, Number(v) || 0));
+    const pct = Math.abs(n) / 2; const pos = n >= 0;
+    return '<span class="vlm-rap-track"><span class="vlm-rap-mid"></span><span class="vlm-rap-fill ' + (pos ? 'pos' : 'neg') + '" style="' + (pos ? 'left:50%;width:' + pct + '%' : 'right:50%;width:' + pct + '%') + '"></span></span>';
+  };
+  const rows = rapport.map((r) => '<div class="vlm-rap-row">'
+    + '<span class="vlm-rap-name">' + escapeHtml(r.name) + '</span>'
+    + '<span class="vlm-rap-sent ' + (sCls[r.sentiment] || 'se-neu') + '">' + (sGlyph[r.sentiment] || '\u25CB') + ' ' + escapeHtml(r.sentiment) + '</span>'
+    + '<span class="vlm-rap-bars"><span class="vlm-rap-lbl">aff</span>' + bar(r.affection) + '<span class="vlm-rap-lbl">trust</span>' + bar(r.trust) + '</span>'
+    + '</div>').join('');
+  return '<div class="vlm-rapport"><div class="vlm-rap-h">Rapport with you</div>' + rows + '</div>';
+}
+
 function render(body, dot, data) {
   const g = data && data.ledger;
   const bts = data && data.bts;
@@ -1161,9 +1183,10 @@ function render(body, dot, data) {
       + '<div class="vlm-rule"></div></div>';
     scene += '<div class="vlm-chips">'
       + chipHtml('⏱', g.time) + chipHtml('🌤', g.weather) + chipHtml('👥', g.present) + '</div>';
-    if (g.sceneTension || g.bondTension) {
-      scene += '<div class="vlm-meters">' + meterHtml('Scene', g.sceneTension, '') + meterHtml('Bond', g.bondTension, 'bond') + '</div>';
+    if (g.sceneTension) {
+      scene += '<div class="vlm-meters">' + meterHtml('Scene tension', g.sceneTension, '') + '</div>';
     }
+    scene += rapportHtml(data && data.rapport);
     html += '<div class="vlm-panel" data-panel="scene">' + scene + '</div>';
     // ----- MINDS panel: inner landscape -----
     const minds = mindSecHtml('💭', 'Inner Landscape', g.thoughts);
@@ -2377,6 +2400,19 @@ const VELLUM_CSS = [
   ".vlm-chip-l{font-size:13px;opacity:.9}",
   ".vlm-chip-v{font-size:11px;line-height:1.4;color:#e6d9bd;word-break:break-word}",
   ".vlm-meters{display:flex;gap:14px;margin-bottom:16px}",
+﻿  ".vlm-rapport{margin-bottom:16px}",
+  ".vlm-rap-h{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.6);margin-bottom:7px}",
+  ".vlm-rap-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid rgba(var(--vacc,205,168,78),.07)}",
+  ".vlm-rap-row:last-child{border-bottom:none}",
+  ".vlm-rap-name{flex:none;min-width:74px;font-family:'Cormorant Garamond',Georgia,serif;font-size:15px;color:#ecdcb6}",
+  ".vlm-rap-sent{flex:none;font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:2px 6px;border-radius:5px;border:1px solid transparent}",
+  ".vlm-rap-bars{flex:1;display:flex;align-items:center;gap:5px;min-width:0}",
+  ".vlm-rap-lbl{font-family:'JetBrains Mono',monospace;font-size:7.5px;letter-spacing:.5px;text-transform:uppercase;color:rgba(220,200,150,.5)}",
+  ".vlm-rap-track{position:relative;flex:1;min-width:0;height:7px;border-radius:4px;background:rgba(120,110,90,.22);overflow:hidden}",
+  ".vlm-rap-mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.25)}",
+  ".vlm-rap-fill{position:absolute;top:0;bottom:0}",
+  ".vlm-rap-fill.pos{background:linear-gradient(90deg,rgba(143,166,126,.45),#8fa67e)}",
+  ".vlm-rap-fill.neg{background:linear-gradient(270deg,rgba(201,106,106,.45),#c96a6a)}",
   ".vlm-m{flex:1}",
   ".vlm-m-top{display:flex;justify-content:space-between;align-items:baseline;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.7);margin-bottom:5px}",
   ".vlm-m-top i{font-style:normal;opacity:.5;font-size:8px}",
