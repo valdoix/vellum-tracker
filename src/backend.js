@@ -287,9 +287,8 @@ function computeRapport(ch, userName) {
   // strongest signal first (exact key / alias), then a distinctive-token match
   // (so short "Daeron" matches "Daeron Targaryen") — but a SHARED SURNAME alone
   // (Targaryen, Lannister) must NOT match, or the player gets confused with kin.
-  const SURNAMES = new Set(['targaryen', 'lannister', 'stark', 'martell', 'baratheon', 'tyrell', 'greyjoy', 'tully', 'arryn', 'stone', 'snow', 'sand', 'hill', 'rivers', 'storm', 'flowers']);
   const utoks = (String(userName).toLowerCase().match(/[a-z0-9]{3,}/g) || []);
-  const distinctive = utoks.filter((t) => !SURNAMES.has(t));
+  const distinctive = utoks.filter((t) => !NAME_SURNAMES.has(t));
   const exactMatch = (c) => castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey);
   const tokenMatch = (c) => { const ct = (String(c.name).toLowerCase().match(/[a-z0-9]{3,}/g) || []); return distinctive.some((t) => ct.includes(t)); };
   const nameMatchesUser = (c) => exactMatch(c) || tokenMatch(c);
@@ -1000,6 +999,10 @@ const MEMORY_RECALL = {
 const PHASE_BUDGET_MULT = { action: 1.15, dialogue: 1.0, intro: 0.85, transition: 0.7, unknown: 1.0 };
 
 const RECALL_STOP = new Set(['the','and','for','with','that','this','her','his','him','she','they','them','their','was','were','are','you','your','from','into','but','not','had','has','have','will','would','could','should','what','when','where','who','why','how','all','any','out','off','over','then','there','about','said','says','like','just','its','also','been','being','because','around','before','after','still','than','too','very','more','most','some','such','only','even','onto','upon','while','here','now','one','two']);
+// Shared family surnames — a lone surname token must NOT flag a character as
+// "named in the scene" (you playing "Daeron Targaryen" shouldn't light up every
+// Targaryen). Used by nameSignal / sceneMentionBoost / graph anchor matching.
+const NAME_SURNAMES = new Set(['targaryen', 'lannister', 'stark', 'martell', 'baratheon', 'tyrell', 'greyjoy', 'tully', 'arryn', 'stone', 'snow', 'sand', 'hill', 'rivers', 'storm', 'flowers', 'waters', 'pyke', 'frey', 'bolton', 'mormont', 'tarly', 'clegane', 'hunt']);
 
 function recallTokens(text) {
   const m = String(text || '').toLowerCase().match(/[a-z0-9][a-z0-9''-]{2,}/g) || [];
@@ -1642,8 +1645,9 @@ function sceneMentionBoost(title, layers) {
   if (!top || top.weight < 3) return 0;
   const name = normForPhrase(title).trim();
   if (name.length >= 4 && top.text.includes(' ' + name + ' ')) return 100; // exact name in newest msg
-  // distinctive single token of the title present in the newest message
-  const toks = recallTokens(title).filter((w) => w.length >= 4 && !RECALL_STOP.has(w));
+  // distinctive single token of the title present in the newest message (skip
+  // shared surnames so a Targaryen title doesn't fire on "Targaryen" alone)
+  const toks = recallTokens(title).filter((w) => w.length >= 4 && !RECALL_STOP.has(w) && !NAME_SURNAMES.has(w));
   for (const t of toks) if (top.tokens.includes(t)) return 40;
   return 0;
 }
@@ -1800,7 +1804,7 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
     const p = normForPhrase(text || '');
     const full = normForPhrase(c.name).trim();
     if (full.length >= 3 && p.includes(' ' + full + ' ')) return true;
-    const toks = recallTokens(c.name).filter((t) => t.length >= 3 && !new Set(['the','a','ser','lord','lady','king','queen','prince','princess']).has(t));
+    const toks = recallTokens(c.name).filter((t) => t.length >= 3 && !new Set(['the','a','ser','lord','lady','king','queen','prince','princess']).has(t) && !NAME_SURNAMES.has(t));
     const pset = new Set(recallTokens(text || ''));
     for (const t of toks) if (pset.has(t)) return true;
     for (const a of (c.aka || [])) { const at = normForPhrase(a).trim(); if (at.length >= 3 && p.includes(' ' + at + ' ')) return true; }
@@ -1849,12 +1853,19 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
 function nameSignal(c, qtokens, qphrase) {
   let s = 0;
   const full = normForPhrase(c.name).trim();
-  if (full.length >= 3 && qphrase.includes(' ' + full + ' ')) s += 6;       // exact name in scene
-  // distinctive name tokens (skip generic titles)
+  if (full.length >= 3 && qphrase.includes(' ' + full + ' ')) s += 6;       // exact full name in scene
+  // distinctive name tokens (skip generic titles AND shared surnames — a lone
+  // "Targaryen"/"Lannister" must NOT flag every kin as "named in the scene").
   const GENERIC = new Set(['the', 'a', 'an', 'ser', 'lord', 'lady', 'king', 'queen', 'prince', 'princess', 'maester', 'septa', 'septon', 'man', 'woman', 'girl', 'boy', 'guard', 'soldier', 'stranger']);
-  const ntoks = recallTokens(c.name).filter((t) => t.length >= 3 && !GENERIC.has(t));
+  const ntoks = recallTokens(c.name).filter((t) => t.length >= 3 && !GENERIC.has(t) && !NAME_SURNAMES.has(t));
   const qset = new Set(qtokens);
-  for (const t of ntoks) if (qset.has(t)) s += 3;                            // a real name token in scene
+  for (const t of ntoks) if (qset.has(t)) s += 3;                            // a distinctive given-name token in scene
+  // If the character only shares a SURNAME with the scene (no given-name/full
+  // match), give a tiny nudge — not enough to read as "named".
+  if (s === 0) {
+    const sur = recallTokens(c.name).filter((t) => NAME_SURNAMES.has(t));
+    for (const t of sur) if (qset.has(t)) { s += 0.5; break; }
+  }
   for (const a of (c.aka || [])) {
     const at = normForPhrase(a).trim();
     if (at.length >= 3 && qphrase.includes(' ' + at + ' ')) { s += 4; break; }
