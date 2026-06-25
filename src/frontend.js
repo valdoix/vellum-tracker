@@ -49,6 +49,7 @@ function _setupImpl(ctx) {
   // stale content on the frontend.
   function requestRefresh() {
     ctx.sendToBackend({ type: 'get_state', chatId: currentChatId });
+    ctx.sendToBackend({ type: 'get_pulse', chatId: currentChatId });
   }
 
   // ---- entry points: drawer tab + input-bar button both toggle the window ----
@@ -177,7 +178,8 @@ function _setupImpl(ctx) {
         { key: 'b', label: 'Character B', type: 'text', value: A(rb, 'data-b') },
         { key: 'category', label: 'Category', type: 'select', value: A(rb, 'data-category') || 'neutral', options: REL_CAT_OPTS },
         { key: 'status', label: 'Status', type: 'select', value: A(rb, 'data-status') || 'active', options: REL_STATUS_OPTS },
-        { key: 'sentiment', label: 'Sentiment', type: 'select', value: A(rb, 'data-sentiment') || 'neutral', options: REL_SENT_OPTS },
+        { key: 'affection', label: 'Affection (-100..100)', type: 'text', value: A(rb, 'data-affection') || '0' },
+        { key: 'trust', label: 'Trust (-100..100)', type: 'text', value: A(rb, 'data-trust') || '0' },
       ], (v) => ctx.sendToBackend({ type: 'relation_edit', chatId: currentChatId, id: A(rb, 'data-id'), entry: v }));
       return; }
     rb = e.target.closest('[data-relation-del]');
@@ -413,13 +415,15 @@ function _setupImpl(ctx) {
     applySkin(VELLUM_SKINS[_skinIdx]);
     skinBtn.title = 'Skin: ' + (SKIN_LABEL[VELLUM_SKINS[_skinIdx]] || VELLUM_SKINS[_skinIdx]);
   });
-  // ---- Window tabs (Scene / Minds / Story / Backstage) ----
-  const WIN_TABS = ['scene', 'minds', 'story', 'backstage'];
+  // ---- Window tabs (Scene / Minds / Story / Backstage / Pulse) ----
+  let _livingOn = false;
+  const WIN_TABS = ['scene', 'minds', 'story', 'backstage', 'pulse'];
   function applyWinTab(name) {
     const t = WIN_TABS.includes(name) ? name : 'scene';
     win.setAttribute('data-wintab', t);
     win.querySelectorAll('[data-wintab-btn]').forEach((b) => b.classList.toggle('on', b.getAttribute('data-wintab-btn') === t));
     try { localStorage.setItem('vellum_wintab', t); } catch (e) {}
+    if (t === 'pulse' && win._onPulseTab) win._onPulseTab();
   }
   let _winTab = 'scene';
   try { const sv = localStorage.getItem('vellum_wintab'); if (sv && WIN_TABS.includes(sv)) _winTab = sv; } catch (e) {}
@@ -470,13 +474,62 @@ function _setupImpl(ctx) {
     const applyB = q('[data-cp-apply]'); if (applyB) applyB.addEventListener('click', () => { colorPop.hidden = true; });
     const resetB = q('[data-cp-reset]'); if (resetB) resetB.addEventListener('click', () => { resetTheme2(); syncUI(); });
     document.addEventListener('click', () => { if (!colorPop.hidden) colorPop.hidden = true; });
+    // Living tracker toggle (inside the customizer popover).
+    const livingBtn = q('[data-cp-living]');
+    if (livingBtn) livingBtn.addEventListener('click', (e) => { e.stopPropagation(); ctx.sendToBackend({ type: 'set_living', chatId: currentChatId, enabled: !_livingOn }); livingBtn.textContent = '…'; });
+    win._livingBtn = livingBtn;
   }
+
+  // ---- Pulse: notifications + activity feed ----
+  let _pulse = [];           // full event list for the Pulse tab
+  let _unseen = 0;
+  const toastWrap = win.querySelector('[data-toasts]');
+  const pulseBadge = win.querySelector('[data-pulse-badge]');
+  function pulseIcon(ev) { return ev.icon || { knowledge: '◇', secret: '⚿', relation: '↔', memory: '📖' }[ev.kind] || '✦'; }
+  function setUnseen(n) {
+    _unseen = Math.max(0, n | 0);
+    if (!pulseBadge) return;
+    if (_unseen > 0 && win.getAttribute('data-wintab') !== 'pulse') { pulseBadge.textContent = _unseen > 99 ? '99+' : String(_unseen); pulseBadge.hidden = false; }
+    else pulseBadge.hidden = true;
+  }
+  function showToast(ev) {
+    if (!toastWrap) return;
+    const el = document.createElement('div');
+    el.className = 'vlm-toast vlm-toast-' + (ev.kind || 'info') + (ev.big ? ' big' : '');
+    el.innerHTML = '<span class="vlm-toast-i">' + escapeHtml(pulseIcon(ev)) + '</span><span class="vlm-toast-t">' + escapeHtml(ev.text || '') + '</span>';
+    toastWrap.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('in'));
+    const life = ev.big ? 7000 : 5000;
+    const kill = () => { el.classList.remove('in'); setTimeout(() => el.remove(), 250); };
+    el.addEventListener('click', kill);
+    setTimeout(kill, life);
+    // cap stacked toasts
+    while (toastWrap.children.length > 4) toastWrap.removeChild(toastWrap.firstChild);
+  }
+  function renderPulsePanel() {
+    const host = body.querySelector('[data-panel="pulse"]');
+    if (!host) return;
+    if (!_pulse.length) { host.innerHTML = emptyPanel('No activity yet. Enable the Living tracker (✦ → Living tracker) to auto-record relationship shifts, new knowledge, secrets, and memories as they happen.'); return; }
+    const kindCls = { knowledge: 'pk-know', secret: 'pk-sec', relation: 'pk-rel', memory: 'pk-mem' };
+    const rows = _pulse.slice().reverse().slice(0, 80).map((ev) =>
+      '<div class="vlm-pulse-row ' + (kindCls[ev.kind] || '') + '">'
+      + '<span class="vlm-pulse-i">' + escapeHtml(pulseIcon(ev)) + '</span>'
+      + '<div class="vlm-pulse-b"><div class="vlm-pulse-t">' + escapeHtml(ev.text || '') + '</div>'
+      + '<div class="vlm-pulse-m">turn ' + (ev.turn || 0) + (ev.day ? ' · day ' + ev.day : '') + ' · ' + (ev.kind || '') + '</div></div></div>'
+    ).join('');
+    host.innerHTML = '<div class="vlm-pulse-bar"><span>' + _pulse.length + ' events</span><button class="vlm-pulse-clear" data-pulse-clear>Clear</button></div>' + rows;
+    const clr = host.querySelector('[data-pulse-clear]');
+    if (clr) clr.addEventListener('click', () => ctx.sendToBackend({ type: 'pulse_clear', chatId: currentChatId }));
+  }
+  win._renderPulsePanel = renderPulsePanel;
+  win._onPulseTab = () => { if (_unseen) { ctx.sendToBackend({ type: 'pulse_seen', chatId: currentChatId }); setUnseen(0); } };
 
   const unsubBackend = ctx.onBackendMessage((p) => {
     if (p?.type === 'vellum_tracker_update') {
       lastData = p;
       if (p.chatId) currentChatId = p.chatId;
       render(body, dot, p);
+      renderPulsePanel();
       // Ledger + backstage are hidden from chat, so surface the window
       // automatically the first time real state arrives.
       const hasState = (p.ledger && p.ledger.raw) || p.bts;
@@ -486,7 +539,27 @@ function _setupImpl(ctx) {
       if (visible && tab.setBadge) tab.setBadge('●');
     } else if (p?.type === 'vellum_tracker_empty') {
       // No cached state yet for this chat; keep whatever is shown.
-      if (!lastData) render(body, dot, null);
+      if (!lastData) { render(body, dot, null); renderPulsePanel(); }
+    } else if (p?.type === 'vellum_pulse') {
+      // live notifications from the living tracker
+      if (Array.isArray(p.events)) {
+        for (const ev of p.events) { _pulse.push(ev); showToast(ev); }
+        if (_pulse.length > 200) _pulse = _pulse.slice(-200);
+      }
+      setUnseen(typeof p.unseen === 'number' ? p.unseen : _unseen + (p.events ? p.events.length : 0));
+      renderPulsePanel();
+    } else if (p?.type === 'vellum_pulse_list') {
+      _pulse = Array.isArray(p.events) ? p.events : [];
+      _livingOn = !!p.living;
+      if (win._livingBtn) win._livingBtn.textContent = _livingOn ? 'ON' : 'OFF';
+      if (win._livingBtn) win._livingBtn.classList.toggle('on', _livingOn);
+      setUnseen(p.unseen || 0);
+      renderPulsePanel();
+    } else if (p?.type === 'vellum_pulse_unseen') {
+      setUnseen(p.unseen || 0);
+    } else if (p?.type === 'vellum_living') {
+      _livingOn = !!p.enabled;
+      if (win._livingBtn) { win._livingBtn.textContent = _livingOn ? 'ON' : 'OFF'; win._livingBtn.classList.toggle('on', _livingOn); }
     } else if (p?.type === 'vellum_chronicle') {
       chronicleData = p.chronicle;
       renderChronicle(chronicleBody, p.chronicle);
@@ -1080,6 +1153,8 @@ function render(body, dot, data) {
   }
   // ----- BACKSTAGE panel -----
   html += '<div class="vlm-panel" data-panel="backstage">' + (bts ? btsHtml(bts) : emptyPanel('No backstage activity yet.')) + '</div>';
+  // ----- PULSE panel (filled by renderPulsePanel) -----
+  html += '<div class="vlm-panel" data-panel="pulse"></div>';
   html += '<div class="vlm-foot">The ledger and backstage are hidden from the chat and live only here. Arc memory (@vellum_*) syncs every turn.</div>';
   body.innerHTML = html;
   if (dot) dot.style.background = '#cda84e';
@@ -1834,6 +1909,23 @@ function relationsHtml(ch) {
     + (c === 'all' ? 'All' : escapeHtml(c)) + ' <span class="vlc-fchip-n">' + (c === 'all' ? rels.length : cnt[c]) + '</span></button>'
   ).join('');
   const shown = _relFilter === 'all' ? rels : rels.filter((r) => (r.category || 'neutral') === _relFilter);
+  // a -100..100 score bar centered at 0 (left = negative/red, right = positive/green)
+  const scoreBar = (label, v) => {
+    const n = Math.max(-100, Math.min(100, Number(v) || 0));
+    const pct = Math.abs(n) / 2; // half-width max
+    const pos = n >= 0;
+    return '<div class="vlc-rel-score"><span class="vlc-rel-score-l">' + label + '</span>'
+      + '<span class="vlc-rel-track"><span class="vlc-rel-mid"></span>'
+      + '<span class="vlc-rel-fill ' + (pos ? 'pos' : 'neg') + '" style="' + (pos ? 'left:50%;width:' + pct + '%' : 'right:50%;width:' + pct + '%') + '"></span></span>'
+      + '<span class="vlc-rel-score-v">' + (n > 0 ? '+' : '') + n + '</span></div>';
+  };
+  // tiny sparkline of the affection history (last ~12 points)
+  const spark = (r) => {
+    const h = (r.history || []).slice(-12);
+    if (h.length < 2) return '';
+    const pts = h.map((x, i) => { const xx = (i / (h.length - 1)) * 100; const yy = 50 - ((Number(x.affection) || 0) / 100) * 45; return xx.toFixed(1) + ',' + yy.toFixed(1); }).join(' ');
+    return '<svg class="vlc-rel-spark" viewBox="0 0 100 50" preserveAspectRatio="none"><polyline points="' + pts + '"/></svg>';
+  };
   const rows = shown.length ? shown.slice().sort((a, b) => (b.lastTurn || 0) - (a.lastTurn || 0)).map((r) => {
     const aN = nameOf(r.a), bN = nameOf(r.b);
     const text = r.label ? (escapeHtml(aN) + ' \u2014 ' + escapeHtml(r.label)) : (escapeHtml(aN) + ' \u2194 ' + escapeHtml(bN));
@@ -1841,10 +1933,13 @@ function relationsHtml(ch) {
     const tags = '<span class="vlc-rel-sent ' + (sentCls[r.sentiment] || 'se-neu') + '" title="' + escapeHtml(r.sentiment || 'neutral') + '">' + escapeHtml(sentLbl[r.sentiment] || (r.sentiment || 'neutral')) + '</span>'
       + '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>'
       + (r.status && r.status !== 'active' ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '');
+    const aff = (typeof r.affection === 'number') ? r.affection : 0;
+    const tr = (typeof r.trust === 'number') ? r.trust : 0;
     return '<div class="vlc-rel-row">'
-      + '<span class="vlc-rel-t">' + text + ' ' + sub + '</span>' + tags
-      + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" title="Edit">\u270E</button>'
-      + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button>'
+      + '<div class="vlc-rel-head"><span class="vlc-rel-t">' + text + ' ' + sub + '</span>' + tags
+      + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" data-affection="' + aff + '" data-trust="' + tr + '" title="Edit">\u270E</button>'
+      + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button></div>'
+      + '<div class="vlc-rel-scores">' + scoreBar('aff', aff) + scoreBar('trust', tr) + spark(r) + '</div>'
       + '</div>';
   }).join('') : '<div class="vlc-empty" style="padding:8px">No \u201c' + escapeHtml(_relFilter) + '\u201d relations.</div>';
   return '<div class="vlc-fbar" data-rel-fbar>' + chips + '</div>' + rows;
@@ -2057,6 +2152,8 @@ const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" d
   + '<div class="vlm-cp-field"><label>Text</label><div class="vlm-cp-row"><input type="color" class="vlm-cp-wheel" data-cp-text value="#d8c9a8"><input type="text" class="vlm-cp-hex" data-cp-text-hex placeholder="default" maxlength="7"></div></div>'
   + '<div class="vlm-cp-field"><label>Font</label><select class="vlm-cp-font" data-cp-font><option value="">Skin default</option><option value="serif">Serif (Cormorant)</option><option value="sans">Sans (Inter)</option><option value="mono">Mono (JetBrains)</option><option value="rounded">Rounded (Quicksand)</option><option value="slab">Slab (Roboto Slab)</option></select></div>'
   + '<div class="vlm-cp-field"><label>Font size <span data-cp-size-val>100%</span></label><input type="range" class="vlm-cp-range" data-cp-size min="80" max="150" step="5" value="100"></div>'
+  + '<div class="vlm-cp-h" style="margin-top:6px">Living tracker</div>'
+  + '<div class="vlm-cp-living"><span class="vlm-cp-living-d">Auto-update relations, knowledge, secrets &amp; memories each turn, with notifications. Uses a background generation per turn.</span><button class="vlm-cp-living-btn" data-cp-living>OFF</button></div>'
   + '<div class="vlm-cp-h" style="margin-top:4px">Accent presets</div>'
   + '<div class="vlm-cp-sw" data-cp-swatches></div>'
   + '<div class="vlm-cp-btns"><button class="vlm-cp-apply" data-cp-apply>Done</button><button class="vlm-cp-reset" data-cp-reset>Reset all</button></div>'
@@ -2067,8 +2164,11 @@ const WINDOW_HTML = '<div class="vlm-titlebar" data-drag><span class="vlm-dot" d
   + '<button class="vlm-tab" data-wintab-btn="minds"><span class="vlm-tab-ico">💭</span><span class="vlm-tab-rn">II</span><span class="vlm-tab-lbl">Minds</span></button>'
   + '<button class="vlm-tab" data-wintab-btn="story"><span class="vlm-tab-ico">📜</span><span class="vlm-tab-rn">III</span><span class="vlm-tab-lbl">Story</span></button>'
   + '<button class="vlm-tab" data-wintab-btn="backstage"><span class="vlm-tab-ico">🎭</span><span class="vlm-tab-rn">IV</span><span class="vlm-tab-lbl">Backstage</span></button>'
+  + '<button class="vlm-tab" data-wintab-btn="pulse"><span class="vlm-tab-ico">✦</span><span class="vlm-tab-rn">V</span><span class="vlm-tab-lbl">Pulse</span><span class="vlm-tab-badge" data-pulse-badge hidden></span></button>'
   + '</div>'
-  + '<div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div><div class="vlm-resize" data-resize></div>';
+  + '<div class="vlm-body" data-body><div class="vlm-empty">Awaiting the first ledger…</div></div>'
+  + '<div class="vlm-toasts" data-toasts></div>'
+  + '<div class="vlm-resize" data-resize></div>';
 
 const VELLUM_CSS = [
   "@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;600&family=Quicksand:wght@400;600&family=Roboto+Slab:wght@400;600&display=swap');",
@@ -2086,6 +2186,46 @@ const VELLUM_CSS = [
   ".vlm-window[data-wintab=minds] .vlm-panel[data-panel=minds]{display:block}",
   ".vlm-window[data-wintab=story] .vlm-panel[data-panel=story]{display:block}",
   ".vlm-window[data-wintab=backstage] .vlm-panel[data-panel=backstage]{display:block}",
+  ".vlm-window[data-wintab=pulse] .vlm-panel[data-panel=pulse]{display:block}",
+﻿  ".vlm-toasts{position:absolute;left:10px;right:10px;bottom:10px;display:flex;flex-direction:column;gap:6px;pointer-events:none;z-index:40}",
+  ".vlm-toast{pointer-events:auto;cursor:pointer;display:flex;gap:8px;align-items:flex-start;padding:9px 11px;border-radius:10px;background:linear-gradient(160deg,rgba(28,24,18,.97),rgba(20,17,12,.97));border:1px solid rgba(var(--vacc,205,168,78),.45);box-shadow:0 8px 26px rgba(0,0,0,.5);opacity:0;transform:translateY(10px);transition:opacity .25s,transform .25s;font-size:11px;line-height:1.4}",
+  ".vlm-toast.in{opacity:1;transform:translateY(0)}",
+  ".vlm-toast.big{border-color:rgba(var(--vacc,205,168,78),.8)}",
+  ".vlm-toast-i{flex:none;color:var(--vsolid,#cda84e);font-size:13px}",
+  ".vlm-toast-t{flex:1;color:#e6d9bd}",
+  ".vlm-toast-relation{border-left:3px solid #c97a9a}",
+  ".vlm-toast-secret{border-left:3px solid #c96a6a}",
+  ".vlm-toast-knowledge{border-left:3px solid #7ea6b0}",
+  ".vlm-toast-memory{border-left:3px solid #8fa67e}",
+  ".vlm-tab{position:relative}",
+  ".vlm-tab-badge{position:absolute;top:2px;right:6px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;background:#c96a6a;color:#fff;font-size:8px;font-weight:700;line-height:14px;text-align:center;font-family:'JetBrains Mono',monospace}",
+  ".vlm-pulse-bar{display:flex;justify-content:space-between;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:rgba(var(--vacc,205,168,78),.6);margin-bottom:8px}",
+  ".vlm-pulse-clear{font:inherit;color:#c98a8a;background:rgba(201,138,138,.12);border:1px solid rgba(201,138,138,.3);border-radius:6px;padding:3px 8px;cursor:pointer}",
+  ".vlm-pulse-row{display:flex;gap:9px;align-items:flex-start;padding:8px 2px;border-bottom:1px solid rgba(var(--vacc,205,168,78),.08)}",
+  ".vlm-pulse-i{flex:none;width:20px;text-align:center;color:var(--vsolid,#cda84e);font-size:13px}",
+  ".vlm-pulse-b{flex:1;min-width:0}",
+  ".vlm-pulse-t{color:#e6d9bd;font-size:11px;line-height:1.45}",
+  ".vlm-pulse-m{color:rgba(var(--vacc,205,168,78),.5);font-size:8.5px;letter-spacing:.5px;text-transform:uppercase;margin-top:2px;font-family:'JetBrains Mono',monospace}",
+  ".vlm-pulse-row.pk-rel .vlm-pulse-i{color:#d8a0b4}",
+  ".vlm-pulse-row.pk-sec .vlm-pulse-i{color:#e09090}",
+  ".vlm-pulse-row.pk-know .vlm-pulse-i{color:#9ec4d0}",
+  ".vlm-pulse-row.pk-mem .vlm-pulse-i{color:#a0c088}",
+  ".vlm-cp-living{display:flex;gap:8px;align-items:flex-start}",
+  ".vlm-cp-living-d{flex:1;font-family:'JetBrains Mono',monospace;font-size:8.5px;line-height:1.4;color:rgba(var(--vacc,205,168,78),.5)}",
+  ".vlm-cp-living-btn{flex:none;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.12);border:1px solid rgba(var(--vacc,205,168,78),.35);border-radius:7px;padding:6px 12px;cursor:pointer}",
+  ".vlm-cp-living-btn.on{color:#1a1610;background:var(--vsolid,#cda84e)}",
+  ".vlc-rel-head{display:flex;gap:7px;align-items:center}",
+  ".vlc-rel-scores{display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap}",
+  ".vlc-rel-score{display:flex;gap:5px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:8.5px}",
+  ".vlc-rel-score-l{color:rgba(205,168,78,.6);text-transform:uppercase;letter-spacing:.5px;width:30px}",
+  ".vlc-rel-track{position:relative;width:84px;height:7px;border-radius:4px;background:rgba(120,110,90,.25);overflow:hidden}",
+  ".vlc-rel-mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.25)}",
+  ".vlc-rel-fill{position:absolute;top:0;bottom:0}",
+  ".vlc-rel-fill.pos{background:linear-gradient(90deg,rgba(143,166,126,.5),#8fa67e)}",
+  ".vlc-rel-fill.neg{background:linear-gradient(270deg,rgba(201,106,106,.5),#c96a6a)}",
+  ".vlc-rel-score-v{color:#cdbf9a;width:26px;text-align:right}",
+  ".vlc-rel-spark{width:60px;height:18px}",
+  ".vlc-rel-spark polyline{fill:none;stroke:var(--vsolid,#cda84e);stroke-width:2;opacity:.7}",
 ﻿  ".vls-parchment .vlm-tabs{border-bottom:1px solid rgba(90,70,40,.4)}",
   ".vls-parchment .vlm-tab{color:rgba(90,68,32,.6);font-family:'Cormorant Garamond',Georgia,serif;font-style:italic}",
   ".vls-parchment .vlm-tab.on{color:#5a4420;border-bottom-color:#5a4420}",

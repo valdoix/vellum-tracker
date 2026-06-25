@@ -399,7 +399,7 @@ function canonName(raw, nc) {
 const chronicleByChat = new Map();
 
 function freshChronicle() {
-  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, hideSummarized: false, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
+  return { version: 3, updatedAt: 0, turns: 0, lastDay: 1, arcs: {}, threads: {}, events: [], shifts: [], memories: [], cast: {}, present: [], memJournal: {}, knowledge: [], secrets: [], relations: [], covered: 0, hideSummarized: false, living: false, pulse: [], pulseSeen: 0, tombstones: { mem: [], know: [], sec: [], rel: [] }, injLog: [], fb: {}, tune: { minScore: RECALL.minScore, samples: 0 }, _sig: '' };
 }
 
 function normKey(s) {
@@ -753,10 +753,14 @@ async function loadChronicle(chatId) {
   if (!Array.isArray(ch.presentIds)) ch.presentIds = [];
   if (typeof ch.deepRecall !== 'boolean') ch.deepRecall = false;
   if (typeof ch.hideSummarized !== 'boolean') ch.hideSummarized = false;
+  if (typeof ch.living !== 'boolean') ch.living = false; // auto-update the trackers each turn
+  if (!Array.isArray(ch.pulse)) ch.pulse = [];           // activity log / notifications
+  if (typeof ch.pulseSeen !== 'number') ch.pulseSeen = 0; // count marked-seen
   if (!ch.memJournal || typeof ch.memJournal !== 'object') ch.memJournal = {};
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
   if (!Array.isArray(ch.relations)) ch.relations = []; // cast relationship edges
+  ch.relations.forEach((r) => ensureRelScores(r)); // migrate text-only edges to numeric axes
   // Tombstones: signatures of entries the user deleted, so a re-import or a
   // future scan never resurrects them. Capped to stay bounded.
   if (!ch.tombstones || typeof ch.tombstones !== 'object') ch.tombstones = { mem: [], know: [], sec: [], rel: [] };
@@ -1971,7 +1975,7 @@ function scanWindows(turns, size) {
 }
 
 // Fold a parsed memory list into the chronicle. Returns count added.
-function applyMemList(ch, list, nc) {
+function applyMemList(ch, list, nc, opts) {
   if (!ch.memJournal) ch.memJournal = {};
   const turnNow = ch.turns || 0;
   let added = 0;
@@ -1992,6 +1996,7 @@ function applyMemList(ch, list, nc) {
     arr.push({ id: 'mj' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36), about: e.about, memory: e.memory, kind: e.kind, weight: e.weight, sentiment: e.sentiment, day: e.day, turn: turnNow });
     // No cap — per-character memory journal is unlimited (file-backed storage).
     added++;
+    if (opts && opts.pulse) pushPulse(ch, { kind: 'memory', icon: '\uD83D\uDCD6', who: (m ? m.name : e.who), text: (m ? m.name : e.who) + ' \u2014 ' + e.memory, weight: e.weight });
   }
   return added;
 }
@@ -2080,8 +2085,114 @@ async function knowExtract(turns, nc, userId) {
   return parseKnowJson(raw);
 }
 
+﻿const LIVING_SYS = "You are the living-state tracker for an ongoing roleplay. Read the RECENT excerpt and report ONLY what CHANGED or is newly revealed in it \u2014 not the whole history. Output STRICT JSON only: {\"relations\":[{\"a\":\"Name\",\"b\":\"Name\",\"dAffection\":<int -40..40>,\"dTrust\":<int -40..40>,\"reason\":\"why, one clause\"}],\"knowledge\":[{\"who\":\"Name\",\"fact\":\"one clause\",\"reliability\":\"knows|believes|suspects|wrong|unaware\",\"truth\":\"true|false|unknown\",\"source\":\"brief\"}],\"secrets\":[{\"secret\":\"one clause\",\"keeper\":\"Name\",\"from\":\"Name(s)\",\"method\":\"lie|omission|misdirection|disguise\",\"exposure\":\"brief\",\"danger\":\"minor|major|explosive\"}],\"memories\":[{\"who\":\"Name\",\"about\":\"Name\",\"memory\":\"one vivid sentence in their POV\",\"kind\":\"interaction|promise|betrayal|gift|shared|wound|observation\",\"weight\":\"trivial|minor|significant|defining\",\"sentiment\":\"positive|negative|neutral|complex\"}]}. Rules: use ONLY the real names provided \u2014 never placeholders; only NAMED significant characters. relations: dAffection/dTrust are the CHANGE this excerpt caused to how A feels about B, positive for warming/earning trust, negative for hurt/betrayal, 0 if unchanged \u2014 omit pairs with no change. Only report knowledge/secrets/memories that are NEW in this excerpt. Keep every list short. If nothing changed, return empty arrays. No prose outside the JSON.";
+function parseLivingJson(text) {
+  let t = String(text || "").replace(/<think[\s\S]*?<\/think>/gi, "").replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) { const m = t.match(/\{[\s\S]*\}/); if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { obj = null; } } }
+  if (!obj) return null;
+  return {
+    relations: Array.isArray(obj.relations) ? obj.relations : [],
+    knowledge: Array.isArray(obj.knowledge) ? obj.knowledge : [],
+    secrets: Array.isArray(obj.secrets) ? obj.secrets : [],
+    memories: Array.isArray(obj.memories) ? obj.memories : [],
+  };
+}
+﻿
+// Apply scored relation deltas from the living pass. Resolves names, creates the
+// edge if missing, applies the delta, pulses on a sentiment change or big swing.
+function applyLivingRelations(ch, list, nc) {
+  if (!Array.isArray(list)) return 0;
+  let n = 0;
+  const turn = ch.turns || 0;
+  for (const d of list) {
+    const a = canonName(d.a || d.from || d.subject, nc);
+    const b = canonName(d.b || d.to || d.other, nc);
+    const ma = resolveOrAddCast(ch, a), mb = resolveOrAddCast(ch, b);
+    if (!ma || !mb || ma.id === mb.id) continue;
+    const dAff = Math.max(-40, Math.min(40, Number(d.dAffection) || 0));
+    const dTr = Math.max(-40, Math.min(40, Number(d.dTrust) || 0));
+    if (!dAff && !dTr) continue;
+    // find any existing edge between the pair (ignore category), else create one
+    let r = ch.relations.find((x) => (x.a === ma.id && x.b === mb.id) || (x.a === mb.id && x.b === ma.id));
+    if (!r) {
+      r = relationAdd(ch, { a, b, category: 'neutral', sentiment: 'neutral' }, { source: 'auto' });
+      if (!r) continue;
+    }
+    if (r.userEdited && r.lockScores) continue; // respect a user who pinned scores
+    // orient the delta to the stored edge direction (a feels about b)
+    const flip = (r.a === mb.id && r.b === ma.id);
+    const res = applyRelDelta(r, flip ? dAff : dAff, flip ? dTr : dTr, d.reason, turn);
+    if (res.changed) {
+      n++;
+      const arrow = (res.after.affection + res.after.trust) >= (res.before.affection + res.before.trust) ? '\u25B2' : '\u25BC';
+      const nameA = ch.cast[r.a] ? ch.cast[r.a].name : a;
+      const nameB = ch.cast[r.b] ? ch.cast[r.b].name : b;
+      const moved = res.before.sentiment !== res.after.sentiment;
+      pushPulse(ch, {
+        kind: 'relation', icon: arrow,
+        who: nameA,
+        text: nameA + ' \u2192 ' + nameB + ': ' + (moved ? (res.before.sentiment + ' \u2192 ' + res.after.sentiment + ' ') : '')
+          + '(aff ' + (dAff >= 0 ? '+' : '') + dAff + ', trust ' + (dTr >= 0 ? '+' : '') + dTr + ')'
+          + (d.reason ? ' \u2014 ' + d.reason : ''),
+        relId: r.id, sentiment: res.after.sentiment, big: moved || Math.abs(dAff) + Math.abs(dTr) >= 40,
+      });
+    }
+  }
+  return n;
+}
+
+// The Living pass: one combined LLM call over the RECENT window that returns
+// deltas for relations + new knowledge/secrets/memories. Throttled and gated by
+// the per-chat `living` toggle. Runs in the background after a turn.
+const livingBusy = new Set();
+async function runLivingUpdate(chatId, userId) {
+  if (!chatId || livingBusy.has(chatId)) return;
+  if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) return;
+  livingBusy.add(chatId);
+  try {
+    const ch = await loadChronicle(chatId);
+    if (!ch.living) return;
+    let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { return; }
+    if (!msgs || !msgs.length) return;
+    const nc = await resolveNameContext(chatId, msgs);
+    const turns = assistantTurns(msgs);
+    // recent window only — the living pass is about CHANGE, not full history
+    const recent = turns.slice(-8);
+    const excerpt = sampleHistory(recent, { maxTurns: 8, headN: 1, tailN: 7, charBudget: 9000, nameCtx: nc });
+    if (!excerpt.trim()) return;
+    // give the model the current relationship scores so deltas are grounded
+    let relCtx = '';
+    if (ch.relations && ch.relations.length) {
+      relCtx = '\n\nCurrent relationship scores (affection/trust, -100..100):\n' + ch.relations.slice(0, 24).map((r) => {
+        const na = ch.cast[r.a] ? ch.cast[r.a].name : r.a, nb = ch.cast[r.b] ? ch.cast[r.b].name : r.b;
+        return '- ' + na + ' \u2192 ' + nb + ': aff ' + (r.affection || 0) + ', trust ' + (r.trust || 0) + ' (' + r.sentiment + ')';
+      }).join('\n');
+    }
+    const sys = LIVING_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
+    let raw = '';
+    try { raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Recent excerpt:\n\n' + excerpt + relCtx }], { temperature: 0.2, max_tokens: 1600 }, userId); }
+    catch (e) { spindle.log.warn('[vellum_tracker] living gen: ' + (e && e.message)); return; }
+    const res = parseLivingJson(raw);
+    if (!res) return;
+    const before = (ch.pulse || []).length;
+    const rN = applyLivingRelations(ch, res.relations, nc);
+    const kr = applyKnowResult(ch, { knowledge: res.knowledge || [], secrets: res.secrets || [] }, nc, { pulse: true });
+    const mN = applyMemList(ch, res.memories || [], nc, { pulse: true });
+    const newPulses = (ch.pulse || []).slice(before);
+    if (rN || kr.addedK || kr.addedS || mN || newPulses.length) {
+      await saveChronicle(chatId, ch);
+      broadcastChronicle(chatId, ch, userId);
+      if (newPulses.length) spindle.sendToFrontend({ type: 'vellum_pulse', chatId, events: newPulses, unseen: unseenPulse(ch) }, userId);
+      spindle.log.info('[vellum_tracker] living: +' + rN + ' rel, +' + kr.addedK + 'k/' + kr.addedS + 's, +' + mN + ' mem');
+    }
+  } catch (err) {
+    spindle.log.warn('[vellum_tracker] runLivingUpdate: ' + (err && err.message));
+  } finally { livingBusy.delete(chatId); }
+}
+
 // Fold a parsed knowledge/secrets result into the chronicle. Returns counts.
-function applyKnowResult(ch, res, nc) {
+function applyKnowResult(ch, res, nc, opts) {
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
   const turnNow = ch.turns || 0;
@@ -2097,6 +2208,7 @@ function applyKnowResult(ch, res, nc) {
     if (ex) { if (ex.userEdited) continue; ex.reliability = k.reliability; ex.truth = k.truth; if (k.source) ex.source = k.source; ex.lastTurn = turnNow; continue; }
     ch.knowledge.push(Object.assign({ turn: turnNow, lastTurn: turnNow }, k));
     addedK++;
+    if (opts && opts.pulse) pushPulse(ch, { kind: 'knowledge', icon: '\u25C7', who: k.who, text: k.who + ' ' + (k.reliability === 'wrong' ? 'wrongly believes' : k.reliability) + ': ' + k.fact });
   }
   for (const s of res.secrets) {
     s.keeper = canonName(s.keeper, nc);
@@ -2111,6 +2223,7 @@ function applyKnowResult(ch, res, nc) {
     if (ex) { if (ex.userEdited) continue; ex.danger = s.danger; if (s.exposure) ex.exposure = s.exposure; ex.lastTurn = turnNow; continue; }
     ch.secrets.push(Object.assign({ turn: turnNow, lastTurn: turnNow, revealed: false }, s));
     addedS++;
+    if (opts && opts.pulse) pushPulse(ch, { kind: 'secret', icon: '\u26BF', who: s.keeper, text: s.keeper + ' hides from ' + (s.from || 'others') + ': ' + s.secret + ' [' + s.danger + ']' });
   }
   // No cap — knowledge & secrets are unlimited (file-backed storage).
   return { addedK, addedS };
@@ -2310,6 +2423,97 @@ const REL_CATEGORIES = new Set(['familial', 'romantic', 'alliance', 'rivalry', '
 const REL_STATUS = new Set(['active', 'past', 'broken', 'secret']);
 const REL_SENTIMENT = new Set(['warm', 'strained', 'hostile', 'complex', 'neutral']);
 
+/* --- Relation scoring: two axes, each -100..+100 ---------------------------
+ * affection = warmth/liking (love .. hatred)
+ * trust     = reliance/faith (trusts .. betrayed/wary)
+ * The textual `sentiment` is DERIVED from the pair, so it self-updates as the
+ * scores move. Two axes (not one) capture nuance a single bar can't:
+ *   high aff + low trust  = infatuated but wary  -> complex
+ *   low aff  + high trust = respected adversary  -> complex
+ * Relations also decay slowly toward neutral each turn when not reinforced. */
+const REL_CLAMP = (n) => Math.max(-100, Math.min(100, Math.round(Number(n) || 0)));
+function deriveSentiment(affection, trust) {
+  const a = REL_CLAMP(affection), t = REL_CLAMP(trust);
+  const mag = Math.max(Math.abs(a), Math.abs(t));
+  if (mag < 12) return 'neutral';
+  // strong disagreement between the two axes reads as complex
+  if (Math.abs(a - t) >= 70) return 'complex';
+  const avg = (a + t) / 2;
+  if (avg >= 45) return 'warm';
+  if (avg <= -45) return 'hostile';
+  if (avg < 0) return 'strained';
+  if (a >= 25 && t >= 25) return 'warm';
+  return 'complex';
+}
+// Map a legacy textual sentiment to seed scores (for migration).
+function sentimentToScores(s) {
+  switch (s) {
+    case 'warm': return { affection: 55, trust: 50 };
+    case 'hostile': return { affection: -60, trust: -55 };
+    case 'strained': return { affection: -25, trust: -20 };
+    case 'complex': return { affection: 30, trust: -30 };
+    default: return { affection: 0, trust: 0 };
+  }
+}
+// Ensure a relation has numeric axes + history (migrates old text-only edges).
+function ensureRelScores(r) {
+  if (typeof r.affection !== 'number' || typeof r.trust !== 'number') {
+    const seed = sentimentToScores(r.sentiment);
+    if (typeof r.affection !== 'number') r.affection = seed.affection;
+    if (typeof r.trust !== 'number') r.trust = seed.trust;
+  }
+  r.affection = REL_CLAMP(r.affection); r.trust = REL_CLAMP(r.trust);
+  if (!Array.isArray(r.history)) r.history = [];
+  r.sentiment = deriveSentiment(r.affection, r.trust);
+  return r;
+}
+// Apply a scored delta to a relation; records history + re-derives sentiment.
+// Returns { before, after, changed } for notifications.
+function applyRelDelta(r, dAff, dTrust, reason, turn) {
+  ensureRelScores(r);
+  const before = { affection: r.affection, trust: r.trust, sentiment: r.sentiment };
+  r.affection = REL_CLAMP(r.affection + (Number(dAff) || 0));
+  r.trust = REL_CLAMP(r.trust + (Number(dTrust) || 0));
+  r.sentiment = deriveSentiment(r.affection, r.trust);
+  r.lastTurn = turn;
+  if (Number(dAff) || Number(dTrust)) {
+    r.history.push({ turn, affection: r.affection, trust: r.trust, reason: String(reason || '').slice(0, 120) });
+    if (r.history.length > 60) r.history.shift();
+  }
+  const changed = before.affection !== r.affection || before.trust !== r.trust;
+  return { before, after: { affection: r.affection, trust: r.trust, sentiment: r.sentiment }, changed };
+}
+// Gentle per-turn decay toward neutral for relations not touched this turn.
+function decayRelations(ch, turn) {
+  for (const r of (ch.relations || [])) {
+    if (r.userEdited && r.lockScores) continue;
+    if (r.lastTurn === turn) continue;
+    ensureRelScores(r);
+    const pull = (v) => { if (v > 0) return Math.max(0, v - Math.max(1, Math.round(v * 0.02))); if (v < 0) return Math.min(0, v + Math.max(1, Math.round(Math.abs(v) * 0.02))); return 0; };
+    r.affection = pull(r.affection); r.trust = pull(r.trust);
+    r.sentiment = deriveSentiment(r.affection, r.trust);
+  }
+}
+
+/* --- Pulse: the activity log + notification feed ---------------------------
+ * Every meaningful auto-change (knowledge learned, secret formed/revealed,
+ * relationship shift, memory recorded) appends a pulse event. It persists on
+ * the chronicle (survives reload), drives the in-window toast + Pulse tab, and
+ * is emitted live to the frontend. Bounded ring buffer. */
+const PULSE_CAP = 200;
+function pushPulse(ch, ev) {
+  if (!Array.isArray(ch.pulse)) ch.pulse = [];
+  const e = Object.assign({ id: vid('p'), turn: ch.turns || 0, day: ch.lastDay || 1, at: Date.now() }, ev);
+  ch.pulse.push(e);
+  if (ch.pulse.length > PULSE_CAP) {
+    const over = ch.pulse.length - PULSE_CAP;
+    ch.pulse.splice(0, over);
+    ch.pulseSeen = Math.max(0, (ch.pulseSeen || 0) - over);
+  }
+  return e;
+}
+function unseenPulse(ch) { return Math.max(0, (ch.pulse ? ch.pulse.length : 0) - (ch.pulseSeen || 0)); }
+
 // Resolve a name to a cast id, creating a lightweight 'mentioned' card if the
 // person isn't tracked yet (so a relation can name someone off-page). Returns
 // null for blank/incidental names.
@@ -2358,6 +2562,12 @@ function relationAdd(ch, input, opts) {
     source: o.source === 'user' ? 'user' : 'auto',
     firstTurn: turn, lastTurn: turn,
   };
+  // seed numeric axes from the given sentiment (or explicit scores), + history
+  if (typeof input.affection === 'number' || typeof input.trust === 'number') {
+    rel.affection = REL_CLAMP(input.affection); rel.trust = REL_CLAMP(input.trust);
+  } else { const s = sentimentToScores(rel.sentiment); rel.affection = s.affection; rel.trust = s.trust; }
+  rel.history = [];
+  ensureRelScores(rel);
   if (o.source === 'user') rel.userEdited = true;
   ch.relations.push(rel);
   return rel;
@@ -2366,12 +2576,18 @@ function relationAdd(ch, input, opts) {
 function relationEdit(ch, id, input) {
   const r = Array.isArray(ch.relations) && ch.relations.find((x) => x.id === id);
   if (!r) return null;
+  ensureRelScores(r);
   if (input.a) { const m = resolveOrAddCast(ch, input.a); if (m) r.a = m.id; }
   if (input.b) { const m = resolveOrAddCast(ch, input.b); if (m) r.b = m.id; }
   if (typeof input.label === 'string') r.label = input.label.slice(0, 120);
   if (REL_CATEGORIES.has(input.category)) r.category = input.category;
   if (REL_STATUS.has(input.status)) r.status = input.status;
-  if (REL_SENTIMENT.has(input.sentiment)) r.sentiment = input.sentiment;
+  // explicit numeric scores from the editor (sliders); else allow sentiment to seed
+  let scored = false;
+  if (input.affection !== undefined && input.affection !== '') { r.affection = REL_CLAMP(input.affection); scored = true; }
+  if (input.trust !== undefined && input.trust !== '') { r.trust = REL_CLAMP(input.trust); scored = true; }
+  if (scored) { r.sentiment = deriveSentiment(r.affection, r.trust); r.lockScores = true; }
+  else if (REL_SENTIMENT.has(input.sentiment)) { r.sentiment = input.sentiment; const s = sentimentToScores(input.sentiment); r.affection = s.affection; r.trust = s.trust; }
   r.userEdited = true;
   return r;
 }
@@ -2929,12 +3145,16 @@ async function handle(chatId, content, userId) {
       } catch (eFb) { /* feedback is best-effort */ }
       const day = extractDay(ledger.time) || ch.lastDay || 1;
       foldTurn(ch, ch.turns, day, ledger, btsRaw);
+      decayRelations(ch, ch.turns); // relationships fade slightly when not reinforced
       await saveChronicle(chatId, ch);
       _prewarmCache.delete(chatId); // chronicle changed → next interceptor re-scores
       broadcastChronicle(chatId, ch);
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).
       if (userId) setTimeout(() => { maybeSummarize(chatId, userId); }, 1500);
+      // Living tracker: auto-update relations/knowledge/secrets/memories from the
+      // recent turn and emit pulse notifications (opt-in, background, throttled).
+      if (userId && ch.living) setTimeout(() => { runLivingUpdate(chatId, userId); }, 2200);
       if (userId && deepEnabled(ch)) setTimeout(async () => {
         try { const msgs = await readStoredMessages(chatId); if (msgs && msgs.length) await runDeepRecall(chatId, msgs, userId); } catch (e) {}
       }, 1800);
@@ -3059,6 +3279,35 @@ spindle.onFrontendMessage(async (payload, userId) => {
         await saveChronicle(chatId, ch);
       }
       spindle.sendToFrontend({ type: 'vellum_hide_summarized', enabled: !!ch.hideSummarized, covered: ch.covered || 0, memories: (ch.memories || []).length }, userId);
+      return;
+    }
+    if (payload?.type === 'set_living' || payload?.type === 'get_living') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (!chatId) { spindle.sendToFrontend({ type: 'vellum_living', enabled: false }, userId); return; }
+      const ch = await loadChronicle(chatId);
+      if (payload.type === 'set_living') { ch.living = !!payload.enabled; await saveChronicle(chatId, ch); }
+      spindle.sendToFrontend({ type: 'vellum_living', enabled: !!ch.living }, userId);
+      return;
+    }
+    if (payload?.type === 'run_living') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (chatId) { const ch = await loadChronicle(chatId); if (!ch.living) { ch.living = true; await saveChronicle(chatId, ch); } await runLivingUpdate(chatId, userId); }
+      return;
+    }
+    if (payload?.type === 'get_pulse') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      const ch = chatId ? await loadChronicle(chatId) : null;
+      spindle.sendToFrontend({ type: 'vellum_pulse_list', events: ch ? (ch.pulse || []) : [], unseen: ch ? unseenPulse(ch) : 0, living: !!(ch && ch.living) }, userId);
+      return;
+    }
+    if (payload?.type === 'pulse_seen') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (chatId) { const ch = await loadChronicle(chatId); ch.pulseSeen = (ch.pulse || []).length; await saveChronicle(chatId, ch); spindle.sendToFrontend({ type: 'vellum_pulse_unseen', unseen: 0 }, userId); }
+      return;
+    }
+    if (payload?.type === 'pulse_clear') {
+      const chatId = await resolveChatId(payload.chatId, userId);
+      if (chatId) { const ch = await loadChronicle(chatId); ch.pulse = []; ch.pulseSeen = 0; await saveChronicle(chatId, ch); broadcastChronicle(chatId, ch, userId); spindle.sendToFrontend({ type: 'vellum_pulse_list', events: [], unseen: 0, living: !!ch.living }, userId); }
       return;
     }
     if (payload?.type === 'summarize_all') {
