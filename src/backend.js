@@ -283,31 +283,37 @@ function computeRapport(ch, userName) {
   if (!presentIds.size) return [];
   const userKey = userName ? castKey(userName) : null;
   if (!userKey) return []; // can't identify the player → don't guess
-  // The player's cast id = the card matching the {{user}} persona name/alias.
-  // NOTE: do NOT use source==='user' — that flags user-ADDED cards too, not the
-  // player. Identify strictly by persona name.
+  // The player's cast id = the card matching the {{user}} persona name. Try the
+  // strongest signal first (exact key / alias), then a distinctive-token match
+  // (so short "Daeron" matches "Daeron Targaryen") — but a SHARED SURNAME alone
+  // (Targaryen, Lannister) must NOT match, or the player gets confused with kin.
+  const SURNAMES = new Set(['targaryen', 'lannister', 'stark', 'martell', 'baratheon', 'tyrell', 'greyjoy', 'tully', 'arryn', 'stone', 'snow', 'sand', 'hill', 'rivers', 'storm', 'flowers']);
+  const utoks = (String(userName).toLowerCase().match(/[a-z0-9]{3,}/g) || []);
+  const distinctive = utoks.filter((t) => !SURNAMES.has(t));
+  const exactMatch = (c) => castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey);
+  const tokenMatch = (c) => { const ct = (String(c.name).toLowerCase().match(/[a-z0-9]{3,}/g) || []); return distinctive.some((t) => ct.includes(t)); };
+  const nameMatchesUser = (c) => exactMatch(c) || tokenMatch(c);
   let userId = null;
-  for (const k of Object.keys(ch.cast || {})) {
-    const c = ch.cast[k];
-    if (castKey(c.name) === userKey || (c.aka || []).some((a) => castKey(a) === userKey)) { userId = c.id; break; }
-  }
+  // prefer an exact match across all cast first
+  for (const k of Object.keys(ch.cast || {})) { if (exactMatch(ch.cast[k])) { userId = ch.cast[k].id; break; } }
+  if (!userId) { for (const k of Object.keys(ch.cast || {})) { if (tokenMatch(ch.cast[k])) { userId = ch.cast[k].id; break; } } }
+  const userMatch = (id) => { const c = ch.cast[id]; return c && nameMatchesUser(c); };
   const out = [];
   const seen = new Set();
   for (const r of ch.relations) {
     let other = null;
     if (userId && r.a === userId && presentIds.has(r.b)) other = r.b;
     else if (userId && r.b === userId && presentIds.has(r.a)) other = r.a;
-    // fallback when the player has no cast card: a relation where exactly one
-    // side is a present character and the OTHER side name is the persona.
+    // fallback when the player has no resolved cast id: a relation where one
+    // side fuzzy-matches the persona and the other is a present character.
     else if (!userId) {
-      const an = ch.cast[r.a] ? ch.cast[r.a].name : '', bn = ch.cast[r.b] ? ch.cast[r.b].name : '';
-      if (castKey(an) === userKey && presentIds.has(r.b)) other = r.b;
-      else if (castKey(bn) === userKey && presentIds.has(r.a)) other = r.a;
+      if (userMatch(r.a) && presentIds.has(r.b)) other = r.b;
+      else if (userMatch(r.b) && presentIds.has(r.a)) other = r.a;
     }
     if (!other) continue;
     const oc = ch.cast[other];
     if (!oc) continue;
-    if (castKey(oc.name) === userKey) continue; // never show the player as a rapport row
+    if (userMatch(other)) continue; // never show the player as a rapport row
     if (seen.has(other)) continue; seen.add(other);
     out.push({ name: oc.name, affection: r.affection || 0, trust: r.trust || 0, sentiment: r.sentiment || 'neutral' });
   }
