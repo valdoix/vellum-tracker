@@ -30,11 +30,18 @@ function hasPerm(name) {
  * raw uses only the connection's provider/model/key, with our own messages.
  */
 let _connCache = { at: 0, conn: null };
+// Operator-scoped extensions REQUIRE a userId on connections.list/generate.
+// Several internal call paths (interceptor, background timers) don't naturally
+// carry one, so we remember the last userId seen from any frontend message,
+// host event, or generation and fall back to it.
+let _lastUserId = null;
+function rememberUser(u) { if (u) _lastUserId = u; }
 async function resolveConnection(userId) {
+  const uid = userId || _lastUserId;
   if (_connCache.conn && Date.now() - _connCache.at < 30000) return _connCache.conn;
   try {
     if (spindle.connections && spindle.connections.list) {
-      const list = await spindle.connections.list(userId);
+      const list = await spindle.connections.list(uid);
       if (Array.isArray(list) && list.length) {
         const pick = list.find((c) => c.is_default) || list[0];
         if (pick && pick.id) { _connCache = { at: Date.now(), conn: pick }; return pick; }
@@ -72,9 +79,11 @@ function extractGenContent(r) {
 }
 
 async function internalGenerate(messages, params, userId) {
-  const conn = await resolveConnection(userId);
+  const uid = userId || _lastUserId;
+  rememberUser(userId);
+  const conn = await resolveConnection(uid);
   const req = { messages, parameters: params || {} };
-  if (userId) req.userId = userId;
+  if (uid) req.userId = uid;
   if (conn && conn.id) req.connection_id = conn.id;
   // Some hosts require provider/model alongside connection_id for raw.
   if (conn && conn.provider) req.provider = conn.provider;
@@ -2971,7 +2980,7 @@ async function resolveChatId(hinted, userId) {
   if (hinted) return hinted;
   try {
     if (spindle.chats && spindle.chats.getActive) {
-      const active = await spindle.chats.getActive(userId);
+      const active = await spindle.chats.getActive(userId || _lastUserId);
       if (active && active.id) return active.id;
     }
   } catch (e) {
@@ -3333,19 +3342,21 @@ const vellumInterceptor = async (messages, context) => {
     return filtered === msg.content ? msg : { ...msg, content: filtered };
   });
 
-  // Optional: drop already-summarized old turns to save context (opt-in toggle).
+  // Hide-on-file: when enabled, the OLD summarized messages are already hidden
+  // from the prompt at the assembler level (via setMessagesHidden in handle()),
+  // so we don't touch the array here. Instead, prepend a compact STORY SO FAR
+  // recap so the model still has the condensed past. Recent turns stay verbatim.
+  let storyRecap = '';
   let _hideCh = null;
   try {
     const cid0 = context && (context.chatId || context.chat_id);
     if (cid0) {
       _hideCh = await loadChronicle(cid0);
-      if (_hideCh && _hideCh.hideSummarized) {
-        const before = out.length;
-        out = applyHideSummarized(out, _hideCh);
-        if (out.length !== before) spindle.log.info('[vellum_tracker] hid summarized turns (' + before + '→' + out.length + ' msgs)');
+      if (_hideCh && _hideCh.hideSummarized && (_hideCh.hiddenByVellum || []).length) {
+        storyRecap = buildStorySoFar(_hideCh);
       }
     }
-  } catch (eHide) { spindle.log.warn('[vellum_tracker] hideSummarized: ' + (eHide && eHide.message)); }
+  } catch (eHide) { spindle.log.warn('[vellum_tracker] hideSummarized recap: ' + (eHide && eHide.message)); }
 
   // Scene-relevant chronicle recall (budgeted, retrieval-gated — never a full dump).
   let injectedContent = '';
@@ -3448,14 +3459,19 @@ const vellumInterceptor = async (messages, context) => {
     spindle.log.warn(`[vellum_tracker] recall inject: ${err?.message || err}`);
   }
 
-  // Inject at index 0 as a system message + a Prompt Breakdown entry (the exact
-  // shape LoreRecall uses, so it shows as its own attributed block in dry-run /
-  // live breakdown / saved snapshots).
+  // Inject at index 0 as system message(s) + Prompt Breakdown entries. When
+  // hide-on-file is active, prepend a STORY SO FAR recap of the hidden chapters.
+  const heads = [], bk = [];
+  if (storyRecap) {
+    heads.push({ role: 'system', content: '[STORY SO FAR \u2014 earlier chapters of this scene, condensed to save context (the raw turns are hidden from the prompt). Treat as established history; do not recap it in prose.]\n' + storyRecap });
+    bk.push({ messageIndex: heads.length - 1, name: 'VELLUM Story So Far' });
+  }
   if (injectedContent) {
-    return {
-      messages: [{ role: 'system', content: injectedContent }, ...out],
-      breakdown: [{ messageIndex: 0, name: 'VELLUM Recall' }],
-    };
+    heads.push({ role: 'system', content: injectedContent });
+    bk.push({ messageIndex: heads.length - 1, name: 'VELLUM Recall' });
+  }
+  if (heads.length) {
+    return { messages: [...heads, ...out], breakdown: bk };
   }
   return out;
 };
@@ -3549,6 +3565,7 @@ spindle.on('GENERATION_ENDED', async (payload) => {
     ensureInterceptor('generation_ended');
     const chatId = payload?.chatId || payload?.chat_id;
     const content = payload?.content || payload?.message?.content || '';
+    rememberUser(payload?.userId || payload?.user_id);
     await handle(chatId, content, payload?.userId || payload?.user_id);
   } catch (err) {
     spindle.log.warn(`[vellum_tracker] GENERATION_ENDED: ${err?.message || err}`);
@@ -3572,6 +3589,7 @@ spindle.on('MESSAGE_EDITED', async (payload) => {
  */
 spindle.onFrontendMessage(async (payload, userId) => {
   try {
+    rememberUser(userId);
     if (payload?.type === 'get_state') {
       const chatId = await resolveChatId(payload.chatId, userId);
       let state = chatId && lastStateByChat.get(chatId);
