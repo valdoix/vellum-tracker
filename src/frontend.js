@@ -2149,7 +2149,7 @@ const VELLUM_CSS = [
   ".vlm-mind-t{display:block;font-style:italic;color:#e3d6bb;line-height:1.5}",
   ".vlm-empty{opacity:.5;font-style:italic;text-align:center;padding:60px 12px;font-family:'Cormorant Garamond',serif;font-size:17px;line-height:2}",
     ".vlm-timenote{margin:-4px 0 12px;text-align:center;font-size:10px;letter-spacing:1px;color:var(--vsolid,#cda84e);opacity:.85;font-family:'JetBrains Mono',monospace}",
-  ".vlm-bts-h{font-family:'Cormorant Garamond',Georgia,serif;font-size:14px;letter-spacing:3px;text-transform:uppercase;color:var(--vsolid,#cda84e);text-align:center;margin:20px 0 12px;padding-top:14px;border-top:1px solid rgba(var(--vacc,205,168,78),.2)}",
+  ".vlm-bts-h{font-family:'Cormorant Garamond',Georgia,serif;font-size:14px;letter-spacing:3px;text-transform:uppercase;color:var(--vsolid,#cda84e);text-align:center;margin:0 0 12px}",
   ".vlm-bts-sec{margin-bottom:12px}",
   ".vlm-bts-l{font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:7px;display:flex;align-items:center;gap:7px}",
   ".vlm-bts-l::after{content:'';flex:1;height:1px;background:linear-gradient(to right,currentColor,transparent);opacity:.4}",
