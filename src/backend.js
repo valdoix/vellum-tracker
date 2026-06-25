@@ -278,11 +278,11 @@ function extractDay(timeStr) {
 // derived (not model-guessed). Replaces the old single [bond] meter.
 // `userName` is the resolved {{user}} persona name (authoritative).
 function computeRapport(ch, userName) {
-  if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) return [];
+  if (!ch || !Array.isArray(ch.relations) || !ch.relations.length) { spindle.log.info('[vellum_tracker] rapport: no relations (' + (ch && ch.relations ? ch.relations.length : 'n/a') + ')'); return []; }
   const presentIds = new Set(ch.presentIds || []);
-  if (!presentIds.size) return [];
+  if (!presentIds.size) { spindle.log.info('[vellum_tracker] rapport: no presentIds'); return []; }
   const userKey = userName ? castKey(userName) : null;
-  if (!userKey) return []; // can't identify the player → don't guess
+  if (!userKey) { spindle.log.info('[vellum_tracker] rapport: no userName resolved'); return []; }
   // The player's cast id = the card matching the {{user}} persona name. Try the
   // strongest signal first (exact key / alias), then a distinctive-token match
   // (so short "Daeron" matches "Daeron Targaryen") — but a SHARED SURNAME alone
@@ -317,6 +317,7 @@ function computeRapport(ch, userName) {
     if (seen.has(other)) continue; seen.add(other);
     out.push({ name: oc.name, affection: r.affection || 0, trust: r.trust || 0, sentiment: r.sentiment || 'neutral' });
   }
+  spindle.log.info('[vellum_tracker] rapport: user="' + userName + '" userId=' + (userId || 'NONE') + ' present=' + presentIds.size + ' -> ' + out.length + ' rows');
   return out.slice(0, 6);
 }
 
