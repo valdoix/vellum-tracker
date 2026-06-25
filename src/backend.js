@@ -1419,7 +1419,7 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
       const om = ch.cast[other];
       const oName = om ? om.name : other;
       const lbl = r.label ? (c.name + ' \u2014 ' + r.label) : (c.name + ' \u2194 ' + oName);
-      const tags = [r.category]; if (r.status && r.status !== 'active') tags.push(r.status);
+      const tags = [r.category]; if (r.sentiment && r.sentiment !== 'neutral') tags.push(r.sentiment); if (r.status && r.status !== 'active') tags.push(r.status);
       cands.push({ id, kind: 'relation', label: (r.label || (c.name + '/' + oName)).slice(0, 40), recent: r.lastTurn || 0, anchor: c.name, line: '\u21ce ' + lbl + ' (' + tags.join(', ') + ')' });
     });
   }

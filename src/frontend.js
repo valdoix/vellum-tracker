@@ -1654,6 +1654,8 @@ function relationsHtml(ch) {
   }
   const nameOf = (id) => (ch.cast && ch.cast[id] ? ch.cast[id].name : id);
   const catCls = { familial: 'r-fam', romantic: 'r-rom', alliance: 'r-all', rivalry: 'r-riv', social: 'r-soc', neutral: 'r-neu' };
+  const sentCls = { warm: 'se-warm', hostile: 'se-host', strained: 'se-strain', complex: 'se-cx', neutral: 'se-neu' };
+  const sentLbl = { warm: '\u2665 warm', hostile: '\u2694 hostile', strained: '\u26A1 strained', complex: '\u269C complex', neutral: '\u25CB neutral' };
   const cnt = rels.reduce((acc, r) => { const c = r.category || 'neutral'; acc[c] = (acc[c] || 0) + 1; return acc; }, {});
   const order = ['familial', 'romantic', 'alliance', 'rivalry', 'social', 'neutral'];
   const chips = ['all'].concat(order.filter((c) => cnt[c])).map((c) =>
@@ -1665,7 +1667,8 @@ function relationsHtml(ch) {
     const aN = nameOf(r.a), bN = nameOf(r.b);
     const text = r.label ? (escapeHtml(aN) + ' \u2014 ' + escapeHtml(r.label)) : (escapeHtml(aN) + ' \u2194 ' + escapeHtml(bN));
     const sub = r.label ? ('<span class="vlc-rel-b">\u2194 ' + escapeHtml(bN) + '</span>') : '';
-    const tags = '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>'
+    const tags = '<span class="vlc-rel-sent ' + (sentCls[r.sentiment] || 'se-neu') + '" title="' + escapeHtml(r.sentiment || 'neutral') + '">' + escapeHtml(sentLbl[r.sentiment] || (r.sentiment || 'neutral')) + '</span>'
+      + '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>'
       + (r.status && r.status !== 'active' ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '');
     return '<div class="vlc-rel-row">'
       + '<span class="vlc-rel-t">' + text + ' ' + sub + '</span>' + tags
@@ -2217,6 +2220,12 @@ const VELLUM_CSS = [
   ".vlc-rel-cat{flex:none;font-size:8px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 6px;border-radius:4px;color:#1a1610;background:#8c8478}",
   ".r-fam{background:#cda84e}",".r-rom{background:#c97a9a}",".r-all{background:#8fa67e}",".r-riv{background:#c96a6a}",".r-soc{background:#7ea6b0}",".r-neu{background:#8c8478}",
   ".vlc-rel-st{flex:none;font-size:8px;letter-spacing:.5px;text-transform:uppercase;padding:2px 5px;border-radius:4px;color:#cda84e;background:rgba(205,168,78,.14);border:1px solid rgba(205,168,78,.25)}",
+  ".vlc-rel-sent{flex:none;font-size:8px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;padding:2px 6px;border-radius:4px;border:1px solid transparent}",
+  ".se-warm{color:#e6b89a;background:rgba(216,160,90,.16);border-color:rgba(216,160,90,.4)}",
+  ".se-host{color:#e09090;background:rgba(201,106,106,.18);border-color:rgba(201,106,106,.45)}",
+  ".se-strain{color:#d8c98a;background:rgba(205,168,78,.16);border-color:rgba(205,168,78,.4)}",
+  ".se-cx{color:#c9a8e0;background:rgba(180,142,208,.16);border-color:rgba(180,142,208,.4)}",
+  ".se-neu{color:#9aa0a6;background:rgba(140,132,120,.16);border-color:rgba(140,132,120,.35)}",
   ".vlc-mini-edit{flex:none;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(205,168,78,.14);color:#cda84e;font-size:9px;line-height:1;display:grid;place-items:center;margin-left:4px}",
   ".vlc-mini-edit:hover{background:rgba(205,168,78,.34)}",
   ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",
