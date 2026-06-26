@@ -663,51 +663,62 @@ function foldTurn(ch, turn, day, led, bts) {
           }
         } catch (eRel) {}
       } else if (/^know[\s:\u2192]/i.test(line)) {
-        // know→Name: fact | knows|believes|suspects|wrong|unaware [| source]
+        // know→Name: fact | <reliability> | truth:<true|false|unknown> | source:<how>
+        // reliability/truth accepted as bare enum tokens OR key:value; full match
+        // to the chronicle knowledge model {who,fact,reliability,truth,source}.
         try {
           const m = line.match(/^know[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
           if (m) {
             const who = canonName(m[1].trim(), null);
-            const rest = m[2].split('|').map((x) => x.trim());
-            const fact = rest[0];
+            const segs = btsSegs(m[2]);
+            const fact = segs.text;
             const REL = new Set(['knows', 'believes', 'suspects', 'wrong', 'unaware']);
-            let reliability = 'knows', source = '';
-            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase(); if (REL.has(sl)) reliability = sl; else if (seg) source = seg; }
+            const TR = new Set(['true', 'false', 'unknown']);
+            let reliability = segs.pickEnum(REL) || 'knows';
+            let truth = segs.kv('truth') || segs.pickEnum(TR) || (reliability === 'wrong' ? 'false' : 'unknown');
+            const source = segs.kv('source') || segs.kv('via') || segs.rest();
             if (who && fact && !isIncidentalName(who)) {
-              const r = applyKnowResult(ch, { knowledge: [{ who, fact, reliability, truth: reliability === 'wrong' ? 'false' : 'unknown', source }], secrets: [] }, null, { pulse: true });
-              void r;
+              applyKnowResult(ch, { knowledge: [{ who, fact, reliability, truth, source }], secrets: [] }, null, { pulse: true });
             }
           }
         } catch (eK) {}
       } else if (/^secret[\s:\u2192]/i.test(line)) {
-        // secret→Keeper: the secret | from: Name | minor|major|explosive
+        // secret→Keeper: the secret | from:<who> | <danger> | method:<lie|omission|misdirection|disguise> | exposure:<how>
         try {
           const m = line.match(/^secret[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
           if (m) {
             const keeper = canonName(m[1].trim(), null);
-            const rest = m[2].split('|').map((x) => x.trim());
-            const secret = rest[0];
+            const segs = btsSegs(m[2]);
+            const secret = segs.text;
             const DG = new Set(['minor', 'major', 'explosive']);
-            let from = '', danger = 'major';
-            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase().replace(/^from[:\s]*/i, ''); if (DG.has(sl)) danger = sl; else if (/^from[:\s]/i.test(seg)) from = seg.replace(/^from[:\s]*/i, '').trim(); else if (seg && !DG.has(seg.toLowerCase())) from = seg; }
+            const METH = new Set(['lie', 'omission', 'misdirection', 'disguise']);
+            const danger = segs.pickEnum(DG) || 'major';
+            const method = segs.kv('method') || segs.pickEnum(METH) || 'omission';
+            const from = segs.kv('from') || '';
+            const exposure = segs.kv('exposure') || segs.kv('surfaces') || '';
             if (keeper && secret && !isIncidentalName(keeper)) {
-              applyKnowResult(ch, { knowledge: [], secrets: [{ secret, keeper, from, method: 'omission', exposure: '', danger }] }, null, { pulse: true });
+              applyKnowResult(ch, { knowledge: [], secrets: [{ secret, keeper, from, method, exposure, danger }] }, null, { pulse: true });
             }
           }
         } catch (eS) {}
       } else if (/^mem[\s:\u2192]/i.test(line)) {
-        // mem→Name: a memorable beat | weight [| about:Name]
+        // mem→Name: the memory | about:<who/what> | <weight> | <sentiment> | kind:<...>
+        // full match to the journal model {who,about,memory,kind,weight,sentiment,day}.
         try {
           const m = line.match(/^mem[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
           if (m) {
             const who = canonName(m[1].trim(), null);
-            const rest = m[2].split('|').map((x) => x.trim());
-            const memory = rest[0];
+            const segs = btsSegs(m[2]);
+            const memory = segs.text;
             const W = new Set(['trivial', 'minor', 'significant', 'defining']);
-            let weight = 'minor', about = '';
-            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase(); if (W.has(sl)) weight = sl; else if (/^about[:\s]/i.test(seg)) about = canonName(seg.replace(/^about[:\s]*/i, '').trim(), null); }
+            const S = new Set(['positive', 'negative', 'neutral', 'complex']);
+            const KIND = new Set(['interaction', 'promise', 'betrayal', 'gift', 'shared', 'wound', 'observation']);
+            const weight = segs.pickEnum(W) || 'minor';
+            const sentiment = segs.pickEnum(S) || 'neutral';
+            const kind = segs.kv('kind') || segs.pickEnum(KIND) || 'observation';
+            const about = segs.kv('about') ? canonName(segs.kv('about'), null) : '';
             if (who && memory && !isIncidentalName(who)) {
-              applyMemList(ch, [{ who, about, memory, kind: 'observation', weight, sentiment: 'neutral', day }], null, { pulse: true });
+              applyMemList(ch, [{ who, about, memory, kind, weight, sentiment, day }], null, { pulse: true });
             }
           }
         } catch (eM) {}
@@ -741,6 +752,33 @@ function parseRelAxes(tail) {
     dTr: trM ? parseInt(trM[1], 10) : 0,
     abs: !signed,
     reason: reasonM ? reasonM[1].trim() : '',
+  };
+}
+
+// Parse a pipe-delimited BTS field tail into the first free-text segment plus
+// helpers to extract enum tokens (e.g. "explosive") and key:value pairs (e.g.
+// "from: the court"). Lets one parser fully populate the chronicle field model.
+function btsSegs(tail) {
+  const parts = String(tail || '').split('|').map((x) => x.trim()).filter(Boolean);
+  const text = parts.length ? parts[0] : '';
+  const tags = parts.slice(1);
+  const usedEnum = new Set();
+  return {
+    text,
+    pickEnum(set) {
+      for (const t of tags) { const sl = t.toLowerCase(); if (!usedEnum.has(t) && set.has(sl)) { usedEnum.add(t); return sl; } }
+      return '';
+    },
+    kv(key) {
+      const re = new RegExp('^' + key + '\\s*[:=]\\s*(.+)$', 'i');
+      for (const t of tags) { const m = t.match(re); if (m) return m[1].trim(); }
+      return '';
+    },
+    // any remaining tag that isn't a key:value and wasn't claimed as an enum
+    rest() {
+      for (const t of tags) { if (!/[:=]/.test(t) && !usedEnum.has(t)) return t; }
+      return '';
+    },
   };
 }
 
