@@ -174,10 +174,10 @@ function _setupImpl(ctx) {
         { key: 'a', label: 'Character A', type: 'text', placeholder: 'name (the subject)' },
         { key: 'label', label: 'Relation (from A\u2019s side)', type: 'text', placeholder: "e.g. Tywin's daughter / betrothed to Daeron" },
         { key: 'b', label: 'Character B', type: 'text', placeholder: 'the other person' },
-        { key: 'category', label: 'Category', type: 'select', value: 'neutral', options: REL_CAT_OPTS },
+        { key: 'categories', label: 'Categories (one or more)', type: 'checks', value: [], options: REL_CAT_MULTI_OPTS },
         { key: 'status', label: 'Status', type: 'select', value: 'active', options: REL_STATUS_OPTS },
         { key: 'sentiment', label: 'Sentiment', type: 'select', value: 'neutral', options: REL_SENT_OPTS },
-      ], (v) => { if (v.a && v.a.trim() && v.b && v.b.trim()) ctx.sendToBackend({ type: 'relation_add', chatId: currentChatId, entry: v }); });
+      ], (v) => { if (v.a && v.a.trim() && v.b && v.b.trim()) { v.categories = splitCats(v.categories); ctx.sendToBackend({ type: 'relation_add', chatId: currentChatId, entry: v }); } });
       return; }
     rb = e.target.closest('[data-relation-edit]');
     if (rb) {
@@ -185,11 +185,11 @@ function _setupImpl(ctx) {
         { key: 'a', label: 'Character A', type: 'text', value: A(rb, 'data-a') },
         { key: 'label', label: 'Relation (from A\u2019s side)', type: 'text', value: A(rb, 'data-label') },
         { key: 'b', label: 'Character B', type: 'text', value: A(rb, 'data-b') },
-        { key: 'category', label: 'Category', type: 'select', value: A(rb, 'data-category') || 'neutral', options: REL_CAT_OPTS },
+        { key: 'categories', label: 'Categories (one or more)', type: 'checks', value: A(rb, 'data-categories') || A(rb, 'data-category') || 'neutral', options: REL_CAT_MULTI_OPTS },
         { key: 'status', label: 'Status', type: 'select', value: A(rb, 'data-status') || 'active', options: REL_STATUS_OPTS },
         { key: 'affection', label: 'Affection (-100..100)', type: 'text', value: A(rb, 'data-affection') || '0' },
         { key: 'trust', label: 'Trust (-100..100)', type: 'text', value: A(rb, 'data-trust') || '0' },
-      ], (v) => ctx.sendToBackend({ type: 'relation_edit', chatId: currentChatId, id: A(rb, 'data-id'), entry: v }));
+      ], (v) => { v.categories = splitCats(v.categories); ctx.sendToBackend({ type: 'relation_edit', chatId: currentChatId, id: A(rb, 'data-id'), entry: v }); });
       return; }
     rb = e.target.closest('[data-relation-del]');
     if (rb) { if (confirm('Delete this relation?')) ctx.sendToBackend({ type: 'relation_delete', chatId: currentChatId, id: A(rb, 'data-id') }); return; }
@@ -814,6 +814,15 @@ function vlcFormModal(title, fields, onSave) {
       const opts = (f.options || []).map((o) => '<option value="' + escapeHtml(o.value) + '"' + (String(o.value) === String(f.value) ? ' selected' : '') + '>' + escapeHtml(o.label) + '</option>').join('');
       return '<label class="vlc-ff-l">' + escapeHtml(f.label) + '<select class="vlc-cf-in vlc-cf-sel" data-ff="' + f.key + '">' + opts + '</select></label>';
     }
+    if (f.type === 'checks') {
+      // multi-select checkbox group; value is an array (or comma string) of
+      // currently-checked option values. Collected back into a comma string.
+      const sel = Array.isArray(f.value) ? f.value.map(String) : String(f.value || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const boxes = (f.options || []).map((o) =>
+        '<label class="vlc-ff-chk"><input type="checkbox" data-ff-chk="' + f.key + '" value="' + escapeHtml(o.value) + '"' + (sel.includes(String(o.value)) ? ' checked' : '') + '> ' + escapeHtml(o.label) + '</label>'
+      ).join('');
+      return '<div class="vlc-ff-l" data-ff-checks="' + f.key + '">' + escapeHtml(f.label) + '<div class="vlc-ff-chkrow">' + boxes + '</div></div>';
+    }
     return '<label class="vlc-ff-l">' + escapeHtml(f.label) + '<input class="vlc-cf-in" data-ff="' + f.key + '" placeholder="' + escapeHtml(f.placeholder || '') + '" value="' + escapeHtml(f.value || '') + '"></label>';
   }).join('');
   overlay.innerHTML = '<div class="vlc-formmodal-panel"><div class="vlc-formmodal-h">' + escapeHtml(title) + '</div>'
@@ -827,6 +836,12 @@ function vlcFormModal(title, fields, onSave) {
   overlay.querySelector('[data-ff-save]').addEventListener('click', () => {
     const values = {};
     overlay.querySelectorAll('[data-ff]').forEach((el) => { values[el.getAttribute('data-ff')] = el.value; });
+    // checkbox groups -> comma-joined string of checked values
+    overlay.querySelectorAll('[data-ff-checks]').forEach((grp) => {
+      const key = grp.getAttribute('data-ff-checks');
+      const on = Array.from(grp.querySelectorAll('[data-ff-chk]')).filter((c) => c.checked).map((c) => c.value);
+      values[key] = on.join(',');
+    });
     close();
     onSave(values);
   });
@@ -840,7 +855,19 @@ const TRUTH_OPTS = [{ value: 'unknown', label: 'unknown' }, { value: 'true', lab
 const DANGER_OPTS = [{ value: 'minor', label: 'minor' }, { value: 'major', label: 'major' }, { value: 'explosive', label: 'explosive' }];
 const WEIGHT_OPTS = [{ value: 'trivial', label: 'trivial' }, { value: 'minor', label: 'minor' }, { value: 'significant', label: 'significant' }, { value: 'defining', label: 'defining' }];
 const SENT_OPTS = [{ value: 'neutral', label: 'neutral' }, { value: 'positive', label: 'positive' }, { value: 'negative', label: 'negative' }, { value: 'complex', label: 'complex' }];
+// Category "maturity" rank — mirrors the backend's REL_CAT_RANK so the card
+// accent (data-cat) uses the most-defined facet of a multi-category bond.
+const REL_RANK = { neutral: 0, social: 1, alliance: 2, rivalry: 2, romantic: 3, familial: 3 };
 const REL_CAT_OPTS = [{ value: 'familial', label: 'familial' }, { value: 'romantic', label: 'romantic' }, { value: 'alliance', label: 'alliance' }, { value: 'rivalry', label: 'rivalry' }, { value: 'social', label: 'social' }, { value: 'neutral', label: 'neutral' }];
+// Multi-select category options (neutral is the implicit "no real bond" state,
+// so it's omitted from the checkbox group — leave all unchecked for neutral).
+const REL_CAT_MULTI_OPTS = [{ value: 'familial', label: 'familial' }, { value: 'romantic', label: 'romantic' }, { value: 'alliance', label: 'alliance' }, { value: 'rivalry', label: 'rivalry' }, { value: 'social', label: 'social' }];
+// Parse a comma-joined category string from the form into a clean array; an
+// empty selection falls back to ['neutral'].
+function splitCats(s) {
+  const arr = String(s || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  return arr.length ? arr : ['neutral'];
+}
 const REL_STATUS_OPTS = [{ value: 'active', label: 'active' }, { value: 'past', label: 'past' }, { value: 'broken', label: 'broken' }, { value: 'secret', label: 'secret' }];
 const REL_SENT_OPTS = [{ value: 'neutral', label: 'neutral' }, { value: 'warm', label: 'warm' }, { value: 'strained', label: 'strained' }, { value: 'hostile', label: 'hostile' }, { value: 'complex', label: 'complex' }];
 
@@ -2062,13 +2089,18 @@ function relationsHtml(ch) {
   const catCls = { familial: 'r-fam', romantic: 'r-rom', alliance: 'r-all', rivalry: 'r-riv', social: 'r-soc', neutral: 'r-neu' };
   const sentCls = { warm: 'se-warm', hostile: 'se-host', strained: 'se-strain', complex: 'se-cx', neutral: 'se-neu' };
   const sentLbl = { warm: '\u2665 warm', hostile: '\u2694 hostile', strained: '\u26A1 strained', complex: '\u269C complex', neutral: '\u25CB neutral' };
-  const cnt = rels.reduce((acc, r) => { const c = r.category || 'neutral'; acc[c] = (acc[c] || 0) + 1; return acc; }, {});
+  // The active category set of an edge (back-compat: fall back to single category).
+  const catsOf = (r) => (Array.isArray(r.categories) && r.categories.length ? r.categories : [r.category || 'neutral']);
+  // Count by EACH category an edge belongs to, so a familial+rivalry edge counts
+  // under both filter chips.
+  const cnt = rels.reduce((acc, r) => { catsOf(r).forEach((c) => { acc[c] = (acc[c] || 0) + 1; }); return acc; }, {});
   const order = ['familial', 'romantic', 'alliance', 'rivalry', 'social', 'neutral'];
   const chips = ['all'].concat(order.filter((c) => cnt[c])).map((c) =>
     '<button class="vlc-fchip' + (_relFilter === c ? ' on' : '') + '" data-rel-filter="' + c + '">'
     + (c === 'all' ? 'All' : escapeHtml(c)) + ' <span class="vlc-fchip-n">' + (c === 'all' ? rels.length : cnt[c]) + '</span></button>'
   ).join('');
-  const shown = _relFilter === 'all' ? rels : rels.filter((r) => (r.category || 'neutral') === _relFilter);
+  // an edge matches the filter if ANY of its categories matches
+  const shown = _relFilter === 'all' ? rels : rels.filter((r) => catsOf(r).includes(_relFilter));
   // a -100..100 score bar centered at 0 (left = negative/red, right = positive/green)
   const scoreBar = (label, v) => {
     const n = Math.max(-100, Math.min(100, Number(v) || 0));
@@ -2086,26 +2118,45 @@ function relationsHtml(ch) {
     const pts = h.map((x, i) => { const xx = (i / (h.length - 1)) * 100; const yy = 50 - ((Number(x.affection) || 0) / 100) * 45; return xx.toFixed(1) + ',' + yy.toFixed(1); }).join(' ');
     return '<svg class="vlc-rel-spark" viewBox="0 0 100 50" preserveAspectRatio="none"><polyline points="' + pts + '"/></svg>';
   };
+  // Category-evolution trail: compact "+romantic" / "−alliance" steps so the user
+  // can see how the bond's nature changed over time. Built from categoryHistory's
+  // add/remove ops (skipping the seed row), capped to the last few transitions.
+  const catTrail = (r) => {
+    const hist = Array.isArray(r.categoryHistory) ? r.categoryHistory : [];
+    const ops = hist.filter((h) => h && (h.op === 'add' || h.op === 'remove') && h.category);
+    if (ops.length < 2) return ''; // nothing meaningful evolved yet
+    const steps = ops.slice(-5).map((h) => {
+      const sign = h.op === 'remove' ? '\u2212' : '+';
+      const cls = h.op === 'remove' ? 'ev-rm' : 'ev-add';
+      const tip = (h.day ? 'day ' + h.day : ('turn ' + (h.turn || 0))) + (h.reason ? ' \u2014 ' + h.reason : '');
+      return '<span class="vlc-rel-ev ' + cls + '" title="' + escapeHtml(tip) + '">' + sign + escapeHtml(h.category) + '</span>';
+    }).join('<span class="vlc-rel-ev-sep">\u203a</span>');
+    return '<div class="vlc-rel-evtrail" title="how this bond evolved">' + steps + '</div>';
+  };
   const rows = shown.length ? shown.slice().sort((a, b) => (b.lastTurn || 0) - (a.lastTurn || 0)).map((r) => {
     const aN = nameOf(r.a), bN = nameOf(r.b);
     const aff = (typeof r.affection === 'number') ? r.affection : 0;
     const tr = (typeof r.trust === 'number') ? r.trust : 0;
+    const cats = catsOf(r);
     const sentChip = '<span class="vlc-rel-sent ' + (sentCls[r.sentiment] || 'se-neu') + '" title="' + escapeHtml(r.sentiment || 'neutral') + '">' + escapeHtml(sentLbl[r.sentiment] || (r.sentiment || 'neutral')) + '</span>';
-    const catChip = '<span class="vlc-rel-cat ' + (catCls[r.category] || 'r-neu') + '">' + escapeHtml(r.category || 'neutral') + '</span>';
+    // ONE chip per active category — coexisting facets all show (familial + rivalry)
+    const catChips = cats.map((c) => '<span class="vlc-rel-cat ' + (catCls[c] || 'r-neu') + '">' + escapeHtml(c) + '</span>').join('');
     const stChip = (r.status && r.status !== 'active') ? '<span class="vlc-rel-st">' + escapeHtml(r.status) + '</span>' : '';
     // header: A → B as a clear pair; the relationship label sits on its own line
     const pair = '<span class="vlc-rel-a">' + escapeHtml(aN) + '</span><span class="vlc-rel-arrow">\u2192</span><span class="vlc-rel-bn">' + escapeHtml(bN) + '</span>';
     const lbl = r.label ? '<div class="vlc-rel-label">\u201c' + escapeHtml(r.label) + '\u201d</div>' : '';
-    return '<div class="vlc-rel-card ' + (sentCls[r.sentiment] || 'se-neu') + '" data-cat="' + escapeHtml(r.category || 'neutral') + '">'
+    const primaryCat = cats.slice().sort((x, y) => (REL_RANK[y] || 0) - (REL_RANK[x] || 0))[0] || 'neutral';
+    return '<div class="vlc-rel-card ' + (sentCls[r.sentiment] || 'se-neu') + '" data-cat="' + escapeHtml(primaryCat) + '">'
       + '<div class="vlc-rel-top">'
         + '<div class="vlc-rel-pair">' + pair + '</div>'
         + '<div class="vlc-rel-ctl">'
-          + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(r.category || 'neutral') + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" data-affection="' + aff + '" data-trust="' + tr + '" title="Edit">\u270E</button>'
+          + '<button class="vlc-mini-edit" data-relation-edit data-id="' + escapeHtml(r.id || '') + '" data-a="' + escapeHtml(aN) + '" data-b="' + escapeHtml(bN) + '" data-label="' + escapeHtml(r.label || '') + '" data-category="' + escapeHtml(primaryCat) + '" data-categories="' + escapeHtml(cats.join(',')) + '" data-status="' + escapeHtml(r.status || 'active') + '" data-sentiment="' + escapeHtml(r.sentiment || 'neutral') + '" data-affection="' + aff + '" data-trust="' + tr + '" title="Edit">\u270E</button>'
           + '<button class="vlc-mini-del" data-relation-del data-id="' + escapeHtml(r.id || '') + '" title="Delete">\u2715</button>'
         + '</div>'
       + '</div>'
       + lbl
-      + '<div class="vlc-rel-tags">' + sentChip + catChip + stChip + '</div>'
+      + '<div class="vlc-rel-tags">' + sentChip + catChips + stChip + '</div>'
+      + catTrail(r)
       + '<div class="vlc-rel-scores">' + scoreBar('Affection', aff) + scoreBar('Trust', tr) + '</div>'
       + (spark(r) ? '<div class="vlc-rel-sparkwrap">' + spark(r) + '</div>' : '')
       + '</div>';
@@ -2869,6 +2920,14 @@ const VELLUM_CSS = [
   ".vlc-rel-sparkwrap{margin-top:8px;border-top:1px solid rgba(205,168,78,.1);padding-top:6px}",
   ".vlc-rel-spark{width:100%;height:24px;display:block}",
   ".vlc-rel-spark polyline{fill:none;stroke:var(--vsolid,#cda84e);stroke-width:2;opacity:.75}",
+  ".vlc-rel-evtrail{display:flex;flex-wrap:wrap;align-items:center;gap:3px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px}",
+  ".vlc-rel-ev{padding:1px 5px;border-radius:6px;border:1px solid rgba(205,168,78,.22);opacity:.85}",
+  ".vlc-rel-ev.ev-add{color:#a9c089;border-color:rgba(143,166,126,.4)}",
+  ".vlc-rel-ev.ev-rm{color:#e09090;border-color:rgba(201,106,106,.4);text-decoration:line-through}",
+  ".vlc-rel-ev-sep{opacity:.4}",
+  ".vlc-ff-chkrow{display:flex;flex-wrap:wrap;gap:8px 12px;padding:2px 0}",
+  ".vlc-ff-chk{display:inline-flex;align-items:center;gap:5px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;text-transform:none;letter-spacing:0}",
+  ".vlc-ff-chk input{accent-color:var(--vsolid,#cda84e);cursor:pointer}",
   ".vlc-mini-edit{flex:none;width:16px;height:16px;border:none;border-radius:4px;cursor:pointer;background:rgba(205,168,78,.14);color:#cda84e;font-size:9px;line-height:1;display:grid;place-items:center;margin-left:4px}",
   ".vlc-mini-edit:hover{background:rgba(205,168,78,.34)}",
   ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",

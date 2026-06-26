@@ -646,18 +646,28 @@ function foldTurn(ch, turn, day, led, bts) {
           pushLog(ch.shifts, { turn, day, text: shiftText.trim(), kind: 'rel' }, 0);
           if (aName && bName) {
             const ax = parseRelAxes(tail);
-            if (ax) {
+            // optional category facet on the tail: `cat:romantic` / `category:rivalry`
+            const catM = String(tail || '').match(/\bcat(?:egory)?\s*[:=]\s*([a-z]+)/i);
+            const newCat = (catM && REL_CATEGORIES.has(catM[1].toLowerCase()) && catM[1].toLowerCase() !== 'neutral') ? catM[1].toLowerCase() : '';
+            if (ax || newCat) {
               const ma = resolveOrAddCast(ch, aName), mb = resolveOrAddCast(ch, bName);
               if (ma && mb && ma.id !== mb.id) {
                 let r = (ch.relations || []).find((x) => (x.a === ma.id && x.b === mb.id) || (x.a === mb.id && x.b === ma.id));
-                if (!r) r = relationAdd(ch, { a: aName, b: bName, category: 'neutral', sentiment: 'neutral' }, { source: 'auto' });
+                if (!r) r = relationAdd(ch, { a: aName, b: bName, category: newCat || 'neutral', sentiment: 'neutral' }, { source: 'auto' });
                 if (r && !(r.userEdited && r.lockScores)) {
-                  const beforeS = r.sentiment;
-                  if (ax.abs) { r.affection = REL_CLAMP(ax.dAff); r.trust = REL_CLAMP(ax.dTr); r.sentiment = deriveSentiment(r.affection, r.trust); r.lastTurn = turn; r.history.push({ turn, day, affection: r.affection, trust: r.trust, reason: ax.reason }); if (r.history.length > 60) r.history.shift(); }
-                  else { applyRelDelta(r, ax.dAff, ax.dTr, ax.reason, turn); }
-                  const na = ch.cast[r.a] ? ch.cast[r.a].name : aName, nb = ch.cast[r.b] ? ch.cast[r.b].name : bName;
-                  const moved = beforeS !== r.sentiment;
-                  pushPulse(ch, { kind: 'relation', icon: (ax.dAff + ax.dTr) >= 0 ? '▲' : '▼', who: na, text: na + ' → ' + nb + ': ' + (moved ? (beforeS + ' → ' + r.sentiment + ' ') : '') + '(aff ' + (ax.abs ? '=' : (ax.dAff >= 0 ? '+' : '')) + ax.dAff + ', trust ' + (ax.abs ? '=' : (ax.dTr >= 0 ? '+' : '')) + ax.dTr + ')' + (ax.reason ? ' — ' + ax.reason : ''), relId: r.id, sentiment: r.sentiment, big: moved });
+                  // category facet first (adds, never silently strips)
+                  if (newCat && !r.userEdited) {
+                    const ev = addRelationCategory(r, newCat, turn, day, ax && ax.reason ? ax.reason : '', { source: 'auto' });
+                    if (ev.changed) relationCategoryPulse(ch, r, ev, turn, day, ax && ax.reason ? ax.reason : '');
+                  }
+                  if (ax) {
+                    const beforeS = r.sentiment;
+                    if (ax.abs) { r.affection = REL_CLAMP(ax.dAff); r.trust = REL_CLAMP(ax.dTr); r.sentiment = deriveSentiment(r.affection, r.trust); r.lastTurn = turn; r.history.push({ turn, day, affection: r.affection, trust: r.trust, reason: ax.reason }); if (r.history.length > 60) r.history.shift(); }
+                    else { applyRelDelta(r, ax.dAff, ax.dTr, ax.reason, turn); }
+                    const na = ch.cast[r.a] ? ch.cast[r.a].name : aName, nb = ch.cast[r.b] ? ch.cast[r.b].name : bName;
+                    const moved = beforeS !== r.sentiment;
+                    pushPulse(ch, { kind: 'relation', icon: (ax.dAff + ax.dTr) >= 0 ? '▲' : '▼', who: na, text: na + ' → ' + nb + ': ' + (moved ? (beforeS + ' → ' + r.sentiment + ' ') : '') + '(aff ' + (ax.abs ? '=' : (ax.dAff >= 0 ? '+' : '')) + ax.dAff + ', trust ' + (ax.abs ? '=' : (ax.dTr >= 0 ? '+' : '')) + ax.dTr + ')' + (ax.reason ? ' — ' + ax.reason : ''), relId: r.id, sentiment: r.sentiment, big: moved });
+                  }
                 }
               }
             }
@@ -1002,7 +1012,8 @@ async function loadChronicle(chatId) {
   if (!Array.isArray(ch.knowledge)) ch.knowledge = [];
   if (!Array.isArray(ch.secrets)) ch.secrets = [];
   if (!Array.isArray(ch.relations)) ch.relations = []; // cast relationship edges
-  ch.relations.forEach((r) => ensureRelScores(r)); // migrate text-only edges to numeric axes
+  ch.relations.forEach((r) => ensureRelScores(r)); // migrate text-only edges to numeric axes + category trail
+  mergeDuplicateRelations(ch); // collapse pre-evolution duplicate edges for one pair
   // Tombstones: signatures of entries the user deleted, so a re-import or a
   // future scan never resurrects them. Capped to stay bounded.
   if (!ch.tombstones || typeof ch.tombstones !== 'object') ch.tombstones = { mem: [], know: [], sec: [], rel: [] };
@@ -1974,7 +1985,8 @@ function buildGraphRecall(ch, query, excludeIds, opts) {
       const om = ch.cast[other];
       const oName = om ? om.name : other;
       const lbl = r.label ? (c.name + ' \u2014 ' + r.label) : (c.name + ' \u2194 ' + oName);
-      const tags = [r.category]; if (r.sentiment && r.sentiment !== 'neutral') tags.push(r.sentiment); if (r.status && r.status !== 'active') tags.push(r.status);
+      const cats = (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'];
+      const tags = cats.slice(); if (r.sentiment && r.sentiment !== 'neutral') tags.push(r.sentiment); if (r.status && r.status !== 'active') tags.push(r.status);
       cands.push({ id, kind: 'relation', label: (r.label || (c.name + '/' + oName)).slice(0, 40), recent: r.lastTurn || 0, anchor: c.name, line: '\u21ce ' + lbl + ' (' + tags.join(', ') + ')' });
     });
   }
@@ -2315,7 +2327,7 @@ async function summarizeAll(chatId, userId) {
  * ========================================================================== */
 const scanningCast = new Set();
 
-const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about, and including the human player\u2019s own character), AND the relationships between them. For each, infer details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}],"relations":[{"a":"Character A (exact name)","b":"Character B (exact name)","label":"how A relates to B, from A\u2019s side, e.g. \\"Tywin\u2019s daughter\\" / \\"betrothed to Daeron\\"","category":"familial|romantic|alliance|rivalry|social|neutral","status":"active|past|broken|secret","sentiment":"warm|strained|hostile|complex|neutral"}]}. Rules: ALWAYS use the real names given to you \u2014 never output "{{user}}", "User", "{{char}}", or "you" as a name; pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words. For relations: only between NAMED characters; status=past for former/dissolved bonds (e.g. "once considered for betrothal" = neutral + past); category=neutral for faded or hypothetical links; never invent unsupported details (use "unknown"); merge obvious duplicates. No prose outside the JSON.';
+const CAST_SYS = 'You are a meticulous story-bible archivist reading a roleplay transcript. Extract EVERY named or distinctly-referenced character (including those only spoken about, and including the human player\u2019s own character), AND the relationships between them. For each, infer details from the WHOLE excerpt, not one line. Output STRICT JSON only: {"characters":[{"name":"Canonical Full Name","aka":["other names/nicknames/titles used"],"age":"e.g. 32 / mid-30s / unknown","appearance":"distinguishing looks, terse","role":"their function/relationship in the story","mentioned_only":true|false}],"relations":[{"a":"Character A (exact name)","b":"Character B (exact name)","label":"how A relates to B, from A\u2019s side, e.g. \\"Tywin\u2019s daughter\\" / \\"betrothed to Daeron\\"","category":"familial|romantic|alliance|rivalry|social|neutral","categories":["one or more of familial/romantic/alliance/rivalry/social when several apply at once, e.g. kin who are also rivals = [\\"familial\\",\\"rivalry\\"]"],"status":"active|past|broken|secret","sentiment":"warm|strained|hostile|complex|neutral"}]}. Rules: ALWAYS use the real names given to you \u2014 never output "{{user}}", "User", "{{char}}", or "you" as a name; pick the fullest form as the canonical name and list shorter spellings/nicknames/titles in aka; set mentioned_only=true only if they never appear or act on-page; keep age/appearance/role under ~14 words. For relations: only between NAMED characters; use `categories` (an array) when more than one bond type applies simultaneously \u2014 a brother who is also a rival, an ally who is also a lover; otherwise a single `category` is fine; status=past for former/dissolved bonds (e.g. "once considered for betrothal" = neutral + past); category=neutral for faded or hypothetical links; never invent unsupported details (use "unknown"); merge obvious duplicates. No prose outside the JSON.';
 
 function parseCastJson(text) {
   let t = String(text || '').replace(/<think[\s\S]*?<\/think>/gi, '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
@@ -2339,6 +2351,7 @@ function parseCastJson(text) {
     b: String(r.b || '').trim().slice(0, 60),
     label: String(r.label || '').trim().slice(0, 120),
     category: String(r.category || 'neutral').trim().toLowerCase(),
+    categories: Array.isArray(r.categories) ? r.categories.map((c) => String(c || '').trim().toLowerCase()).filter(Boolean).slice(0, 6) : undefined,
     status: String(r.status || 'active').trim().toLowerCase(),
     sentiment: String(r.sentiment || 'neutral').trim().toLowerCase(),
   })).filter((r) => r.a && r.b) : [];
@@ -2609,11 +2622,19 @@ function parseKnowJson(text) {
 function knowSig(k) { return (k.who + '|' + k.fact).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 120); }
 function secSig(s) { return (s.keeper + '|' + s.secret).toLowerCase().replace(/[^a-z0-9|]+/g, ' ').trim().slice(0, 120); }
 // Relation signature: unordered pair + category, so "A↔B familial" dedupes
-// regardless of which side is `a`, and a familial vs romantic bond between the
-// same two people are distinct edges.
+// regardless of which side is `a`. Kept for tombstone/back-compat with edges
+// that were stored category-specifically before relations could evolve.
 function relSig(aId, bId, category) {
   const pair = [String(aId || ''), String(bId || '')].sort().join('|');
   return (pair + '|' + String(category || '')).toLowerCase().slice(0, 160);
+}
+// Pair signature: the IDENTITY of a relation is now the unordered pair of
+// people, NOT the pair+category. A single bond between two people persists as
+// ONE edge whose `category` evolves over time (neutral → social → romantic …),
+// rather than spawning a fresh edge per category. The category trail lives in
+// `categoryHistory`. Used for dedup, tombstones, and evolution lookup.
+function relPairSig(aId, bId) {
+  return [String(aId || ''), String(bId || '')].sort().join('|').toLowerCase().slice(0, 160);
 }
 
 async function scanKnowledge(chatId, userId) {
@@ -2661,14 +2682,19 @@ async function knowExtract(turns, nc, userId) {
   return parseKnowJson(raw);
 }
 
-﻿const LIVING_SYS = "You are the LIVING-STATE EXTRACTOR for a roleplay. You read the RECENT NARRATIVE PROSE (the BTS/ledger blocks are stripped out \u2014 you must infer everything from the story text itself) and surface what it newly establishes. Output STRICT JSON only: {\"relations\":[{\"a\":\"Name\",\"b\":\"Name\",\"dAffection\":<int -40..40>,\"dTrust\":<int -40..40>,\"reason\":\"why, one clause\"}],\"knowledge\":[{\"who\":\"Name\",\"fact\":\"one clause\",\"reliability\":\"knows|believes|suspects|wrong|unaware\",\"truth\":\"true|false|unknown\",\"source\":\"how they learned it\"}],\"secrets\":[{\"secret\":\"one clause\",\"keeper\":\"Name\",\"from\":\"Name(s)\",\"method\":\"lie|omission|misdirection|disguise\",\"exposure\":\"how it might surface\",\"danger\":\"minor|major|explosive\"}],\"memories\":[{\"who\":\"Name\",\"about\":\"Name\",\"memory\":\"one vivid sentence from WHO'S point of view\",\"kind\":\"interaction|promise|betrayal|gift|shared|wound|observation\",\"weight\":\"trivial|minor|significant|defining\",\"sentiment\":\"positive|negative|neutral|complex\"}]}. EXTRACTION RULES: use ONLY real character names that appear in the prose \u2014 never {{user}}/{{char}}/placeholders, never unnamed figures (a guard, a servant). KNOWLEDGE: extract when a character learns, realizes, infers, deduces, overhears, or comes to wrongly believe something; truth is the ACTUAL state regardless of belief (wrong+false for a mistaken belief). SECRETS: extract when someone starts concealing something, or a kept secret is exposed/revealed this excerpt. MEMORIES: extract genuine TURNING POINTS a character would personally carry \u2014 a promise, betrayal, confession, gift, wound, first kiss, a vow, a moment of being truly seen; write each from that character's POV; fill weight AND sentiment AND kind for every entry. RELATIONS: dAffection/dTrust are the CHANGE this excerpt caused to how A feels toward B (warmth + trust); positive for warming/earning trust, negative for hurt/betrayal; omit pairs that did not move. Be GENEROUS but TRUE \u2014 capture every real reveal/turning-point you find (do not under-report), but invent nothing the prose does not support. Empty arrays are fine for categories with no new material. No prose outside the JSON.";
+﻿const LIVING_SYS = "You are the LIVING-STATE EXTRACTOR for a roleplay. You read the RECENT NARRATIVE PROSE (the BTS/ledger blocks are stripped out \u2014 you must infer everything from the story text itself) and surface what it newly establishes. Output STRICT JSON only: {\"relations\":[{\"a\":\"Name\",\"b\":\"Name\",\"dAffection\":<int -40..40>,\"dTrust\":<int -40..40>,\"category\":\"familial|romantic|alliance|rivalry|social|neutral (ONLY when the NATURE of the bond changed this excerpt, e.g. acquaintances become lovers \u2014 omit otherwise)\",\"reason\":\"why, one clause\"}],\"knowledge\":[{\"who\":\"Name\",\"fact\":\"one clause\",\"reliability\":\"knows|believes|suspects|wrong|unaware\",\"truth\":\"true|false|unknown\",\"source\":\"how they learned it\"}],\"secrets\":[{\"secret\":\"one clause\",\"keeper\":\"Name\",\"from\":\"Name(s)\",\"method\":\"lie|omission|misdirection|disguise\",\"exposure\":\"how it might surface\",\"danger\":\"minor|major|explosive\"}],\"memories\":[{\"who\":\"Name\",\"about\":\"Name\",\"memory\":\"one vivid sentence from WHO'S point of view\",\"kind\":\"interaction|promise|betrayal|gift|shared|wound|observation\",\"weight\":\"trivial|minor|significant|defining\",\"sentiment\":\"positive|negative|neutral|complex\"}]}. EXTRACTION RULES: use ONLY real character names that appear in the prose \u2014 never {{user}}/{{char}}/placeholders, never unnamed figures (a guard, a servant). KNOWLEDGE: extract when a character learns, realizes, infers, deduces, overhears, or comes to wrongly believe something; truth is the ACTUAL state regardless of belief (wrong+false for a mistaken belief). SECRETS: extract when someone starts concealing something, or a kept secret is exposed/revealed this excerpt. MEMORIES: extract genuine TURNING POINTS a character would personally carry \u2014 a promise, betrayal, confession, gift, wound, first kiss, a vow, a moment of being truly seen; write each from that character's POV; fill weight AND sentiment AND kind for every entry. RELATIONS: dAffection/dTrust are the CHANGE this excerpt caused to how A feels toward B (warmth + trust); positive for warming/earning trust, negative for hurt/betrayal; omit pairs that did not move. Be GENEROUS but TRUE \u2014 capture every real reveal/turning-point you find (do not under-report), but invent nothing the prose does not support. Empty arrays are fine for categories with no new material. No prose outside the JSON.";
 function parseLivingJson(text) {
   let t = String(text || "").replace(/<think[\s\S]*?<\/think>/gi, "").replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   let obj = null;
   try { obj = JSON.parse(t); } catch (e) { const m = t.match(/\{[\s\S]*\}/); if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { obj = null; } } }
   if (!obj) return null;
   return {
-    relations: Array.isArray(obj.relations) ? obj.relations : [],
+    relations: Array.isArray(obj.relations) ? obj.relations.map((r) => ({
+      a: r.a, b: r.b, from: r.from, to: r.to, subject: r.subject, other: r.other,
+      dAffection: r.dAffection, dTrust: r.dTrust,
+      category: typeof r.category === 'string' ? r.category.trim().toLowerCase() : '',
+      reason: r.reason,
+    })) : [],
     knowledge: Array.isArray(obj.knowledge) ? obj.knowledge : [],
     secrets: Array.isArray(obj.secrets) ? obj.secrets : [],
     memories: Array.isArray(obj.memories) ? obj.memories : [],
@@ -2676,11 +2702,13 @@ function parseLivingJson(text) {
 }
 ﻿
 // Apply scored relation deltas from the living pass. Resolves names, creates the
-// edge if missing, applies the delta, pulses on a sentiment change or big swing.
+// edge if missing, applies the delta, evolves the category set, and pulses on a
+// sentiment change, a category change, or a big swing.
 function applyLivingRelations(ch, list, nc) {
   if (!Array.isArray(list)) return 0;
   let n = 0;
   const turn = ch.turns || 0;
+  const day = ch.lastDay || 0;
   for (const d of list) {
     const a = canonName(d.a || d.from || d.subject, nc);
     const b = canonName(d.b || d.to || d.other, nc);
@@ -2688,14 +2716,22 @@ function applyLivingRelations(ch, list, nc) {
     if (!ma || !mb || ma.id === mb.id) continue;
     const dAff = Math.max(-40, Math.min(40, Number(d.dAffection) || 0));
     const dTr = Math.max(-40, Math.min(40, Number(d.dTrust) || 0));
-    if (!dAff && !dTr) continue;
-    // find any existing edge between the pair (ignore category), else create one
+    // a category facet the prose newly established (e.g. "social" → also "romantic")
+    const newCat = (typeof d.category === 'string' && REL_CATEGORIES.has(d.category.trim().toLowerCase()) && d.category.trim().toLowerCase() !== 'neutral') ? d.category.trim().toLowerCase() : '';
+    if (!dAff && !dTr && !newCat) continue; // nothing to record
+    // find any existing edge between the pair (identity = pair), else create one
     let r = ch.relations.find((x) => (x.a === ma.id && x.b === mb.id) || (x.a === mb.id && x.b === ma.id));
     if (!r) {
-      r = relationAdd(ch, { a, b, category: 'neutral', sentiment: 'neutral' }, { source: 'auto' });
+      r = relationAdd(ch, { a, b, category: newCat || 'neutral', sentiment: 'neutral' }, { source: 'auto' });
       if (!r) continue;
+      if (newCat) n++; // brand-new edge already carries the facet
+    } else if (newCat && !(r.userEdited)) {
+      // ADD the facet to the existing bond's set (never strips an existing one)
+      const ev = addRelationCategory(r, newCat, turn, day, d.reason, { source: 'auto' });
+      if (ev.changed) { n++; relationCategoryPulse(ch, r, ev, turn, day, d.reason); }
     }
     if (r.userEdited && r.lockScores) continue; // respect a user who pinned scores
+    if (!dAff && !dTr) continue; // category-only change already handled above
     // orient the delta to the stored edge direction (a feels about b)
     const flip = (r.a === mb.id && r.b === ma.id);
     const res = applyRelDelta(r, flip ? dAff : dAff, flip ? dTr : dTr, d.reason, turn);
@@ -3043,14 +3079,37 @@ function chapterMemoryAdd(ch, input) {
 
 /* ============================================================================
  * RELATIONS — edges between cast members ("Cersei is Tywin's daughter").
- * Stored once as ch.relations = [{ id, a, b, label, category, status,
- * sentiment, source, ... }] where a/b are canonical cast ids. The label is
- * written from a's perspective; the reverse view renders the raw edge rather
- * than auto-inverting the wording (siblings/in-laws make inversion unreliable).
+ * Stored once as ch.relations = [{ id, a, b, label, categories, category,
+ * status, sentiment, source, categoryHistory, ... }] where a/b are canonical
+ * cast ids. The label is written from a's perspective; the reverse view renders
+ * the raw edge rather than auto-inverting the wording (siblings/in-laws make
+ * inversion unreliable).
+ * A bond between two people is ONE edge identified by the unordered pair (see
+ * relPairSig). It carries a SET of co-existing categories (`categories`, e.g.
+ * ["familial","rivalry"] — kin who are also rivals), which gains/loses members
+ * over time; `category` is the synced PRIMARY (highest-rank) kept for back-compat
+ * and filtering, and `categoryHistory` is the add/remove trail.
  * ========================================================================== */
 const REL_CATEGORIES = new Set(['familial', 'romantic', 'alliance', 'rivalry', 'social', 'neutral']);
 const REL_STATUS = new Set(['active', 'past', 'broken', 'secret']);
 const REL_SENTIMENT = new Set(['warm', 'strained', 'hostile', 'complex', 'neutral']);
+// "Maturity" of each category — how settled/specific the bond is. An automatic
+// source (BTS / living pass / cast scan) may ADD a more-defined category freely,
+// but may only REMOVE one when it explicitly says that facet ended/changed
+// (handled by callers via allowRemove). This stops a quiet turn from silently
+// dropping an established romance/family tie. Manual edits ignore this entirely.
+// Rank also picks the synced PRIMARY category from the active set.
+const REL_CAT_RANK = { neutral: 0, social: 1, alliance: 2, rivalry: 2, romantic: 3, familial: 3 };
+function catRank(c) { return REL_CAT_RANK[c] != null ? REL_CAT_RANK[c] : 0; }
+// The primary (single) category for an edge = the highest-rank member of its
+// set, ignoring "neutral" unless that's all there is. Drives `category`, the
+// card accent color, and the legacy category filter.
+function primaryCategory(cats) {
+  const list = (Array.isArray(cats) ? cats : []).filter((c) => REL_CATEGORIES.has(c));
+  const meaningful = list.filter((c) => c !== 'neutral');
+  const pool = meaningful.length ? meaningful : (list.length ? list : ['neutral']);
+  return pool.slice().sort((a, b) => catRank(b) - catRank(a))[0] || 'neutral';
+}
 
 /* --- Relation scoring: two axes, each -100..+100 ---------------------------
  * affection = warmth/liking (love .. hatred)
@@ -3093,8 +3152,82 @@ function ensureRelScores(r) {
   }
   r.affection = REL_CLAMP(r.affection); r.trust = REL_CLAMP(r.trust);
   if (!Array.isArray(r.history)) r.history = [];
+  // Category set: every edge carries a SET of co-existing categories. Migrate a
+  // legacy single `category` string into the set, and always keep `category`
+  // synced to the primary (highest-rank) member so old readers/filters still work.
+  if (!Array.isArray(r.categories)) {
+    const seed = REL_CATEGORIES.has(r.category) ? r.category : 'neutral';
+    r.categories = [seed];
+  }
+  r.categories = normalizeCategorySet(r.categories);
+  r.category = primaryCategory(r.categories);
+  if (!Array.isArray(r.categoryHistory)) {
+    r.categoryHistory = [{ turn: r.firstTurn || 0, day: r.firstDay || 0, op: 'add', category: r.category, categories: r.categories.slice(), reason: '' }];
+  }
   r.sentiment = deriveSentiment(r.affection, r.trust);
   return r;
+}
+// Clean a category set: keep only valid names, de-dupe, drop "neutral" when any
+// meaningful category is present, and never return empty (falls back to neutral).
+function normalizeCategorySet(cats) {
+  let list = Array.from(new Set((Array.isArray(cats) ? cats : []).map((c) => String(c || '').trim().toLowerCase()).filter((c) => REL_CATEGORIES.has(c))));
+  const meaningful = list.filter((c) => c !== 'neutral');
+  if (meaningful.length) list = meaningful;          // neutral is implied-absent once a real bond exists
+  if (!list.length) list = ['neutral'];
+  // stable, rank-desc order so the primary reads first and the UI is consistent
+  return list.sort((a, b) => catRank(b) - catRank(a) || a.localeCompare(b));
+}
+// Add a category facet to an edge's set (e.g. kin who become rivals gain
+// "rivalry" alongside "familial"). Returns { changed, added, categories }.
+// Auto sources add freely; re-adding an existing facet is a no-op.
+function addRelationCategory(r, cat, turn, day, reason, opts) {
+  ensureRelScores(r);
+  const o = opts || {};
+  const c = String(cat || '').trim().toLowerCase();
+  if (!REL_CATEGORIES.has(c) || c === 'neutral') return { changed: false, added: false, categories: r.categories.slice() };
+  if (r.categories.includes(c)) return { changed: false, added: false, categories: r.categories.slice() };
+  r.categories = normalizeCategorySet(r.categories.concat(c));
+  r.category = primaryCategory(r.categories);
+  pushCategoryHistory(r, 'add', c, turn, day, reason);
+  return { changed: true, added: true, categories: r.categories.slice() };
+}
+// Remove a category facet from an edge's set. Auto sources may only remove when
+// explicitly told (allowRemove), so a quiet turn never silently drops a bond.
+// A user edit always wins. Returns { changed, removed, categories }.
+function removeRelationCategory(r, cat, turn, day, reason, opts) {
+  ensureRelScores(r);
+  const o = opts || {};
+  const c = String(cat || '').trim().toLowerCase();
+  if (!r.categories.includes(c)) return { changed: false, removed: false, categories: r.categories.slice() };
+  if (o.source !== 'user' && !o.allowRemove) return { changed: false, removed: false, categories: r.categories.slice() };
+  r.categories = normalizeCategorySet(r.categories.filter((x) => x !== c));
+  r.category = primaryCategory(r.categories);
+  pushCategoryHistory(r, 'remove', c, turn, day, reason);
+  return { changed: true, removed: true, categories: r.categories.slice() };
+}
+// Replace the whole category set (used by manual edits and explicit set ops).
+// Returns { changed, added:[], removed:[], categories }.
+function setRelationCategories(r, next, turn, day, reason, opts) {
+  ensureRelScores(r);
+  const o = opts || {};
+  const target = normalizeCategorySet(next);
+  const before = r.categories.slice();
+  const added = target.filter((c) => !before.includes(c));
+  const removed = before.filter((c) => !target.includes(c));
+  // auto sources can't silently strip facets unless allowed
+  const effRemoved = (o.source === 'user' || o.allowRemove) ? removed : [];
+  if (!added.length && !effRemoved.length) return { changed: false, added: [], removed: [], categories: before };
+  const keep = before.filter((c) => !effRemoved.includes(c));
+  r.categories = normalizeCategorySet(keep.concat(added));
+  r.category = primaryCategory(r.categories);
+  added.forEach((c) => pushCategoryHistory(r, 'add', c, turn, day, reason));
+  effRemoved.forEach((c) => pushCategoryHistory(r, 'remove', c, turn, day, reason));
+  return { changed: true, added, removed: effRemoved, categories: r.categories.slice() };
+}
+function pushCategoryHistory(r, op, cat, turn, day, reason) {
+  if (!Array.isArray(r.categoryHistory)) r.categoryHistory = [];
+  r.categoryHistory.push({ turn: turn || 0, day: day || 0, op, category: cat, categories: r.categories.slice(), reason: String(reason || '').slice(0, 120) });
+  if (r.categoryHistory.length > 40) r.categoryHistory.shift();
 }
 // Apply a scored delta to a relation; records history + re-derives sentiment.
 // Returns { before, after, changed } for notifications.
@@ -3158,6 +3291,48 @@ function resolveOrAddCast(ch, name) {
   return m;
 }
 
+// Collapse pre-evolution duplicate edges: before relations could carry multiple
+// categories, the same pair could hold several edges (one per category). Merge
+// them into ONE edge per pair whose category SET is the UNION of all of them
+// (so familial + rivalry between the same two people becomes one edge with both
+// facets), unioning score + category history, keeping a userEdited survivor.
+function mergeDuplicateRelations(ch) {
+  if (!Array.isArray(ch.relations) || ch.relations.length < 2) return 0;
+  const byPair = new Map();
+  const out = [];
+  let merged = 0;
+  for (const r of ch.relations) {
+    const sig = relPairSig(r.a, r.b);
+    const prev = byPair.get(sig);
+    if (!prev) { byPair.set(sig, r); out.push(r); continue; }
+    merged++;
+    // survivor: user-edited wins, else the newer edge (keeps its label/perspective)
+    const keepR = prev.userEdited && !r.userEdited ? prev
+      : r.userEdited && !prev.userEdited ? r
+      : (r.lastTurn || 0) >= (prev.lastTurn || 0) ? r : prev;
+    const dropR = keepR === prev ? r : prev;
+    // UNION the category sets — both facets coexist on the surviving edge
+    keepR.categories = normalizeCategorySet((keepR.categories || [keepR.category]).concat(dropR.categories || [dropR.category]));
+    keepR.category = primaryCategory(keepR.categories);
+    // union score history, ordered, capped
+    keepR.history = (keepR.history || []).concat(dropR.history || []).sort((a, b) => (a.turn || 0) - (b.turn || 0)).slice(-60);
+    // merge category trails in turn order, capped
+    keepR.categoryHistory = ((prev.categoryHistory) || []).concat((r.categoryHistory) || []).sort((a, b) => (a.turn || 0) - (b.turn || 0)).slice(-40);
+    if (Math.abs(dropR.affection || 0) > Math.abs(keepR.affection || 0)) keepR.affection = dropR.affection;
+    if (Math.abs(dropR.trust || 0) > Math.abs(keepR.trust || 0)) keepR.trust = dropR.trust;
+    keepR.userEdited = keepR.userEdited || dropR.userEdited;
+    keepR.lastTurn = Math.max(keepR.lastTurn || 0, dropR.lastTurn || 0);
+    keepR.firstTurn = Math.min(keepR.firstTurn || 0, dropR.firstTurn || 0);
+    if (!keepR.label && dropR.label) keepR.label = dropR.label;
+    ensureRelScores(keepR);
+    if (keepR !== prev) { // replace prev in out with keepR
+      const idx = out.indexOf(prev); if (idx >= 0) out[idx] = keepR; byPair.set(sig, keepR);
+    }
+  }
+  if (merged) { ch.relations = out; spindle.log.info('[vellum_tracker] merged ' + merged + ' duplicate relation edge(s) into per-pair bonds (categories unioned)'); }
+  return merged;
+}
+
 function relationAdd(ch, input, opts) {
   if (!Array.isArray(ch.relations)) ch.relations = [];
   const o = opts || {};
@@ -3166,18 +3341,39 @@ function relationAdd(ch, input, opts) {
   const ma = resolveOrAddCast(ch, aName);
   const mb = resolveOrAddCast(ch, bName);
   if (!ma || !mb || ma.id === mb.id) return null;
-  const category = REL_CATEGORIES.has(input.category) ? input.category : 'neutral';
-  const sig = relSig(ma.id, mb.id, category);
-  if (o.respectTombstone !== false && isTombstoned(ch, 'rel', sig)) return null; // user deleted — don't resurrect
-  const existing = ch.relations.find((r) => relSig(r.a, r.b, r.category) === sig);
+  // Accept a single `category` and/or a `categories` array; build the set.
+  const inCats = normalizeCategorySet(
+    (Array.isArray(input.categories) ? input.categories : [])
+      .concat(input.category ? [input.category] : [])
+  );
+  const primary = primaryCategory(inCats);
+  const pairSig = relPairSig(ma.id, mb.id);
+  // Tombstone check honors BOTH the new pair signature and the legacy
+  // pair+category signature, so older deletions still suppress resurrection.
+  if (o.respectTombstone !== false && (isTombstoned(ch, 'rel', pairSig) || isTombstoned(ch, 'rel', relSig(ma.id, mb.id, primary)))) return null;
+  // Identity is the PAIR — find any existing edge between these two people,
+  // regardless of its categories, so the bond evolves in place.
+  const existing = ch.relations.find((r) => relPairSig(r.a, r.b) === pairSig);
   const turn = ch.turns || 0;
+  const day = ch.lastDay || 0;
   if (existing) {
-    if (existing.userEdited && o.source !== 'user') return existing; // protect manual edits from auto
+    ensureRelScores(existing);
+    const userLocked = existing.userEdited && o.source !== 'user';
     // Keep the first-seen label/perspective on auto-fold (avoids "A's daughter"
     // flipping to "father of A" when the reverse edge is seen); manual always sets.
     if (input.label && (o.source === 'user' || !existing.label)) existing.label = String(input.label).slice(0, 120);
     if (REL_STATUS.has(input.status)) existing.status = input.status;
     if (REL_SENTIMENT.has(input.sentiment)) existing.sentiment = input.sentiment;
+    // Evolve the category SET in place rather than spawning a duplicate edge.
+    // A user edit replaces the set wholesale; an auto source only ADDS facets
+    // (it won't silently strip an established one), unless allowRemove is set.
+    if (!userLocked && inCats.length && !(inCats.length === 1 && inCats[0] === 'neutral')) {
+      const reason = input.categoryReason || input.label || '';
+      const ev = (o.source === 'user' || o.replaceCategories)
+        ? setRelationCategories(existing, inCats, turn, day, reason, { source: o.source, allowRemove: o.allowRemove })
+        : inCats.reduce((acc, c) => { const a = addRelationCategory(existing, c, turn, day, reason, o); return { changed: acc.changed || a.changed, added: acc.added.concat(a.added ? [c] : []), removed: [] }; }, { changed: false, added: [], removed: [] });
+      if (ev.changed) relationCategoryPulse(ch, existing, ev, turn, day, reason);
+    }
     existing.lastTurn = turn;
     if (o.source === 'user') existing.userEdited = true;
     return existing;
@@ -3185,21 +3381,46 @@ function relationAdd(ch, input, opts) {
   const rel = {
     id: vid('rel'), a: ma.id, b: mb.id,
     label: String(input.label || '').slice(0, 120),
-    category,
+    categories: inCats.length ? inCats : ['neutral'],
+    category: primary,
     status: REL_STATUS.has(input.status) ? input.status : 'active',
     sentiment: REL_SENTIMENT.has(input.sentiment) ? input.sentiment : 'neutral',
     source: o.source === 'user' ? 'user' : 'auto',
-    firstTurn: turn, lastTurn: turn,
+    firstTurn: turn, lastTurn: turn, firstDay: day,
   };
   // seed numeric axes from the given sentiment (or explicit scores), + history
   if (typeof input.affection === 'number' || typeof input.trust === 'number') {
     rel.affection = REL_CLAMP(input.affection); rel.trust = REL_CLAMP(input.trust);
   } else { const s = sentimentToScores(rel.sentiment); rel.affection = s.affection; rel.trust = s.trust; }
   rel.history = [];
+  // seed the category trail with the opening set (+ a cause if given)
+  rel.categoryHistory = [{ turn, day, op: 'add', category: primary, categories: (inCats.length ? inCats : ['neutral']).slice(), reason: String(input.categoryReason || '').slice(0, 120) }];
   ensureRelScores(rel);
   if (o.source === 'user') rel.userEdited = true;
   ch.relations.push(rel);
   return rel;
+}
+
+// Emit a pulse notification when a relation's category set changes (e.g. two
+// people who were "social" also becoming "romantic", or kin gaining "rivalry").
+// Surfaces the added/removed facets in the feed.
+function relationCategoryPulse(ch, r, ev, turn, day, reason) {
+  try {
+    const nameA = ch.cast[r.a] ? ch.cast[r.a].name : r.a;
+    const nameB = ch.cast[r.b] ? ch.cast[r.b].name : r.b;
+    const added = ev.added || [];
+    const removed = ev.removed || [];
+    if (!added.length && !removed.length) return;
+    const bits = [];
+    if (added.length) bits.push('+' + added.join(', '));
+    if (removed.length) bits.push('\u2212' + removed.join(', '));
+    pushPulse(ch, {
+      kind: 'relation', icon: added.length ? '\u2727' : '\u22C5',
+      who: nameA,
+      text: nameA + ' \u2192 ' + nameB + ': now ' + (r.categories || []).join(' + ') + ' (' + bits.join(' ') + ')' + (reason ? ' \u2014 ' + String(reason).slice(0, 120) : ''),
+      relId: r.id, sentiment: r.sentiment, big: true,
+    });
+  } catch (e) { /* pulse is best-effort */ }
 }
 
 function relationEdit(ch, id, input) {
@@ -3209,7 +3430,15 @@ function relationEdit(ch, id, input) {
   if (input.a) { const m = resolveOrAddCast(ch, input.a); if (m) r.a = m.id; }
   if (input.b) { const m = resolveOrAddCast(ch, input.b); if (m) r.b = m.id; }
   if (typeof input.label === 'string') r.label = input.label.slice(0, 120);
-  if (REL_CATEGORIES.has(input.category)) r.category = input.category;
+  // Category set from the editor (manual = always allowed, add AND remove).
+  // Accepts a `categories` array (multi-select) or a single `category` string;
+  // also supports incremental addCategory / removeCategory ops.
+  if (Array.isArray(input.categories) || REL_CATEGORIES.has(input.category)) {
+    const next = Array.isArray(input.categories) ? input.categories : [input.category];
+    setRelationCategories(r, next, ch.turns || 0, ch.lastDay || 0, input.categoryReason || '', { source: 'user' });
+  }
+  if (input.addCategory && REL_CATEGORIES.has(input.addCategory)) addRelationCategory(r, input.addCategory, ch.turns || 0, ch.lastDay || 0, input.categoryReason || '', { source: 'user' });
+  if (input.removeCategory) removeRelationCategory(r, input.removeCategory, ch.turns || 0, ch.lastDay || 0, input.categoryReason || '', { source: 'user' });
   if (REL_STATUS.has(input.status)) r.status = input.status;
   // explicit numeric scores from the editor (sliders); else allow sentiment to seed
   let scored = false;
@@ -3226,6 +3455,9 @@ function relationDelete(ch, id) {
   const i = ch.relations.findIndex((x) => x.id === id);
   if (i < 0) return false;
   const r = ch.relations[i];
+  // Tombstone the PAIR (the bond's identity) so a re-scan won't resurrect it
+  // under any category; also tombstone the legacy pair+category sig for safety.
+  addTombstone(ch, 'rel', relPairSig(r.a, r.b));
   addTombstone(ch, 'rel', relSig(r.a, r.b, r.category));
   ch.relations.splice(i, 1);
   return true;
@@ -3240,7 +3472,7 @@ function applyRelations(ch, list, nc) {
     const a = canonName(r.a || r.from || r.subject, nc);
     const b = canonName(r.b || r.to || r.other, nc);
     const before = ch.relations.length;
-    const res = relationAdd(ch, { a, b, label: r.label, category: r.category, status: r.status, sentiment: r.sentiment }, { source: 'auto' });
+    const res = relationAdd(ch, { a, b, label: r.label, category: r.category, categories: r.categories, status: r.status, sentiment: r.sentiment }, { source: 'auto' });
     if (res && ch.relations.length > before) added++;
   }
   return added;
