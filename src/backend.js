@@ -3779,14 +3779,17 @@ async function handle(chatId, content, userId) {
   if (!parsed && !btsRaw) return;
   const ledger = parsed || { raw: '', time: '', location: '', weather: '', present: '', thoughts: '', arcs: '', offscreen: '', sceneTension: '', bondTension: '' };
   lastStateByChat.set(chatId, { ledger, bts: btsRaw, updatedAt: Date.now() });
-  await syncChatVars(chatId, ledger, btsRaw);
-  const chForRapport = await loadChronicle(chatId); // present-character rapport for the window
-  const userName = await resolveUserName(chatId);
-  broadcast(chatId, ledger, btsRaw, chForRapport, userName);
+  // Broadcast the live window state FIRST and unconditionally — this must never
+  // be blocked by chat-var sync, chronicle load, or persona resolution (any of
+  // which can throw/stall live). Rapport is best-effort on top.
+  broadcast(chatId, ledger, btsRaw);
+  try { await syncChatVars(chatId, ledger, btsRaw); } catch (e) { spindle.log.warn('[vellum_tracker] syncChatVars: ' + (e && e.message)); }
+  let chForRapport = null, userName = null;
+  try { chForRapport = await loadChronicle(chatId); userName = await resolveUserName(chatId); broadcast(chatId, ledger, btsRaw, chForRapport, userName); } catch (e) { spindle.log.warn('[vellum_tracker] rapport broadcast: ' + (e && e.message)); }
 
   // Fold this turn into the long-term chronicle (only when the state is new).
   try {
-    const ch = chForRapport;
+    const ch = chForRapport || await loadChronicle(chatId);
     const sig = sigOf(ledger, btsRaw);
     if (sig !== ch._sig) {
       ch._sig = sig;
