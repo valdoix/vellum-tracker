@@ -2758,22 +2758,23 @@ function revealSensor(text) {
 const livingBusy = new Set();
 async function autoExtract(chatId, userId, opts) {
   const o = opts || {};
-  if (!chatId || livingBusy.has(chatId)) return;
-  if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) return;
+  if (!chatId || livingBusy.has(chatId)) { spindle.log.info('[vellum_tracker] autoEx: skip (no chatId / busy)'); return; }
+  if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) { spindle.log.info('[vellum_tracker] autoEx: skip (no generation perm/api)'); return; }
   livingBusy.add(chatId);
   try {
     const ch = await loadChronicle(chatId);
-    if (ch.autoExtract === false) return; // user disabled (default ON)
-    let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { return; }
-    if (!msgs || !msgs.length) return;
+    if (ch.autoExtract === false) { spindle.log.info('[vellum_tracker] autoEx: disabled'); return; }
+    let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { spindle.log.info('[vellum_tracker] autoEx: readStored failed ' + (e && e.message)); return; }
+    if (!msgs || !msgs.length) { spindle.log.info('[vellum_tracker] autoEx: no msgs'); return; }
     const nc = await resolveNameContext(chatId, msgs);
     const turns = assistantTurns(msgs);
-    if (!turns.length) return;
+    if (!turns.length) { spindle.log.info('[vellum_tracker] autoEx: no assistant turns'); return; }
 
     // Reveal sensor: scan the newest turn's PROSE (BTS/ledger stripped). Skip the
     // LLM call entirely on quiet turns — unless forced (manual / catch-up).
     const newestProse = cleanForSummary(turns[turns.length - 1].ai || '');
     const sensed = revealSensor(newestProse);
+    spindle.log.info('[vellum_tracker] autoEx: proseLen=' + newestProse.length + ' fire=' + sensed.fire + ' kinds=[' + Array.from(sensed.kinds).join(',') + ']');
     if (!o.force && !sensed.fire) {
       spindle.log.info('[vellum_tracker] auto-extract: quiet turn, skipped (sensor)');
       return;
@@ -2798,7 +2799,8 @@ async function autoExtract(chatId, userId, opts) {
     try { raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Recent narrative:\n\n' + excerpt + relCtx + focus }], { temperature: 0.2, max_tokens: 1800 }, userId); }
     catch (e) { spindle.log.warn('[vellum_tracker] auto-extract gen: ' + (e && e.message)); return; }
     const res = parseLivingJson(raw);
-    if (!res) return;
+    if (!res) { spindle.log.info('[vellum_tracker] autoEx: parse failed, raw=' + String(raw).slice(0, 120)); return; }
+    spindle.log.info('[vellum_tracker] autoEx parsed: rel=' + (res.relations || []).length + ' k=' + (res.knowledge || []).length + ' s=' + (res.secrets || []).length + ' mem=' + (res.memories || []).length);
     const before = (ch.pulse || []).length;
     const rN = applyLivingRelations(ch, res.relations, nc);
     const kr = applyKnowResult(ch, { knowledge: res.knowledge || [], secrets: res.secrets || [] }, nc, { pulse: true });
