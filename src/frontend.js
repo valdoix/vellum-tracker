@@ -2068,6 +2068,10 @@ function setupVaultTab(ctx, getChatId) {
 
   function refresh() { ctx.sendToBackend({ type: 'get_vault', chatId: getChatId() }); }
 
+  // transient status line shown under the bar (errors / confirmations)
+  let _status = null;
+  function setStatus(msg, kind) { _status = msg ? { msg, kind: kind || 'info', at: Date.now() } : null; render(); }
+
   // ---- rendering ----
   function entryRow(en) {
     const keys = (en.key || []).join(', ');
@@ -2131,10 +2135,17 @@ function setupVaultTab(ctx, getChatId) {
       body.innerHTML = '<div class="vlc-perm" data-perm-banner="1">\u26A0 Missing permission: <b>world_books</b>. Grant it in the Extensions panel to use the Vault.</div>';
       return;
     }
+    if (!data.ok && data.reason === 'error') {
+      body.innerHTML = '<div class="vlc-perm" data-perm-banner="1">\u26A0 Vault couldn\u2019t load' + (data.detail ? ': ' + escapeHtml(data.detail) : '') + '. <button class="vlv-act" data-vault-refresh style="margin-left:6px">Retry</button></div>';
+      return;
+    }
+    const statusHtml = _status
+      ? '<div class="vlv-status ' + (_status.kind === 'error' ? 'is-err' : 'is-ok') + '">' + escapeHtml(_status.msg) + '</div>'
+      : '';
     const intro = '<div class="vlv-bar">'
       + '<button class="vlv-new" data-vault-book-new>+ New lorebook</button>'
       + '<span class="vlv-hint">Entries inject via the host\u2019s World Info pipeline when their keywords appear. Attach a book to this chat to activate it here.</span>'
-      + '</div>';
+      + '</div>' + statusHtml;
     const books = data.books || [];
     const list = books.length
       ? books.map(bookCard).join('')
@@ -2206,10 +2217,16 @@ function setupVaultTab(ctx, getChatId) {
   return {
     refresh,
     onMessage(p) {
-      if (p.type === 'vellum_vault') { data = p; render(); }
+      if (p.type === 'vellum_vault') { data = p; if (data && data.ok) _status = null; render(); }
       else if (p.type === 'vellum_vault_done') {
-        if (!p.ok && p.reason === 'no_active_chat') { try { ctx.toast && ctx.toast.warning && ctx.toast.warning('Open a chat first to attach/promote.'); } catch (e) {} }
-        // backend re-broadcasts vellum_vault after each op, so render follows.
+        if (p.ok) { setStatus(null); }
+        else {
+          const why = p.reason === 'no_active_chat' ? 'Open a chat first.'
+            : p.reason === 'no_permission' ? 'Grant the world_books permission in the Extensions panel.'
+            : p.reason === 'not_found' ? 'That chronicle entry was not found.'
+            : ('Operation failed' + (p.detail ? ': ' + p.detail : '.'));
+          setStatus('\u26A0 ' + why, 'error');
+        }
       }
     },
     onPerms(g) { granted = g; render(); },
@@ -3146,6 +3163,9 @@ const VELLUM_CSS = [
   ".vlv-new{align-self:flex-start;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid,#cda84e);background:rgba(205,168,78,.16);border:1px solid rgba(205,168,78,.34);border-radius:7px;padding:5px 11px;cursor:pointer}",
   ".vlv-new:hover{background:rgba(205,168,78,.3)}",
   ".vlv-hint{font-size:9.5px;line-height:1.5;opacity:.6}",
+  ".vlv-status{margin:0 0 8px;font:600 10px/1.4 'JetBrains Mono',monospace;border-radius:7px;padding:6px 9px}",
+  ".vlv-status.is-err{color:#e09090;background:rgba(201,106,106,.12);border:1px solid rgba(201,106,106,.34)}",
+  ".vlv-status.is-ok{color:#a9c089;background:rgba(143,166,126,.12);border:1px solid rgba(143,166,126,.34)}",
   ".vlv-books{display:flex;flex-direction:column;gap:8px}",
   ".vlv-book{border:1px solid rgba(205,168,78,.18);border-radius:9px;background:linear-gradient(165deg,rgba(28,25,20,.5),rgba(22,20,16,.4));overflow:hidden}",
   ".vlv-book.is-open{border-color:rgba(205,168,78,.34)}",
