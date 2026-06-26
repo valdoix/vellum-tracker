@@ -4214,143 +4214,6 @@ spindle.on('MESSAGE_SWIPED', async (payload) => {
  * get_state : re-broadcast the cached state for a chat (used when the window opens).
  * parse_content : parse explicit content the frontend supplies (fallback path).
  */
-/* ============================================================================
- * VAULT — in-app lorebook (Lumiverse world_books) management.
- * The Vault is NOT a separate store: it is a thin, VELLUM-flavored surface over
- * the host's own world_books system, so entries authored here use the host's
- * full World Info activation pipeline (keywords, selective logic, vector match,
- * budgets) during prompt assembly — no parallel injector, no double-injection.
- *
- * What VELLUM adds on top of the raw API:
- *   - one-call snapshot of all books + entries for the Vault tab (vaultSnapshot)
- *   - attach/detach a book to the ACTIVE chat (chat.metadata.chat_world_book_ids)
- *     so its entries fire in this story without leaving the tracker
- *   - "promote" a chronicle entry (cast member / secret / chapter memory) into a
- *     world-book entry, pre-seeding sensible keywords from VELLUM's structured data
- *   - which entries actually activated this turn (getActivated), for the live view
- * Everything is permission-gated on `world_books`; reads degrade to empty, writes
- * report a structured reason the UI surfaces.
- * ========================================================================== */
-function wbApi() { return spindle.world_books || null; }
-function hasVaultPerm() { return hasPerm('world_books') && !!wbApi(); }
-
-// Normalize a host WorldBookEntryDTO down to the fields the Vault UI needs.
-function liteEntry(e) {
-  if (!e) return null;
-  return {
-    id: e.id,
-    bookId: e.world_book_id,
-    key: Array.isArray(e.key) ? e.key : [],
-    keysecondary: Array.isArray(e.keysecondary) ? e.keysecondary : [],
-    content: String(e.content || ''),
-    comment: String(e.comment || ''),
-    position: typeof e.position === 'number' ? e.position : 0,
-    depth: typeof e.depth === 'number' ? e.depth : 4,
-    order_value: typeof e.order_value === 'number' ? e.order_value : 100,
-    constant: !!e.constant,
-    selective: !!e.selective,
-    disabled: !!e.disabled,
-    probability: typeof e.probability === 'number' ? e.probability : 100,
-    vellum: !!(e.extensions && e.extensions.vellum), // promoted by VELLUM
-    source: (e.extensions && e.extensions.vellumSource) || '', // 'cast'|'secret'|'memory'|''
-  };
-}
-
-// Build the whole Vault payload: every book the user owns, each with its entries
-// and whether it is attached to the CURRENT chat. One round of host calls.
-async function vaultSnapshot(chatId, userId) {
-  const api = wbApi();
-  if (!api) return { ok: false, reason: 'no_permission', books: [], attached: [], activated: [] };
-  const out = { ok: true, books: [], attached: [], activated: [] };
-  try {
-    // attached-to-this-chat ids live on chat.metadata.chat_world_book_ids
-    if (chatId && spindle.chats && spindle.chats.get) {
-      try { const chat = await spindle.chats.get(chatId, userId); out.attached = (chat && chat.metadata && Array.isArray(chat.metadata.chat_world_book_ids)) ? chat.metadata.chat_world_book_ids.slice() : []; } catch (e) {}
-    }
-    let globalIds = [];
-    try { if (api.getGlobal) globalIds = await api.getGlobal(userId); } catch (e) { globalIds = []; }
-    let listed;
-    try { listed = await api.list({ limit: 200, offset: 0 }, userId); } catch (e) { listed = await api.list({ limit: 200, offset: 0 }); }
-    const books = (listed && Array.isArray(listed.data)) ? listed.data : [];
-    for (const b of books) {
-      let entries = [];
-      try { const le = await api.entries.list(b.id, { limit: 200, offset: 0 }, userId); entries = (le && Array.isArray(le.data)) ? le.data.map(liteEntry).filter(Boolean) : []; }
-      catch (e) { try { const le2 = await api.entries.list(b.id, { limit: 200, offset: 0 }); entries = (le2 && Array.isArray(le2.data)) ? le2.data.map(liteEntry).filter(Boolean) : []; } catch (e2) {} }
-      out.books.push({
-        id: b.id, name: String(b.name || 'Untitled'), description: String(b.description || ''),
-        vellum: !!(b.metadata && b.metadata.vellum),
-        attachedToChat: out.attached.includes(b.id),
-        global: Array.isArray(globalIds) && globalIds.includes(b.id),
-        entries,
-      });
-    }
-    // which entries actually fired for the current scene (best-effort, optional)
-    if (chatId && api.getActivated) {
-      try { const act = await api.getActivated(chatId, userId); if (Array.isArray(act)) out.activated = act.map((a) => ({ id: a.id, comment: a.comment, source: a.source, bookId: a.bookId, bookSource: a.bookSource })); }
-      catch (e) {}
-    }
-  } catch (err) {
-    spindle.log.warn('[vellum_tracker] vaultSnapshot: ' + (err && err.message));
-    if (isPermDenied(err)) return { ok: false, reason: 'no_permission', books: [], attached: [], activated: [] };
-    return { ok: false, reason: 'error', books: [], attached: [], activated: [] };
-  }
-  return out;
-}
-
-async function broadcastVault(chatId, userId) {
-  const snap = await vaultSnapshot(chatId, userId);
-  const uid = userId || _lastUserId;
-  spindle.sendToFrontend(Object.assign({ type: 'vellum_vault', chatId }, snap), uid);
-}
-
-// Attach / detach a world book to the ACTIVE chat by editing its metadata array.
-// This is what makes a Vault book's entries actually inject in THIS story.
-async function setBookAttached(chatId, bookId, attach, userId) {
-  if (!chatId || !bookId || !spindle.chats || !spindle.chats.get || !spindle.chats.update) return false;
-  const chat = await spindle.chats.get(chatId, userId);
-  if (!chat) return false;
-  const meta = Object.assign({}, chat.metadata || {});
-  const cur = Array.isArray(meta.chat_world_book_ids) ? meta.chat_world_book_ids.slice() : [];
-  const has = cur.includes(bookId);
-  let next = cur;
-  if (attach && !has) next = cur.concat(bookId);
-  else if (!attach && has) next = cur.filter((x) => x !== bookId);
-  else return true; // already in desired state
-  meta.chat_world_book_ids = next;
-  await spindle.chats.update(chatId, { metadata: meta }, userId);
-  return true;
-}
-
-// Promote a VELLUM chronicle entry into a world-book entry. `kind` is
-// 'cast'|'secret'|'memory'; `id` indexes into the chronicle. Seeds keywords +
-// content from the structured data and tags the entry as VELLUM-authored.
-function buildPromotion(ch, kind, id) {
-  if (kind === 'cast') {
-    const c = ch.cast && ch.cast[id];
-    if (!c) return null;
-    const keys = [c.name].concat(Array.isArray(c.aka) ? c.aka : []).filter(Boolean);
-    const bits = [];
-    if (c.age) bits.push('Age: ' + c.age);
-    if (c.role) bits.push('Role: ' + c.role);
-    if (c.appearance) bits.push('Appearance: ' + c.appearance);
-    if (c.note) bits.push(c.note);
-    return { key: keys, content: c.name + (bits.length ? ' — ' + bits.join('. ') : ''), comment: 'VELLUM cast: ' + c.name, source: 'cast' };
-  }
-  if (kind === 'secret') {
-    const s = (ch.secrets || []).find((x) => x.id === id);
-    if (!s) return null;
-    const keys = [s.keeper].filter(Boolean);
-    return { key: keys, content: (s.keeper ? s.keeper + ' keeps a secret: ' : 'Secret: ') + s.secret + (s.from ? ' (hidden from ' + s.from + ')' : ''), comment: 'VELLUM secret: ' + String(s.secret).slice(0, 40), source: 'secret' };
-  }
-  if (kind === 'memory') {
-    const m = (ch.memories || []).find((x) => x.id === id);
-    if (!m) return null;
-    const keys = Array.isArray(m.keywords) && m.keywords.length ? m.keywords.slice(0, 8) : (m.title ? [m.title] : []);
-    return { key: keys, content: String(m.gist || m.text || m.summary || ''), comment: 'VELLUM memory: ' + String(m.title || m.gist || '').slice(0, 40), source: 'memory' };
-  }
-  return null;
-}
-
 spindle.onFrontendMessage(async (payload, userId) => {
   try {
     rememberUser(userId);
@@ -4382,11 +4245,11 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (payload?.type === 'check_perms') {
-      let granted = ['chats', 'chat_mutation', 'generation', 'world_books'].filter((p) => hasPerm(p));
+      let granted = ['chats', 'chat_mutation', 'generation'].filter((p) => hasPerm(p));
       try {
         if (spindle.permissions && spindle.permissions.getGranted) {
           const g = await spindle.permissions.getGranted();
-          if (Array.isArray(g)) granted = ['chats', 'chat_mutation', 'generation', 'world_books'].filter((p) => g.includes(p));
+          if (Array.isArray(g)) granted = ['chats', 'chat_mutation', 'generation'].filter((p) => g.includes(p));
         }
       } catch (e) { /* use sync result */ }
       spindle.sendToFrontend({ type: 'vellum_perms', granted }, userId);
@@ -4691,91 +4554,6 @@ spindle.onFrontendMessage(async (payload, userId) => {
     if (payload?.type === 'clear_all') {
       const chatId = await resolveChatId(payload.chatId, userId);
       await clearAllData(chatId, userId);
-      return;
-    }
-    /* ---------- VAULT (in-app lorebook) ---------- */
-    if (payload?.type === 'get_vault') {
-      const chatId = await resolveChatId(payload.chatId, userId);
-      await broadcastVault(chatId, userId);
-      return;
-    }
-    if (payload?.type === 'vault_book_create' || payload?.type === 'vault_book_update'
-      || payload?.type === 'vault_book_delete' || payload?.type === 'vault_book_attach'
-      || payload?.type === 'vault_entry_create' || payload?.type === 'vault_entry_update'
-      || payload?.type === 'vault_entry_delete' || payload?.type === 'vault_promote') {
-      const tp = payload.type;
-      const done = (ok, extra) => spindle.sendToFrontend(Object.assign({ type: 'vellum_vault_done', op: tp, ok }, extra || {}), userId);
-      if (!hasVaultPerm()) { done(false, { reason: 'no_permission' }); return; }
-      const api = wbApi();
-      const chatId = await resolveChatId(payload.chatId, userId);
-      try {
-        if (tp === 'vault_book_create') {
-          const b = await api.create({ name: String(payload.name || 'New Lorebook').slice(0, 120), description: String(payload.description || '').slice(0, 400), metadata: { vellum: true } }, userId);
-          if (b && b.id && payload.attach && chatId) { try { await setBookAttached(chatId, b.id, true, userId); } catch (e) {} }
-          done(!!b, { bookId: b && b.id });
-        } else if (tp === 'vault_book_update') {
-          await api.update(payload.bookId, { name: payload.name, description: payload.description }, userId);
-          done(true);
-        } else if (tp === 'vault_book_delete') {
-          if (chatId) { try { await setBookAttached(chatId, payload.bookId, false, userId); } catch (e) {} }
-          await api.delete(payload.bookId, userId);
-          done(true);
-        } else if (tp === 'vault_book_attach') {
-          if (!chatId) { done(false, { reason: 'no_active_chat' }); return; }
-          const okA = await setBookAttached(chatId, payload.bookId, !!payload.attach, userId);
-          done(okA, { reason: okA ? undefined : 'error' });
-        } else if (tp === 'vault_entry_create') {
-          const e = payload.entry || {};
-          const created = await api.entries.create(payload.bookId, {
-            key: Array.isArray(e.key) ? e.key : String(e.key || '').split(',').map((s) => s.trim()).filter(Boolean),
-            keysecondary: Array.isArray(e.keysecondary) ? e.keysecondary : String(e.keysecondary || '').split(',').map((s) => s.trim()).filter(Boolean),
-            content: String(e.content || ''),
-            comment: String(e.comment || ''),
-            constant: !!e.constant,
-            selective: !!e.selective,
-            disabled: !!e.disabled,
-          }, userId);
-          done(!!created, { entryId: created && created.id });
-        } else if (tp === 'vault_entry_update') {
-          const e = payload.entry || {};
-          const patch = {};
-          if (e.key !== undefined) patch.key = Array.isArray(e.key) ? e.key : String(e.key || '').split(',').map((s) => s.trim()).filter(Boolean);
-          if (e.keysecondary !== undefined) patch.keysecondary = Array.isArray(e.keysecondary) ? e.keysecondary : String(e.keysecondary || '').split(',').map((s) => s.trim()).filter(Boolean);
-          if (e.content !== undefined) patch.content = String(e.content || '');
-          if (e.comment !== undefined) patch.comment = String(e.comment || '');
-          if (e.constant !== undefined) patch.constant = !!e.constant;
-          if (e.selective !== undefined) patch.selective = !!e.selective;
-          if (e.disabled !== undefined) patch.disabled = !!e.disabled;
-          await api.entries.update(payload.entryId, patch, userId);
-          done(true);
-        } else if (tp === 'vault_entry_delete') {
-          await api.entries.delete(payload.entryId, userId);
-          done(true);
-        } else if (tp === 'vault_promote') {
-          if (!chatId) { done(false, { reason: 'no_active_chat' }); return; }
-          const ch = await loadChronicle(chatId);
-          const p = buildPromotion(ch, payload.kind, payload.id);
-          if (!p) { done(false, { reason: 'not_found' }); return; }
-          let bookId = payload.bookId;
-          if (!bookId) {
-            let listed; try { listed = await api.list({ limit: 200, offset: 0 }, userId); } catch (e) { listed = await api.list({ limit: 200, offset: 0 }); }
-            const books = (listed && Array.isArray(listed.data)) ? listed.data : [];
-            const mine = books.find((b) => b.metadata && b.metadata.vellum);
-            if (mine) bookId = mine.id;
-            else { const nb = await api.create({ name: 'VELLUM Vault', description: 'Lore promoted from the VELLUM chronicle', metadata: { vellum: true } }, userId); bookId = nb && nb.id; if (bookId && chatId) { try { await setBookAttached(chatId, bookId, true, userId); } catch (e) {} } }
-          }
-          if (!bookId) { done(false, { reason: 'error' }); return; }
-          const created = await api.entries.create(bookId, {
-            key: p.key, content: p.content, comment: p.comment, constant: false, selective: false,
-            extensions: { vellum: true, vellumSource: p.source },
-          }, userId);
-          done(!!created, { entryId: created && created.id, bookId });
-        }
-      } catch (err) {
-        spindle.log.warn('[vellum_tracker] vault op ' + tp + ': ' + (err && err.message));
-        done(false, { reason: isPermDenied(err) ? 'no_permission' : 'error' });
-      }
-      try { await broadcastVault(chatId, userId); } catch (e) {}
       return;
     }
     if (payload?.type === 'rebuild_chronicle') {
