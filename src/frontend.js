@@ -2217,15 +2217,52 @@ function graphModel(ch) {
     deg[r.a] = (deg[r.a] || 0) + 1; deg[r.b] = (deg[r.b] || 0) + 1;
     const cat = graphPrimaryCat(r);
     const intensity = Math.max(Math.abs(r.affection || 0), Math.abs(r.trust || 0));
-    edges.push({ id: r.id, a: r.a, b: r.b, cat, sentiment: r.sentiment || 'neutral', intensity, label: r.label || '', categories: (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'], affection: r.affection || 0, trust: r.trust || 0, status: r.status || 'active' });
+    edges.push({ id: r.id, a: r.a, b: r.b, cat, sentiment: r.sentiment || 'neutral', intensity, label: r.label || '', categories: (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'], affection: r.affection || 0, trust: r.trust || 0, status: r.status || 'active',
+      // time-travel data for the scrubber (Phase 3)
+      firstTurn: r.firstTurn || 0, history: Array.isArray(r.history) ? r.history : [], categoryHistory: Array.isArray(r.categoryHistory) ? r.categoryHistory : [] });
   }
+  const firstTurnByNode = {};
+  for (const id of Object.keys(cast)) { const c = cast[id]; if (typeof c.firstTurn === 'number') firstTurnByNode[id] = c.firstTurn; }
   const ids = Object.keys(cast).filter((id) => deg[id] || presentIds.has(id));
   const nodes = ids.map((id) => {
     const c = cast[id];
     const present = presentIds.has(id);
-    return { id, name: c.name || id, degree: deg[id] || 0, present, status: c.status || 'active', user: c.source === 'user', role: c.role || '' };
+    return { id, name: c.name || id, degree: deg[id] || 0, present, status: c.status || 'active', user: c.source === 'user', role: c.role || '', firstTurn: firstTurnByNode[id] || 0 };
   });
-  return { nodes, edges };
+  // overall turn span for the time scrubber
+  let maxTurn = (ch && ch.turns) || 0;
+  edges.forEach((e) => { maxTurn = Math.max(maxTurn, e.firstTurn || 0); (e.history || []).forEach((h) => { maxTurn = Math.max(maxTurn, h.turn || 0); }); });
+  return { nodes, edges, maxTurn };
+}
+
+// Reconstruct an edge's state AS OF turn T from its history trails. Returns
+// null if the bond didn't exist yet. Affection/trust = last recorded sample
+// at/under T (or the firstTurn seed); categories = those added at/under T.
+function edgeStateAt(e, T) {
+  if ((e.firstTurn || 0) > T) return null; // bond not formed yet
+  let aff = e.affection, tr = e.trust;
+  const hist = (e.history || []).filter((h) => (h.turn || 0) <= T);
+  if (hist.length) { const last = hist[hist.length - 1]; if (typeof last.affection === 'number') aff = last.affection; if (typeof last.trust === 'number') tr = last.trust; }
+  else if ((e.history || []).length) { aff = 0; tr = 0; } // had history but none yet by T → started neutral
+  // categories present by turn T (fall back to current set if no trail)
+  let cats = e.categories;
+  const ch = (e.categoryHistory || []).filter((h) => (h.turn || 0) <= T);
+  if (ch.length) { const active = ch[ch.length - 1]; if (Array.isArray(active.categories) && active.categories.length) cats = active.categories; }
+  return { affection: aff, trust: tr, categories: cats, intensity: Math.max(Math.abs(aff), Math.abs(tr)), sentiment: graphSentiment(aff, tr) };
+}
+
+// Frontend mirror of backend deriveSentiment (keep thresholds in sync).
+function graphSentiment(affection, trust) {
+  const a = Math.max(-100, Math.min(100, affection || 0)), t = Math.max(-100, Math.min(100, trust || 0));
+  const mag = Math.max(Math.abs(a), Math.abs(t));
+  if (mag < 12) return 'neutral';
+  if (Math.abs(a - t) >= 70) return 'complex';
+  const avg = (a + t) / 2;
+  if (avg >= 45) return 'warm';
+  if (avg <= -45) return 'hostile';
+  if (avg < 0) return 'strained';
+  if (a >= 25 && t >= 25) return 'warm';
+  return 'complex';
 }
 
 // Force-directed layout. Small casts → run synchronously, cache by signature.
@@ -2347,8 +2384,16 @@ function castGraphHtml(ch) {
   const cats = Array.from(new Set(model.edges.map((e) => e.cat)));
   const legend = cats.map((c) => '<button class="vlg-leg" data-graph-cat="' + c + '"><span class="vlg-leg-dot" style="background:' + (GRAPH_CAT_COLORS[c] || '#888') + '"></span>' + escapeHtml(c) + '</button>').join('');
   const facToggle = fac.factions.length ? ('<button class="vlg-tool wide on" data-graph-factions title="Toggle faction hulls">\u25C7 ' + fac.factions.length + ' faction' + (fac.factions.length === 1 ? '' : 's') + '</button>') : '';
+  // time scrubber — only when there's evolution to replay (history trails exist)
+  const maxTurn = model.maxTurn || 0;
+  const hasHistory = maxTurn > 0 && model.edges.some((e) => (e.history && e.history.length) || (e.categoryHistory && e.categoryHistory.length > 1) || (e.firstTurn || 0) > 0);
+  const scrubber = hasHistory ? ('<div class="vlg-scrub" data-graph-scrub>'
+    + '<button class="vlg-tool" data-graph-play title="Play the story\u2019s evolution">\u25B6</button>'
+    + '<input class="vlg-range" type="range" min="0" max="' + maxTurn + '" value="' + maxTurn + '" data-graph-time>'
+    + '<span class="vlg-time" data-graph-timelbl>now</span>'
+    + '</div>') : '';
 
-  return '<div class="vlg-wrap" data-graph data-graph-cat="all" data-factions="on">'
+  return '<div class="vlg-wrap" data-graph data-graph-cat="all" data-factions="on" data-maxturn="' + maxTurn + '">'
     + '<div class="vlg-toolbar">'
       + '<div class="vlg-legend"><button class="vlg-leg on" data-graph-cat="all">all</button>' + legend + '</div>'
       + '<div class="vlg-tools">' + facToggle
@@ -2362,7 +2407,8 @@ function castGraphHtml(ch) {
       + '</svg>'
       + '<div class="vlg-tip" data-graph-tip hidden></div>'
     + '</div>'
-    + '<div class="vlg-hint">Hover to focus \u00b7 click a node to isolate \u00b7 drag a node to arrange \u00b7 click a line to edit \u00b7 drag canvas to pan, scroll to zoom</div>'
+    + scrubber
+    + '<div class="vlg-hint">Hover to focus \u00b7 click a node to isolate \u00b7 drag a node to arrange \u00b7 click a line to edit' + (hasHistory ? ' \u00b7 scrub the timeline to replay how bonds formed' : '') + '</div>'
     + '</div>';
 }
 
@@ -2710,6 +2756,72 @@ function wireCastGraph(ctx, root, body, getChatId) {
     dragging = false; panning = false; dragId = null;
   });
   body.addEventListener('wheel', (e) => { const svg = e.target.closest('[data-graph-svg]'); if (!svg) return; e.preventDefault(); view.z = Math.max(0.4, Math.min(3, view.z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))); applyView(); }, { passive: false });
+
+  /* ---- Phase 3: time scrubber — replay how bonds formed & evolved ---- */
+  let playTimer = null;
+  const SENT_DASH = { hostile: '2 5', strained: '7 4' };
+  // Restyle the graph to its state as of turn T (T===max → present/full).
+  function renderTime(T) {
+    if (!_graph) return;
+    const w = wrap(); if (!w) return;
+    const maxT = _graph.model.maxTurn || 0;
+    const isNow = T >= maxT;
+    w.classList.toggle('vlg-timetravel', !isNow);
+    const liveNodes = new Set();
+    // edges: hide unformed bonds, restyle the rest to their past values
+    _graph.model.edges.forEach((e) => {
+      const eg = w.querySelector('.vlg-edge[data-edge="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]');
+      if (!eg) return;
+      const st = isNow ? { affection: e.affection, trust: e.trust, categories: e.categories, intensity: e.intensity, sentiment: e.sentiment } : edgeStateAt(e, T);
+      if (!st) { eg.style.display = 'none'; return; }
+      eg.style.display = '';
+      liveNodes.add(e.a); liveNodes.add(e.b);
+      const cat = st.categories.slice().sort((x, y) => (GRAPH_RANK[y] || 0) - (GRAPH_RANK[x] || 0))[0] || 'neutral';
+      const col = GRAPH_CAT_COLORS[cat] || GRAPH_CAT_COLORS.neutral;
+      const wd = (1.2 + (st.intensity / 100) * 4).toFixed(2);
+      const line = eg.querySelector('.vlg-edge-line');
+      if (line) { line.setAttribute('stroke', col); line.setAttribute('stroke-width', wd); const dash = SENT_DASH[st.sentiment]; if (dash) line.setAttribute('stroke-dasharray', dash); else line.removeAttribute('stroke-dasharray'); }
+      const multi = eg.querySelector('.vlg-edge-multi');
+      if (multi) { if (st.categories.length > 1) { multi.style.display = ''; multi.setAttribute('stroke', GRAPH_CAT_COLORS[st.categories[1]] || '#fff'); } else { multi.style.display = 'none'; } }
+    });
+    // nodes: dim those not yet introduced / without any bond yet
+    _graph.model.nodes.forEach((nd) => {
+      const g = w.querySelector('.vlg-node[data-node="' + (window.CSS && CSS.escape ? CSS.escape(nd.id) : nd.id) + '"]');
+      if (!g) return;
+      const born = isNow || (nd.firstTurn || 0) <= T;
+      const active = isNow || liveNodes.has(nd.id) || born;
+      g.classList.toggle('vlg-unborn', !active);
+    });
+    // hulls: recompute over only the nodes that currently have bonds
+    (_graph.factions || []).forEach((f, fi) => {
+      const hg = w.querySelector('.vlg-hull[data-hull="' + fi + '"]');
+      if (!hg) return;
+      const live = isNow ? f.members : f.members.filter((id) => liveNodes.has(id));
+      const geo = live.length >= 2 ? hullGeometry(live, _graph.pos, 46) : null;
+      const fill = hg.querySelector('.vlg-hull-fill');
+      if (geo && fill) { fill.setAttribute('d', geo.d); hg.style.display = ''; } else { hg.style.display = isNow ? '' : 'none'; }
+    });
+    const lbl = w.querySelector('[data-graph-timelbl]');
+    if (lbl) lbl.textContent = isNow ? 'now' : ('turn ' + T);
+  }
+  function stopPlay() { if (playTimer) { clearInterval(playTimer); playTimer = null; } const w = wrap(); const b = w && w.querySelector('[data-graph-play]'); if (b) b.textContent = '\u25B6'; }
+  function startPlay() {
+    const w = wrap(); if (!w) return;
+    const range = w.querySelector('[data-graph-time]'); if (!range) return;
+    const maxT = parseInt(range.max, 10) || 0;
+    let t = (parseInt(range.value, 10) >= maxT) ? 0 : parseInt(range.value, 10);
+    const b = w.querySelector('[data-graph-play]'); if (b) b.textContent = '\u2225';
+    playTimer = setInterval(() => {
+      t += Math.max(1, Math.round(maxT / 60));
+      if (t >= maxT) { t = maxT; range.value = t; renderTime(t); stopPlay(); return; }
+      range.value = t; renderTime(t);
+    }, 110);
+  }
+  // scrubber events
+  body.addEventListener('input', (e) => { const r = e.target.closest('[data-graph-time]'); if (r) { stopPlay(); renderTime(parseInt(r.value, 10)); } });
+  body.addEventListener('click', (e) => {
+    if (e.target.closest('[data-graph-play]')) { if (playTimer) stopPlay(); else startPlay(); }
+  });
 
   // re-apply focus highlight after a re-render (renderCast replaces innerHTML)
   root._reapplyGraph = () => { if (focus) setHighlight(null); };
@@ -3412,6 +3524,14 @@ const VELLUM_CSS = [
   ".vlg-node.vlg-dragging{cursor:grabbing}",
   ".vlg-node.vlg-dragging .vlg-node-c{stroke:var(--vsolid,#cda84e);stroke-width:3.4}",
   ".vlg-node{cursor:grab}",
+  /* time scrubber (Phase 3) */
+  ".vlg-scrub{display:flex;align-items:center;gap:9px;padding:4px 6px 2px}",
+  ".vlg-range{flex:1;-webkit-appearance:none;appearance:none;height:4px;border-radius:3px;background:linear-gradient(90deg,rgba(205,168,78,.5),rgba(205,168,78,.18));outline:none;cursor:pointer}",
+  ".vlg-range::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;border-radius:50%;background:var(--vsolid,#cda84e);border:2px solid #1a1610;box-shadow:0 0 6px rgba(205,168,78,.6);cursor:grab}",
+  ".vlg-range::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--vsolid,#cda84e);border:2px solid #1a1610;cursor:grab}",
+  ".vlg-time{flex:none;min-width:48px;text-align:right;font:600 9.5px/1 'JetBrains Mono',monospace;letter-spacing:.5px;color:var(--vsolid,#cda84e);opacity:.85}",
+  ".vlg-unborn{opacity:.08;transition:opacity .25s}",
+  ".vlg-timetravel .vlg-edge{transition:opacity .2s}",
   ".vlc-rel-evtrail{display:flex;flex-wrap:wrap;align-items:center;gap:3px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px}",
   ".vlc-rel-ev{padding:1px 5px;border-radius:6px;border:1px solid rgba(205,168,78,.22);opacity:.85}",
   ".vlc-rel-ev.ev-add{color:#a9c089;border-color:rgba(143,166,126,.4)}",
