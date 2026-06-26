@@ -2101,6 +2101,108 @@ function _hash01(s) {
   return ((h >>> 0) % 100000) / 100000;
 }
 
+// Muted, distinct hull colors for factions (sit behind the nodes).
+const FACTION_COLORS = ['#cda84e', '#8fa67e', '#7ea6b0', '#b48ed0', '#c97a9a', '#d8a05a', '#6fb0a6', '#c98a6a', '#9bb06f'];
+// Module-held geometry of the currently rendered graph, so the interaction
+// layer (drag) can recompute edge/hull paths live without a full re-render.
+let _graph = null;
+
+// Quadratic-bezier path for an edge, with a deterministic perpendicular "bow"
+// so reciprocal/crossing edges fan apart. Shared by render + live drag.
+function edgePathD(pa, pb, eid) {
+  const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
+  const dx = pb.x - pa.x, dy = pb.y - pa.y;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  const bow = Math.min(60, len * 0.12) * (_hash01(eid) - 0.5) * 2;
+  const cxp = mx + (-dy / len) * bow, cyp = my + (dx / len) * bow;
+  return 'M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1);
+}
+
+// Andrew's monotone-chain convex hull. Returns hull points CCW.
+function convexHull(points) {
+  const p = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (p.length < 3) return p;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  for (const pt of p) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], pt) <= 0) lower.pop(); lower.push(pt); }
+  const upper = [];
+  for (let i = p.length - 1; i >= 0; i--) { const pt = p[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], pt) <= 0) upper.pop(); upper.push(pt); }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+
+// A smooth, padded closed blob enclosing the faction's member nodes. We sample
+// a ring around each member, hull the union, then round the corners with
+// quadratic midpoints — so 2-member and N-member factions both look organic.
+function hullGeometry(memberIds, pos, pad) {
+  const samples = [];
+  memberIds.forEach((id) => { const p = pos[id]; if (!p) return; for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; samples.push([p.x + Math.cos(a) * pad, p.y + Math.sin(a) * pad]); } });
+  if (samples.length < 3) return null;
+  const hull = convexHull(samples);
+  if (hull.length < 3) return null;
+  let d = '';
+  for (let i = 0; i < hull.length; i++) {
+    const cur = hull[i], next = hull[(i + 1) % hull.length];
+    const mx = (cur[0] + next[0]) / 2, my = (cur[1] + next[1]) / 2;
+    if (i === 0) { const prev = hull[hull.length - 1]; d = 'M' + ((prev[0] + cur[0]) / 2).toFixed(1) + ',' + ((prev[1] + cur[1]) / 2).toFixed(1); }
+    d += ' Q' + cur[0].toFixed(1) + ',' + cur[1].toFixed(1) + ' ' + mx.toFixed(1) + ',' + my.toFixed(1);
+  }
+  d += ' Z';
+  // label anchor = topmost hull point
+  let top = hull[0]; for (const h of hull) if (h[1] < top[1]) top = h;
+  return { d, labelX: top[0], labelY: top[1] };
+}
+
+// Title-case a token.
+function _titleCase(s) { s = String(s || ''); return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : s; }
+
+// Name a faction: the surname/token shared by the most members (e.g. two
+// "Lannister"s → "Lannister"); else the most-connected member's circle.
+function factionLabel(memberIds, model) {
+  const byId = {}; model.nodes.forEach((n) => { byId[n.id] = n; });
+  const freq = {};
+  memberIds.forEach((id) => {
+    const nm = (byId[id] && byId[id].name) || '';
+    const toks = nm.split(/\s+/).filter((w) => w.length >= 3);
+    const surname = toks.length > 1 ? toks[toks.length - 1] : '';
+    if (surname) { const key = surname.toLowerCase(); freq[key] = (freq[key] || 0) + 1; }
+  });
+  let best = '', bestN = 1;
+  for (const k of Object.keys(freq)) if (freq[k] > bestN) { best = k; bestN = freq[k]; }
+  if (best && bestN >= 2) return _titleCase(best);
+  // fallback: highest-degree member
+  let top = null; memberIds.forEach((id) => { const n = byId[id]; if (n && (!top || n.degree > top.degree)) top = n; });
+  return top ? top.name + '\u2019s circle' : 'Faction';
+}
+
+// Cluster the cast into factions via union-find over BINDING edges (familial +
+// alliance — the bonds that define who stands together). Components of >=2 are
+// factions; each gets a label + color. Returns { factions, byNode }.
+function graphFactions(model) {
+  const parent = {}; model.nodes.forEach((n) => { parent[n.id] = n.id; });
+  const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+  for (const e of model.edges) {
+    const cats = e.categories || [e.cat];
+    if (cats.includes('familial') || cats.includes('alliance')) union(e.a, e.b);
+  }
+  const groups = {};
+  model.nodes.forEach((n) => { const r = find(n.id); (groups[r] = groups[r] || []).push(n.id); });
+  const factions = []; const byNode = {};
+  let idx = 0;
+  for (const k of Object.keys(groups)) {
+    const members = groups[k];
+    if (members.length < 2) continue;
+    const color = FACTION_COLORS[idx % FACTION_COLORS.length];
+    const fi = factions.length;
+    factions.push({ id: k, members, label: factionLabel(members, model), color });
+    members.forEach((id) => { (byNode[id] = byNode[id] || []).push(fi); });
+    idx++;
+  }
+  return { factions, byNode };
+}
+
+
 // Build node/edge model from the chronicle. Only characters that participate in
 // at least one relation are shown (a graph of isolated dots helps no one),
 // unless they're present/active — those always appear as context.
@@ -2127,13 +2229,17 @@ function graphModel(ch) {
 }
 
 // Force-directed layout. Small casts → run synchronously, cache by signature.
-function graphLayout(model) {
+function graphLayout(model, factions) {
   const W = 1000, H = 720; // virtual canvas; SVG viewBox scales it responsively
   const sig = model.nodes.map((n) => n.id).sort().join(',') + '|' + model.edges.map((e) => e.id).sort().join(',');
   if (_graphLayoutCache.sig === sig && _graphLayoutCache.pos) return { pos: _graphLayoutCache.pos, W, H };
   const n = model.nodes.length;
   const pos = {};
   if (!n) { _graphLayoutCache.sig = sig; _graphLayoutCache.pos = pos; return { pos, W, H }; }
+  // faction membership → a per-faction gravity well so allied/kin nodes cluster
+  const facOf = {};
+  (factions || []).forEach((f, fi) => { f.members.forEach((id) => { facOf[id] = fi; }); });
+  const nFac = (factions || []).length;
   // seed on a jittered circle (deterministic) so layout is stable run-to-run
   const cx = W / 2, cy = H / 2, R = Math.min(W, H) * 0.36;
   model.nodes.forEach((node, i) => {
@@ -2141,7 +2247,9 @@ function graphLayout(model) {
     const rr = R * (0.55 + 0.45 * _hash01(node.id + 'r'));
     pos[node.id] = { x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr, vx: 0, vy: 0 };
   });
-  const idx = {}; model.nodes.forEach((nd, i) => { idx[nd.id] = i; });
+  // each faction gets its own anchor point spread around the canvas center
+  const facAnchor = {};
+  for (let fi = 0; fi < nFac; fi++) { const a = (fi / Math.max(1, nFac)) * Math.PI * 2; facAnchor[fi] = { x: cx + Math.cos(a) * R * 0.5, y: cy + Math.sin(a) * R * 0.5 }; }
   const k = Math.sqrt((W * H) / Math.max(1, n)) * 0.62; // ideal spacing
   const ITER = n > 40 ? 160 : 300;
   for (let it = 0; it < ITER; it++) {
@@ -2169,10 +2277,12 @@ function graphLayout(model) {
       pa.vx -= (dx / d) * f; pa.vy -= (dy / d) * f;
       pb.vx += (dx / d) * f; pb.vy += (dy / d) * f;
     }
-    // gravity toward center + integrate with cooling
+    // gravity toward center (+ faction well) and integrate with cooling
     for (const nd of model.nodes) {
       const p = pos[nd.id];
-      p.vx += (cx - p.x) * 0.008; p.vy += (cy - p.y) * 0.008;
+      p.vx += (cx - p.x) * 0.006; p.vy += (cy - p.y) * 0.006;
+      const fi = facOf[nd.id];
+      if (fi !== undefined && facAnchor[fi]) { p.vx += (facAnchor[fi].x - p.x) * 0.02; p.vy += (facAnchor[fi].y - p.y) * 0.02; }
       p.x += Math.max(-30, Math.min(30, p.vx)) * t;
       p.y += Math.max(-30, Math.min(30, p.vy)) * t;
       p.vx *= 0.85; p.vy *= 0.85;
@@ -2189,36 +2299,44 @@ function castGraphHtml(ch) {
   if (!model.nodes.length || !model.edges.length) {
     return '<div class="vlc-empty">No relationship graph yet.<br><span style="opacity:.7;font-size:10px">Bonds appear here once characters relate. Hit \u2756 Scan, play a few turns, or add a relation.</span></div>';
   }
-  const { pos, W, H } = graphLayout(model);
+  const fac = graphFactions(model);
+  const { pos, W, H } = graphLayout(model, fac.factions);
   const nodeR = (nd) => 13 + Math.min(16, nd.degree * 2.2) + (nd.present ? 3 : 0);
+  // expose live geometry to the drag handler so it can re-path without re-layout
+  _graph = { model, pos, factions: fac.factions, W, H, nodeR };
 
-  // edges first (under nodes). curved quadratic for elegance + reduced overlap.
+  // faction hulls (under everything). One soft blob per faction, tinted + labeled.
+  const hullSvg = fac.factions.map((f, fi) => {
+    const g = hullGeometry(f.members, pos, 46);
+    if (!g) return '';
+    return '<g class="vlg-hull" data-hull="' + fi + '">'
+      + '<path class="vlg-hull-fill" d="' + g.d + '" fill="' + f.color + '"/>'
+      + '<text class="vlg-hull-label" x="' + g.labelX.toFixed(1) + '" y="' + (g.labelY - 10).toFixed(1) + '" text-anchor="middle" fill="' + f.color + '">' + escapeHtml(f.label) + '</text>'
+      + '</g>';
+  }).join('');
+
+  // edges (under nodes). curved quadratic for elegance + reduced overlap.
   const edgeSvg = model.edges.map((e) => {
     const pa = pos[e.a], pb = pos[e.b]; if (!pa || !pb) return '';
     const col = GRAPH_CAT_COLORS[e.cat] || GRAPH_CAT_COLORS.neutral;
     const w = (1.2 + (e.intensity / 100) * 4).toFixed(2);
-    const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
-    // perpendicular bow so reciprocal/again-crossing edges separate
-    const dx = pb.x - pa.x, dy = pb.y - pa.y;
-    const len = Math.sqrt(dx * dx + dy * dy) || 1;
-    const bow = Math.min(60, len * 0.12) * (_hash01(e.id) - 0.5) * 2;
-    const cxp = mx + (-dy / len) * bow, cyp = my + (dx / len) * bow;
+    const d = edgePathD(pa, pb, e.id);
     const dash = e.sentiment === 'hostile' ? 'stroke-dasharray="2 5"' : (e.sentiment === 'strained' ? 'stroke-dasharray="7 4"' : '');
-    const multi = e.categories.length > 1 ? ('<path d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="' + (GRAPH_CAT_COLORS[e.categories[1]] || '#fff') + '" stroke-width="' + (Number(w) * 0.5).toFixed(2) + '" stroke-dasharray="1 9" stroke-linecap="round" opacity=".8"/>') : '';
+    const multi = e.categories.length > 1 ? ('<path class="vlg-edge-multi" d="' + d + '" fill="none" stroke="' + (GRAPH_CAT_COLORS[e.categories[1]] || '#fff') + '" stroke-width="' + (Number(w) * 0.5).toFixed(2) + '" stroke-dasharray="1 9" stroke-linecap="round" opacity=".8"/>') : '';
     return '<g class="vlg-edge" data-edge="' + escapeHtml(e.id) + '" data-a="' + escapeHtml(e.a) + '" data-b="' + escapeHtml(e.b) + '">'
-      + '<path class="vlg-edge-hit" d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="transparent" stroke-width="14"/>'
-      + '<path class="vlg-edge-line" d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="' + col + '" stroke-width="' + w + '" ' + dash + ' stroke-linecap="round"/>'
+      + '<path class="vlg-edge-hit" d="' + d + '" fill="none" stroke="transparent" stroke-width="14"/>'
+      + '<path class="vlg-edge-line" d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + w + '" ' + dash + ' stroke-linecap="round"/>'
       + multi + '</g>';
   }).join('');
 
-  // nodes
+  // nodes. data-x/y/r carry virtual-canvas geometry so drag can move them live.
   const nodeSvg = model.nodes.map((nd) => {
     const p = pos[nd.id]; if (!p) return '';
     const r = nodeR(nd);
     const cls = 'vlg-node' + (nd.present ? ' is-present' : '') + (nd.user ? ' is-user' : '') + (nd.status === 'mentioned' ? ' is-mention' : '');
     const init = escapeHtml(castInitials(nd.name));
     const short = nd.name.length > 16 ? nd.name.slice(0, 15) + '\u2026' : nd.name;
-    return '<g class="' + cls + '" data-node="' + escapeHtml(nd.id) + '" transform="translate(' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ')">'
+    return '<g class="' + cls + '" data-node="' + escapeHtml(nd.id) + '" data-r="' + r + '" transform="translate(' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ')">'
       + '<circle class="vlg-node-glow" r="' + (r + 7) + '"/>'
       + '<circle class="vlg-node-c" r="' + r + '"/>'
       + '<text class="vlg-node-i" text-anchor="middle" dy="0.34em">' + init + '</text>'
@@ -2228,21 +2346,23 @@ function castGraphHtml(ch) {
 
   const cats = Array.from(new Set(model.edges.map((e) => e.cat)));
   const legend = cats.map((c) => '<button class="vlg-leg" data-graph-cat="' + c + '"><span class="vlg-leg-dot" style="background:' + (GRAPH_CAT_COLORS[c] || '#888') + '"></span>' + escapeHtml(c) + '</button>').join('');
+  const facToggle = fac.factions.length ? ('<button class="vlg-tool wide on" data-graph-factions title="Toggle faction hulls">\u25C7 ' + fac.factions.length + ' faction' + (fac.factions.length === 1 ? '' : 's') + '</button>') : '';
 
-  return '<div class="vlg-wrap" data-graph data-graph-cat="all">'
+  return '<div class="vlg-wrap" data-graph data-graph-cat="all" data-factions="on">'
     + '<div class="vlg-toolbar">'
       + '<div class="vlg-legend"><button class="vlg-leg on" data-graph-cat="all">all</button>' + legend + '</div>'
-      + '<div class="vlg-tools"><button class="vlg-tool" data-graph-fit title="Fit to view">\u26F6</button>'
+      + '<div class="vlg-tools">' + facToggle
+      + '<button class="vlg-tool" data-graph-fit title="Reset view">\u26F6</button>'
       + '<button class="vlg-tool" data-graph-zoom="1" title="Zoom in">+</button>'
       + '<button class="vlg-tool" data-graph-zoom="-1" title="Zoom out">\u2212</button></div>'
     + '</div>'
     + '<div class="vlg-stage" data-graph-stage>'
       + '<svg class="vlg-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" data-graph-svg>'
-        + '<g data-graph-pan>' + '<g class="vlg-edges">' + edgeSvg + '</g><g class="vlg-nodes">' + nodeSvg + '</g>' + '</g>'
+        + '<g data-graph-pan>' + '<g class="vlg-hulls">' + hullSvg + '</g><g class="vlg-edges">' + edgeSvg + '</g><g class="vlg-nodes">' + nodeSvg + '</g>' + '</g>'
       + '</svg>'
       + '<div class="vlg-tip" data-graph-tip hidden></div>'
     + '</div>'
-    + '<div class="vlg-hint">Hover to focus \u00b7 click a node to isolate \u00b7 click a line to edit the bond \u00b7 drag to pan, scroll to zoom</div>'
+    + '<div class="vlg-hint">Hover to focus \u00b7 click a node to isolate \u00b7 drag a node to arrange \u00b7 click a line to edit \u00b7 drag canvas to pan, scroll to zoom</div>'
     + '</div>';
 }
 
@@ -2454,6 +2574,7 @@ function wireCastTab(ctx, root, body, getChatId, setChatId) {
 function wireCastGraph(ctx, root, body, getChatId) {
   let view = { z: 1, x: 0, y: 0 };     // pan/zoom transform
   let focus = null;                    // focused node id (isolate mode)
+  let _dragMoved = false;              // distinguishes a node drag from a click
   const A = (el, n) => (el && el.getAttribute(n)) || '';
   const stage = () => body.querySelector('[data-graph-stage]');
   const panG = () => body.querySelector('[data-graph-pan]');
@@ -2499,6 +2620,8 @@ function wireCastGraph(ctx, root, body, getChatId) {
     const tool = e.target.closest('[data-graph-zoom]');
     if (tool) { const dir = parseInt(A(tool, 'data-graph-zoom'), 10); view.z = Math.max(0.4, Math.min(3, view.z * (dir > 0 ? 1.2 : 1 / 1.2))); applyView(); return; }
     if (e.target.closest('[data-graph-fit]')) { resetView(); return; }
+    const facBtn = e.target.closest('[data-graph-factions]');
+    if (facBtn) { const w = wrap(); if (w) { const on = w.getAttribute('data-factions') !== 'on'; w.setAttribute('data-factions', on ? 'on' : 'off'); facBtn.classList.toggle('on', on); } return; }
     const leg = e.target.closest('[data-graph-cat]');
     if (leg && leg.classList.contains('vlg-leg')) {
       const w = wrap(); if (!w) return;
@@ -2532,16 +2655,60 @@ function wireCastGraph(ctx, root, body, getChatId) {
       return;
     }
     const node = e.target.closest('.vlg-node');
-    if (node) { const id = A(node, 'data-node'); focus = (focus === id) ? null : id; setHighlight(null); return; }
+    if (node) { if (_dragMoved) { _dragMoved = false; return; } const id = A(node, 'data-node'); focus = (focus === id) ? null : id; setHighlight(null); return; }
     // click empty space clears focus
     if (e.target.closest('[data-graph-svg]') && !node && !edge) { focus = null; setHighlight(null); }
   });
 
-  // drag-to-pan + wheel-zoom on the stage
-  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-  body.addEventListener('mousedown', (e) => { const svg = e.target.closest('[data-graph-svg]'); if (!svg || e.target.closest('.vlg-node') || e.target.closest('.vlg-edge')) return; dragging = true; sx = e.clientX; sy = e.clientY; ox = view.x; oy = view.y; e.preventDefault(); });
-  window.addEventListener('mousemove', (e) => { if (!dragging) return; view.x = ox + (e.clientX - sx); view.y = oy + (e.clientY - sy); applyView(); });
-  window.addEventListener('mouseup', () => { dragging = false; });
+  // SVG user-space px per client px (viewBox scaling) so drag tracks the cursor.
+  function svgScale() { const svg = body.querySelector('[data-graph-svg]'); if (!svg || !_graph) return 1; const rect = svg.getBoundingClientRect(); return rect.width ? (_graph.W / rect.width) : 1; }
+  // Live re-path of a node's edges + redraw of any faction hulls it belongs to,
+  // after its position moved (during drag) — no full re-render.
+  function repathNode(id) {
+    if (!_graph) return;
+    const w = wrap(); if (!w) return;
+    const p = _graph.pos[id]; if (!p) return;
+    const g = w.querySelector('.vlg-node[data-node="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+    if (g) g.setAttribute('transform', 'translate(' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ')');
+    _graph.model.edges.forEach((e) => {
+      if (e.a !== id && e.b !== id) return;
+      const pa = _graph.pos[e.a], pb = _graph.pos[e.b]; if (!pa || !pb) return;
+      const d = edgePathD(pa, pb, e.id);
+      const eg = w.querySelector('.vlg-edge[data-edge="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]');
+      if (eg) eg.querySelectorAll('path').forEach((pth) => pth.setAttribute('d', d));
+    });
+    // redraw hulls containing this node
+    (_graph.factions || []).forEach((f, fi) => {
+      if (f.members.indexOf(id) < 0) return;
+      const geo = hullGeometry(f.members, _graph.pos, 46);
+      const hg = w.querySelector('.vlg-hull[data-hull="' + fi + '"]');
+      if (geo && hg) { const fill = hg.querySelector('.vlg-hull-fill'); if (fill) fill.setAttribute('d', geo.d); const lbl = hg.querySelector('.vlg-hull-label'); if (lbl) { lbl.setAttribute('x', geo.labelX.toFixed(1)); lbl.setAttribute('y', (geo.labelY - 10).toFixed(1)); } }
+    });
+  }
+
+  // drag: a node (rearrange) OR the canvas (pan). Wheel/buttons zoom.
+  let dragging = false, panning = false, sx = 0, sy = 0, ox = 0, oy = 0, dragId = null;
+  body.addEventListener('mousedown', (e) => {
+    const svg = e.target.closest('[data-graph-svg]'); if (!svg) return;
+    const node = e.target.closest('.vlg-node');
+    if (node) { dragging = true; dragId = A(node, 'data-node'); _dragMoved = false; sx = e.clientX; sy = e.clientY; node.classList.add('vlg-dragging'); e.preventDefault(); return; }
+    if (e.target.closest('.vlg-edge')) return; // let edges receive their click
+    panning = true; sx = e.clientX; sy = e.clientY; ox = view.x; oy = view.y; e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (dragging && dragId && _graph) {
+      const sc = svgScale() / (view.z || 1);
+      if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) _dragMoved = true;
+      const p = _graph.pos[dragId]; if (p) { p.x = Math.max(20, Math.min(_graph.W - 20, p.x + (e.clientX - sx) * sc)); p.y = Math.max(20, Math.min(_graph.H - 20, p.y + (e.clientY - sy) * sc)); }
+      sx = e.clientX; sy = e.clientY; repathNode(dragId);
+      return;
+    }
+    if (panning) { view.x = ox + (e.clientX - sx); view.y = oy + (e.clientY - sy); applyView(); }
+  });
+  window.addEventListener('mouseup', () => {
+    if (dragging) { const w = wrap(); if (w) { const g = w.querySelector('.vlg-dragging'); if (g) g.classList.remove('vlg-dragging'); } }
+    dragging = false; panning = false; dragId = null;
+  });
   body.addEventListener('wheel', (e) => { const svg = e.target.closest('[data-graph-svg]'); if (!svg) return; e.preventDefault(); view.z = Math.max(0.4, Math.min(3, view.z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))); applyView(); }, { passive: false });
 
   // re-apply focus highlight after a re-render (renderCast replaces innerHTML)
@@ -3235,6 +3402,16 @@ const VELLUM_CSS = [
   ".vlg-tip{position:absolute;pointer-events:none;z-index:5;max-width:220px;background:rgba(18,15,11,.97);border:1px solid rgba(205,168,78,.34);border-radius:8px;padding:7px 10px;font:500 11px/1.45 'JetBrains Mono',monospace;color:#d8c9a8;box-shadow:0 6px 22px rgba(0,0,0,.5)}",
   ".vlg-tip b{color:#e7d6ad;font-family:'Cormorant Garamond',Georgia,serif;font-size:13px;letter-spacing:.5px}",
   ".vlg-hint{font-size:9px;line-height:1.5;opacity:.5;text-align:center}",
+  /* faction hulls (Phase 2) */
+  ".vlg-hull-fill{opacity:.07;transition:opacity .25s;pointer-events:none}",
+  ".vlg-hull-label{font:600 12px/1 'Cormorant Garamond',Georgia,serif;letter-spacing:1px;opacity:.55;text-transform:uppercase;pointer-events:none}",
+  "[data-factions='off'] .vlg-hulls{display:none}",
+  ".vlg-wrap:hover .vlg-hull-fill{opacity:.1}",
+  ".vlg-tool.wide{width:auto;padding:0 9px;font-size:9px;letter-spacing:.5px;text-transform:uppercase}",
+  ".vlg-tool.wide.on{background:rgba(205,168,78,.26);border-color:rgba(205,168,78,.5);color:var(--vsolid,#cda84e)}",
+  ".vlg-node.vlg-dragging{cursor:grabbing}",
+  ".vlg-node.vlg-dragging .vlg-node-c{stroke:var(--vsolid,#cda84e);stroke-width:3.4}",
+  ".vlg-node{cursor:grab}",
   ".vlc-rel-evtrail{display:flex;flex-wrap:wrap;align-items:center;gap:3px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px}",
   ".vlc-rel-ev{padding:1px 5px;border-radius:6px;border:1px solid rgba(205,168,78,.22);opacity:.85}",
   ".vlc-rel-ev.ev-add{color:#a9c089;border-color:rgba(143,166,126,.4)}",
