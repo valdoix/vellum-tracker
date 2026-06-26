@@ -2030,6 +2030,7 @@ const CAST_HTML =
   + '<button class="vlc-btn" data-cast-filter="mentioned">\u2027 Mentioned</button>'
     + '<button class="vlc-btn" data-cast-filter="added">\u2605 Added</button>'
     + '<button class="vlc-btn" data-cast-filter="relations">\u21CE Relations</button>'
+    + '<button class="vlc-btn" data-cast-filter="graph">\u25C9 Graph</button>'
     + '<button class="vlc-btn" data-cast-filter="journal">\uD83D\uDCD6 Journal</button>'
   + '<button class="vlc-btn ghost" data-cast-refresh title="Refresh">\u27F3</button>'
   + '<button class="vlc-btn" data-cast-scan>\u2756 Scan</button>'
@@ -2075,6 +2076,174 @@ function castGroup(grp, title, hint, arr, present) {
   const head = '<h3 class="vlc-h">' + title + ' <span class="vlc-h-n">' + arr.length + '</span></h3>';
   if (!arr.length) return '<section data-grp="' + grp + '">' + head + '<div class="vlc-empty">' + hint + '</div></section>';
   return '<section data-grp="' + grp + '">' + head + arr.map((c) => castCard(c, present)).join('') + '</section>';
+}
+
+/* ============================================================================
+ * RELATIONSHIP GRAPH — a force-directed node graph of the cast & their bonds.
+ * Pure SVG (no deps), reusing the relations data + category palette. The layout
+ * is computed deterministically (seeded by id) and cached per node/edge set so
+ * the graph doesn't reshuffle on every chronicle update. The interaction layer
+ * (hover/focus/drag/zoom) lives in wireCastGraph(); this builds the markup.
+ * ========================================================================== */
+const GRAPH_CAT_COLORS = { familial: '#cda84e', romantic: '#c97a9a', alliance: '#8fa67e', rivalry: '#c96a6a', social: '#7ea6b0', neutral: '#8c8478' };
+const GRAPH_RANK = { neutral: 0, social: 1, alliance: 2, rivalry: 2, romantic: 3, familial: 3 };
+const _graphLayoutCache = {}; // chatless module cache: sig -> {pos, w, h}
+
+function graphPrimaryCat(r) {
+  const cats = (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'];
+  return cats.slice().sort((a, b) => (GRAPH_RANK[b] || 0) - (GRAPH_RANK[a] || 0))[0] || 'neutral';
+}
+// deterministic 0..1 hash so the same cast always seeds the same layout
+function _hash01(s) {
+  let h = 2166136261;
+  const str = String(s || '');
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 100000) / 100000;
+}
+
+// Build node/edge model from the chronicle. Only characters that participate in
+// at least one relation are shown (a graph of isolated dots helps no one),
+// unless they're present/active — those always appear as context.
+function graphModel(ch) {
+  const cast = (ch && ch.cast) || {};
+  const rels = (ch && ch.relations) || [];
+  const presentIds = new Set(ch && ch.presentIds ? ch.presentIds : []);
+  const deg = {};
+  const edges = [];
+  for (const r of rels) {
+    if (!cast[r.a] || !cast[r.b] || r.a === r.b) continue;
+    deg[r.a] = (deg[r.a] || 0) + 1; deg[r.b] = (deg[r.b] || 0) + 1;
+    const cat = graphPrimaryCat(r);
+    const intensity = Math.max(Math.abs(r.affection || 0), Math.abs(r.trust || 0));
+    edges.push({ id: r.id, a: r.a, b: r.b, cat, sentiment: r.sentiment || 'neutral', intensity, label: r.label || '', categories: (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'], affection: r.affection || 0, trust: r.trust || 0, status: r.status || 'active' });
+  }
+  const ids = Object.keys(cast).filter((id) => deg[id] || presentIds.has(id));
+  const nodes = ids.map((id) => {
+    const c = cast[id];
+    const present = presentIds.has(id);
+    return { id, name: c.name || id, degree: deg[id] || 0, present, status: c.status || 'active', user: c.source === 'user', role: c.role || '' };
+  });
+  return { nodes, edges };
+}
+
+// Force-directed layout. Small casts → run synchronously, cache by signature.
+function graphLayout(model) {
+  const W = 1000, H = 720; // virtual canvas; SVG viewBox scales it responsively
+  const sig = model.nodes.map((n) => n.id).sort().join(',') + '|' + model.edges.map((e) => e.id).sort().join(',');
+  if (_graphLayoutCache.sig === sig && _graphLayoutCache.pos) return { pos: _graphLayoutCache.pos, W, H };
+  const n = model.nodes.length;
+  const pos = {};
+  if (!n) { _graphLayoutCache.sig = sig; _graphLayoutCache.pos = pos; return { pos, W, H }; }
+  // seed on a jittered circle (deterministic) so layout is stable run-to-run
+  const cx = W / 2, cy = H / 2, R = Math.min(W, H) * 0.36;
+  model.nodes.forEach((node, i) => {
+    const a = (i / n) * Math.PI * 2 + _hash01(node.id) * 0.7;
+    const rr = R * (0.55 + 0.45 * _hash01(node.id + 'r'));
+    pos[node.id] = { x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr, vx: 0, vy: 0 };
+  });
+  const idx = {}; model.nodes.forEach((nd, i) => { idx[nd.id] = i; });
+  const k = Math.sqrt((W * H) / Math.max(1, n)) * 0.62; // ideal spacing
+  const ITER = n > 40 ? 160 : 300;
+  for (let it = 0; it < ITER; it++) {
+    const t = 1 - it / ITER; // cooling
+    // repulsion (all pairs — fine for small casts)
+    for (let i = 0; i < n; i++) {
+      const pi = pos[model.nodes[i].id];
+      for (let j = i + 1; j < n; j++) {
+        const pj = pos[model.nodes[j].id];
+        let dx = pi.x - pj.x, dy = pi.y - pj.y;
+        let d2 = dx * dx + dy * dy; if (d2 < 0.01) { dx = (_hash01(i + '' + j) - 0.5); dy = (_hash01(j + '' + i) - 0.5); d2 = dx * dx + dy * dy + 0.01; }
+        const f = (k * k) / d2;
+        const d = Math.sqrt(d2);
+        pi.vx += (dx / d) * f; pi.vy += (dy / d) * f;
+        pj.vx -= (dx / d) * f; pj.vy -= (dy / d) * f;
+      }
+    }
+    // attraction along edges, stronger for intense bonds
+    for (const e of model.edges) {
+      const pa = pos[e.a], pb = pos[e.b]; if (!pa || !pb) continue;
+      const dx = pa.x - pb.x, dy = pa.y - pb.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const strength = 0.6 + (e.intensity / 100) * 0.8;
+      const f = (d * d) / k * 0.012 * strength;
+      pa.vx -= (dx / d) * f; pa.vy -= (dy / d) * f;
+      pb.vx += (dx / d) * f; pb.vy += (dy / d) * f;
+    }
+    // gravity toward center + integrate with cooling
+    for (const nd of model.nodes) {
+      const p = pos[nd.id];
+      p.vx += (cx - p.x) * 0.008; p.vy += (cy - p.y) * 0.008;
+      p.x += Math.max(-30, Math.min(30, p.vx)) * t;
+      p.y += Math.max(-30, Math.min(30, p.vy)) * t;
+      p.vx *= 0.85; p.vy *= 0.85;
+      p.x = Math.max(40, Math.min(W - 40, p.x));
+      p.y = Math.max(40, Math.min(H - 40, p.y));
+    }
+  }
+  _graphLayoutCache.sig = sig; _graphLayoutCache.pos = pos;
+  return { pos, W, H };
+}
+
+function castGraphHtml(ch) {
+  const model = graphModel(ch);
+  if (!model.nodes.length || !model.edges.length) {
+    return '<div class="vlc-empty">No relationship graph yet.<br><span style="opacity:.7;font-size:10px">Bonds appear here once characters relate. Hit \u2756 Scan, play a few turns, or add a relation.</span></div>';
+  }
+  const { pos, W, H } = graphLayout(model);
+  const nodeR = (nd) => 13 + Math.min(16, nd.degree * 2.2) + (nd.present ? 3 : 0);
+
+  // edges first (under nodes). curved quadratic for elegance + reduced overlap.
+  const edgeSvg = model.edges.map((e) => {
+    const pa = pos[e.a], pb = pos[e.b]; if (!pa || !pb) return '';
+    const col = GRAPH_CAT_COLORS[e.cat] || GRAPH_CAT_COLORS.neutral;
+    const w = (1.2 + (e.intensity / 100) * 4).toFixed(2);
+    const mx = (pa.x + pb.x) / 2, my = (pa.y + pb.y) / 2;
+    // perpendicular bow so reciprocal/again-crossing edges separate
+    const dx = pb.x - pa.x, dy = pb.y - pa.y;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const bow = Math.min(60, len * 0.12) * (_hash01(e.id) - 0.5) * 2;
+    const cxp = mx + (-dy / len) * bow, cyp = my + (dx / len) * bow;
+    const dash = e.sentiment === 'hostile' ? 'stroke-dasharray="2 5"' : (e.sentiment === 'strained' ? 'stroke-dasharray="7 4"' : '');
+    const multi = e.categories.length > 1 ? ('<path d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="' + (GRAPH_CAT_COLORS[e.categories[1]] || '#fff') + '" stroke-width="' + (Number(w) * 0.5).toFixed(2) + '" stroke-dasharray="1 9" stroke-linecap="round" opacity=".8"/>') : '';
+    return '<g class="vlg-edge" data-edge="' + escapeHtml(e.id) + '" data-a="' + escapeHtml(e.a) + '" data-b="' + escapeHtml(e.b) + '">'
+      + '<path class="vlg-edge-hit" d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="transparent" stroke-width="14"/>'
+      + '<path class="vlg-edge-line" d="M' + pa.x.toFixed(1) + ',' + pa.y.toFixed(1) + ' Q' + cxp.toFixed(1) + ',' + cyp.toFixed(1) + ' ' + pb.x.toFixed(1) + ',' + pb.y.toFixed(1) + '" fill="none" stroke="' + col + '" stroke-width="' + w + '" ' + dash + ' stroke-linecap="round"/>'
+      + multi + '</g>';
+  }).join('');
+
+  // nodes
+  const nodeSvg = model.nodes.map((nd) => {
+    const p = pos[nd.id]; if (!p) return '';
+    const r = nodeR(nd);
+    const cls = 'vlg-node' + (nd.present ? ' is-present' : '') + (nd.user ? ' is-user' : '') + (nd.status === 'mentioned' ? ' is-mention' : '');
+    const init = escapeHtml(castInitials(nd.name));
+    const short = nd.name.length > 16 ? nd.name.slice(0, 15) + '\u2026' : nd.name;
+    return '<g class="' + cls + '" data-node="' + escapeHtml(nd.id) + '" transform="translate(' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ')">'
+      + '<circle class="vlg-node-glow" r="' + (r + 7) + '"/>'
+      + '<circle class="vlg-node-c" r="' + r + '"/>'
+      + '<text class="vlg-node-i" text-anchor="middle" dy="0.34em">' + init + '</text>'
+      + '<text class="vlg-node-l" text-anchor="middle" y="' + (r + 13) + '">' + escapeHtml(short) + '</text>'
+      + '</g>';
+  }).join('');
+
+  const cats = Array.from(new Set(model.edges.map((e) => e.cat)));
+  const legend = cats.map((c) => '<button class="vlg-leg" data-graph-cat="' + c + '"><span class="vlg-leg-dot" style="background:' + (GRAPH_CAT_COLORS[c] || '#888') + '"></span>' + escapeHtml(c) + '</button>').join('');
+
+  return '<div class="vlg-wrap" data-graph data-graph-cat="all">'
+    + '<div class="vlg-toolbar">'
+      + '<div class="vlg-legend"><button class="vlg-leg on" data-graph-cat="all">all</button>' + legend + '</div>'
+      + '<div class="vlg-tools"><button class="vlg-tool" data-graph-fit title="Fit to view">\u26F6</button>'
+      + '<button class="vlg-tool" data-graph-zoom="1" title="Zoom in">+</button>'
+      + '<button class="vlg-tool" data-graph-zoom="-1" title="Zoom out">\u2212</button></div>'
+    + '</div>'
+    + '<div class="vlg-stage" data-graph-stage>'
+      + '<svg class="vlg-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" data-graph-svg>'
+        + '<g data-graph-pan>' + '<g class="vlg-edges">' + edgeSvg + '</g><g class="vlg-nodes">' + nodeSvg + '</g>' + '</g>'
+      + '</svg>'
+      + '<div class="vlg-tip" data-graph-tip hidden></div>'
+    + '</div>'
+    + '<div class="vlg-hint">Hover to focus \u00b7 click a node to isolate \u00b7 click a line to edit the bond \u00b7 drag to pan, scroll to zoom</div>'
+    + '</div>';
 }
 
 // Relations panel: edges between cast members, grouped under each character,
@@ -2166,6 +2335,7 @@ function relationsHtml(ch) {
 
 function renderCast(host, ch) {
   if (!host) return;
+  host._ch = ch; // stash for the graph interaction layer (hover/focus/drag)
   const cast = ch && ch.cast ? Object.values(ch.cast) : [];
   if (!cast.length) {
     const hasJournal = ch && ch.memJournal && Object.keys(ch.memJournal).length;
@@ -2207,6 +2377,9 @@ function renderCast(host, ch) {
     + '<div class="vlc-break"></div>'
     + '<section data-grp="relations"><h3 class="vlc-h">\u21ce Relations <span class="vlc-h-n">' + ((ch.relations || []).length) + '</span><button class="vlc-add-btn" data-relation-add>+ Relation</button></h3>'
       + relationsHtml(ch) + '</section>'
+    + '<div class="vlc-break"></div>'
+    + '<section data-grp="graph"><h3 class="vlc-h">\u25c9 Relationship Graph <span class="vlc-h-n">' + ((ch.relations || []).length) + '</span></h3>'
+      + castGraphHtml(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="journal"><h3 class="vlc-h">\uD83D\uDCD6 Memory Journal <span class="vlc-h-n">' + Object.keys(ch.memJournal || {}).length + '</span></h3>'
       + '<div class="vlc-lore-bar"><button class="vlc-btn" data-scan-mem>\uD83D\uDCD6 Scan memories</button></div>'
@@ -2272,6 +2445,107 @@ function wireCastTab(ctx, root, body, getChatId, setChatId) {
   });
 
   root._scanBtn = scanBtn;
+  wireCastGraph(ctx, root, body, getChatId);
+}
+
+// Interaction layer for the relationship graph (delegated, survives re-renders).
+// hover-highlight, click-to-focus a node, click an edge to edit the bond,
+// category legend filter, drag-to-pan, scroll/buttons to zoom, fit-to-view.
+function wireCastGraph(ctx, root, body, getChatId) {
+  let view = { z: 1, x: 0, y: 0 };     // pan/zoom transform
+  let focus = null;                    // focused node id (isolate mode)
+  const A = (el, n) => (el && el.getAttribute(n)) || '';
+  const stage = () => body.querySelector('[data-graph-stage]');
+  const panG = () => body.querySelector('[data-graph-pan]');
+  const wrap = () => body.querySelector('[data-graph]');
+
+  function applyView() { const g = panG(); if (g) g.setAttribute('transform', 'translate(' + view.x + ',' + view.y + ') scale(' + view.z + ')'); }
+  function resetView() { view = { z: 1, x: 0, y: 0 }; applyView(); }
+
+  function setHighlight(nodeId) {
+    const w = wrap(); if (!w) return;
+    const active = nodeId || focus;
+    if (!active) { w.classList.remove('vlg-focusing'); w.querySelectorAll('.vlg-dim,.vlg-hot').forEach((el) => el.classList.remove('vlg-dim', 'vlg-hot')); return; }
+    w.classList.add('vlg-focusing');
+    const neighbors = new Set([active]);
+    w.querySelectorAll('.vlg-edge').forEach((g) => {
+      const a = A(g, 'data-a'), b = A(g, 'data-b');
+      const on = (a === active || b === active);
+      g.classList.toggle('vlg-hot', on); g.classList.toggle('vlg-dim', !on);
+      if (on) { neighbors.add(a); neighbors.add(b); }
+    });
+    w.querySelectorAll('.vlg-node').forEach((g) => {
+      const on = neighbors.has(A(g, 'data-node'));
+      g.classList.toggle('vlg-hot', on); g.classList.toggle('vlg-dim', !on);
+    });
+  }
+
+  function showTip(html, x, y) { const tip = body.querySelector('[data-graph-tip]'); if (!tip) return; tip.innerHTML = html; tip.hidden = false; const s = stage(); const r = s ? s.getBoundingClientRect() : { left: 0, top: 0 }; tip.style.left = Math.max(6, x - r.left + 12) + 'px'; tip.style.top = Math.max(6, y - r.top + 12) + 'px'; }
+  function hideTip() { const tip = body.querySelector('[data-graph-tip]'); if (tip) tip.hidden = true; }
+
+  // hover
+  body.addEventListener('mouseover', (e) => {
+    const node = e.target.closest('.vlg-node'); if (node && !focus) { setHighlight(A(node, 'data-node')); }
+    const ch = body._ch || root._ch;
+    if (node && ch) { const c = ch.cast && ch.cast[A(node, 'data-node')]; if (c) { const d = (ch.relations || []).filter((r) => r.a === c.id || r.b === c.id).length; showTip('<b>' + escapeHtml(c.name) + '</b>' + (c.role ? '<br>' + escapeHtml(c.role) : '') + '<br><span style="opacity:.6">' + d + ' bond' + (d === 1 ? '' : 's') + '</span>', e.clientX, e.clientY); } }
+    const edge = e.target.closest('.vlg-edge');
+    if (edge && ch) { const r = (ch.relations || []).find((x) => x.id === A(edge, 'data-edge')); if (r) { const an = ch.cast[r.a] ? ch.cast[r.a].name : r.a, bn = ch.cast[r.b] ? ch.cast[r.b].name : r.b; const cats = (Array.isArray(r.categories) && r.categories.length) ? r.categories.join(' + ') : (r.category || 'neutral'); showTip('<b>' + escapeHtml(an) + ' \u2192 ' + escapeHtml(bn) + '</b><br>' + escapeHtml(cats) + ' \u00b7 ' + escapeHtml(r.sentiment || 'neutral') + (r.label ? '<br>\u201c' + escapeHtml(r.label) + '\u201d' : ''), e.clientX, e.clientY); } }
+  });
+  body.addEventListener('mousemove', (e) => { const tip = body.querySelector('[data-graph-tip]'); if (tip && !tip.hidden) { const s = stage(); const r = s ? s.getBoundingClientRect() : { left: 0, top: 0 }; tip.style.left = (e.clientX - r.left + 12) + 'px'; tip.style.top = (e.clientY - r.top + 12) + 'px'; } });
+  body.addEventListener('mouseout', (e) => { if (e.target.closest('.vlg-node') || e.target.closest('.vlg-edge')) { hideTip(); if (!focus) setHighlight(null); } });
+
+  // click: node focus, edge edit, legend filter, tools
+  body.addEventListener('click', (e) => {
+    const tool = e.target.closest('[data-graph-zoom]');
+    if (tool) { const dir = parseInt(A(tool, 'data-graph-zoom'), 10); view.z = Math.max(0.4, Math.min(3, view.z * (dir > 0 ? 1.2 : 1 / 1.2))); applyView(); return; }
+    if (e.target.closest('[data-graph-fit]')) { resetView(); return; }
+    const leg = e.target.closest('[data-graph-cat]');
+    if (leg && leg.classList.contains('vlg-leg')) {
+      const w = wrap(); if (!w) return;
+      w.querySelectorAll('.vlg-leg').forEach((x) => x.classList.remove('on')); leg.classList.add('on');
+      const cat = A(leg, 'data-graph-cat');
+      w.setAttribute('data-graph-cat', cat);
+      w.querySelectorAll('.vlg-edge').forEach((g) => {
+        const r = (body._ch || root._ch || {}).relations || [];
+        const rel = r.find((x) => x.id === A(g, 'data-edge'));
+        const cats = rel ? ((Array.isArray(rel.categories) && rel.categories.length) ? rel.categories : [rel.category || 'neutral']) : [];
+        g.style.display = (cat === 'all' || cats.includes(cat)) ? '' : 'none';
+      });
+      return;
+    }
+    const edge = e.target.closest('.vlg-edge');
+    if (edge) {
+      const ch = body._ch || root._ch; const r = ch && (ch.relations || []).find((x) => x.id === A(edge, 'data-edge'));
+      if (r) {
+        const an = ch.cast[r.a] ? ch.cast[r.a].name : r.a, bn = ch.cast[r.b] ? ch.cast[r.b].name : r.b;
+        const cats = (Array.isArray(r.categories) && r.categories.length) ? r.categories : [r.category || 'neutral'];
+        vlcFormModal('Edit Relation', [
+          { key: 'a', label: 'Character A', type: 'text', value: an },
+          { key: 'label', label: 'Relation (from A\u2019s side)', type: 'text', value: r.label || '' },
+          { key: 'b', label: 'Character B', type: 'text', value: bn },
+          { key: 'categories', label: 'Categories (one or more)', type: 'checks', value: cats, options: REL_CAT_MULTI_OPTS },
+          { key: 'status', label: 'Status', type: 'select', value: r.status || 'active', options: REL_STATUS_OPTS },
+          { key: 'affection', label: 'Affection (-100..100)', type: 'text', value: String(r.affection || 0) },
+          { key: 'trust', label: 'Trust (-100..100)', type: 'text', value: String(r.trust || 0) },
+        ], (v) => { v.categories = splitCats(v.categories); ctx.sendToBackend({ type: 'relation_edit', chatId: getChatId(), id: r.id, entry: v }); });
+      }
+      return;
+    }
+    const node = e.target.closest('.vlg-node');
+    if (node) { const id = A(node, 'data-node'); focus = (focus === id) ? null : id; setHighlight(null); return; }
+    // click empty space clears focus
+    if (e.target.closest('[data-graph-svg]') && !node && !edge) { focus = null; setHighlight(null); }
+  });
+
+  // drag-to-pan + wheel-zoom on the stage
+  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+  body.addEventListener('mousedown', (e) => { const svg = e.target.closest('[data-graph-svg]'); if (!svg || e.target.closest('.vlg-node') || e.target.closest('.vlg-edge')) return; dragging = true; sx = e.clientX; sy = e.clientY; ox = view.x; oy = view.y; e.preventDefault(); });
+  window.addEventListener('mousemove', (e) => { if (!dragging) return; view.x = ox + (e.clientX - sx); view.y = oy + (e.clientY - sy); applyView(); });
+  window.addEventListener('mouseup', () => { dragging = false; });
+  body.addEventListener('wheel', (e) => { const svg = e.target.closest('[data-graph-svg]'); if (!svg) return; e.preventDefault(); view.z = Math.max(0.4, Math.min(3, view.z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))); applyView(); }, { passive: false });
+
+  // re-apply focus highlight after a re-render (renderCast replaces innerHTML)
+  root._reapplyGraph = () => { if (focus) setHighlight(null); };
 }
 
 function pickStat(card, label) {
@@ -2632,6 +2906,7 @@ const VELLUM_CSS = [
   ".vlc-root[data-view='mentioned'] [data-grp]:not([data-grp='mentioned']){display:none}",
   ".vlc-root[data-view='added'] [data-grp]:not([data-grp='added']){display:none}",
   ".vlc-root[data-view='relations'] [data-grp]:not([data-grp='relations']){display:none}",
+  ".vlc-root[data-view='graph'] [data-grp]:not([data-grp='graph']){display:none}",
   /* chapter memories */
 ﻿  ".vlc-mt-meta{font-size:10px;opacity:.55;margin-bottom:8px;font-style:italic}",
   ".vlc-mt-arc{background:rgba(0,0,0,.2);border:1px solid rgba(205,168,78,.14);border-left:3px solid #8fa67e;border-radius:10px;margin-bottom:8px;overflow:hidden}",
@@ -2920,6 +3195,46 @@ const VELLUM_CSS = [
   ".vlc-rel-sparkwrap{margin-top:8px;border-top:1px solid rgba(205,168,78,.1);padding-top:6px}",
   ".vlc-rel-spark{width:100%;height:24px;display:block}",
   ".vlc-rel-spark polyline{fill:none;stroke:var(--vsolid,#cda84e);stroke-width:2;opacity:.75}",
+  /* ---- Relationship graph ---- */
+  ".vlg-wrap{display:flex;flex-direction:column;gap:8px;padding:2px}",
+  ".vlg-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}",
+  ".vlg-legend{display:flex;flex-wrap:wrap;gap:4px}",
+  ".vlg-leg{display:inline-flex;align-items:center;gap:4px;font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:#cdbfa0;background:rgba(205,168,78,.08);border:1px solid rgba(205,168,78,.2);border-radius:20px;padding:3px 8px;cursor:pointer;opacity:.62;transition:opacity .15s,background .15s}",
+  ".vlg-leg:hover{opacity:.9}",
+  ".vlg-leg.on{opacity:1;background:rgba(205,168,78,.2);border-color:rgba(205,168,78,.45)}",
+  ".vlg-leg-dot{width:8px;height:8px;border-radius:50%;box-shadow:0 0 5px currentColor}",
+  ".vlg-tools{display:flex;gap:4px}",
+  ".vlg-tool{width:24px;height:24px;display:grid;place-items:center;font:600 13px/1 'JetBrains Mono',monospace;color:var(--vsolid,#cda84e);background:rgba(205,168,78,.1);border:1px solid rgba(205,168,78,.24);border-radius:6px;cursor:pointer}",
+  ".vlg-tool:hover{background:rgba(205,168,78,.24)}",
+  ".vlg-stage{position:relative;border:1px solid rgba(205,168,78,.18);border-radius:12px;overflow:hidden;background:radial-gradient(120% 100% at 50% 0%,rgba(205,168,78,.07),transparent 60%),linear-gradient(170deg,rgba(24,21,16,.96),rgba(16,14,11,.98));box-shadow:inset 0 1px 30px rgba(0,0,0,.4)}",
+  ".vlg-svg{display:block;width:100%;height:auto;min-height:340px;max-height:62vh;cursor:grab;touch-action:none}",
+  ".vlg-svg:active{cursor:grabbing}",
+  "[data-graph-pan]{transition:transform .08s ease-out}",
+  ".vlg-edge-line{transition:stroke-width .18s,opacity .18s;opacity:.62;filter:drop-shadow(0 0 2px rgba(0,0,0,.5))}",
+  ".vlg-edge:hover .vlg-edge-line{opacity:1;stroke-width:5}",
+  ".vlg-edge-hit{cursor:pointer}",
+  ".vlg-node{cursor:pointer}",
+  ".vlg-node-glow{fill:var(--vacc-rgba,rgba(205,168,78,.0));opacity:0;transition:opacity .2s}",
+  ".vlg-node-c{fill:#241f17;stroke:#8c8478;stroke-width:2;transition:stroke .2s,stroke-width .2s,fill .2s}",
+  ".vlg-node-i{fill:#e7d6ad;font:600 12px/1 'Cormorant Garamond',Georgia,serif;letter-spacing:.5px;pointer-events:none;user-select:none}",
+  ".vlg-node-l{fill:#cdbfa0;font:600 11px/1 'JetBrains Mono',monospace;opacity:.0;transition:opacity .2s;pointer-events:none;paint-order:stroke;stroke:rgba(12,10,8,.9);stroke-width:3px}",
+  ".vlg-node.is-present .vlg-node-c{fill:#3a2f16;stroke:var(--vsolid,#cda84e);stroke-width:2.6}",
+  ".vlg-node.is-present .vlg-node-glow{fill:rgba(205,168,78,.28);opacity:.9}",
+  ".vlg-node.is-present .vlg-node-l{opacity:1;fill:#e7d6ad}",
+  ".vlg-node.is-user .vlg-node-c{stroke:#e6c07a;stroke-width:3;stroke-dasharray:3 2}",
+  ".vlg-node.is-mention .vlg-node-c{opacity:.55;stroke-dasharray:2 3}",
+  ".vlg-node:hover .vlg-node-l{opacity:1}",
+  ".vlg-node:hover .vlg-node-glow{opacity:.8;fill:rgba(205,168,78,.32)}",
+  ".vlg-node:hover .vlg-node-c{stroke:var(--vsolid,#cda84e);stroke-width:3}",
+  /* focus / dim states */
+  ".vlg-focusing .vlg-edge:not(.vlg-hot){opacity:.12}",
+  ".vlg-focusing .vlg-edge.vlg-dim .vlg-edge-line{opacity:.1}",
+  ".vlg-focusing .vlg-node.vlg-dim{opacity:.22}",
+  ".vlg-focusing .vlg-node.vlg-hot .vlg-node-l{opacity:1}",
+  ".vlg-node.vlg-hot .vlg-node-c{stroke:var(--vsolid,#cda84e);stroke-width:3.2}",
+  ".vlg-tip{position:absolute;pointer-events:none;z-index:5;max-width:220px;background:rgba(18,15,11,.97);border:1px solid rgba(205,168,78,.34);border-radius:8px;padding:7px 10px;font:500 11px/1.45 'JetBrains Mono',monospace;color:#d8c9a8;box-shadow:0 6px 22px rgba(0,0,0,.5)}",
+  ".vlg-tip b{color:#e7d6ad;font-family:'Cormorant Garamond',Georgia,serif;font-size:13px;letter-spacing:.5px}",
+  ".vlg-hint{font-size:9px;line-height:1.5;opacity:.5;text-align:center}",
   ".vlc-rel-evtrail{display:flex;flex-wrap:wrap;align-items:center;gap:3px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:.5px}",
   ".vlc-rel-ev{padding:1px 5px;border-radius:6px;border:1px solid rgba(205,168,78,.22);opacity:.85}",
   ".vlc-rel-ev.ev-add{color:#a9c089;border-color:rgba(143,166,126,.4)}",
