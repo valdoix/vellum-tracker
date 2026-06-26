@@ -3911,17 +3911,19 @@ async function handle(chatId, content, userId) {
       broadcast(chatId, ledger, btsRaw, ch, userName, userId);
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).
-      if (userId) setTimeout(() => { maybeSummarize(chatId, userId); }, 1500);
+      const bgUid = userId || _lastUserId; // GENERATION_ENDED often omits userId
+      if (bgUid) setTimeout(() => { maybeSummarize(chatId, bgUid); }, 1500);
       // Hide-on-file: once summaries advance, hide the now-covered raw turns so
       // they leave the prompt + breakdown + embeddings (real token savings).
       if (ch.hideSummarized) setTimeout(async () => {
         try { const c2 = await loadChronicle(chatId); const r = await syncHideOnFile(chatId, c2); if (r.hid || r.shown) await saveChronicle(chatId, c2); } catch (e) {}
       }, 2600);
-      // Living tracker: auto-update relations/knowledge/secrets/memories from the
-      // recent turn and emit pulse notifications (opt-in, background, throttled).
-      if (userId && ch.autoExtract !== false) setTimeout(() => { autoExtract(chatId, userId); }, 2200);
-      if (userId && deepEnabled(ch)) setTimeout(async () => {
-        try { const msgs = await readStoredMessages(chatId); if (msgs && msgs.length) await runDeepRecall(chatId, msgs, userId); } catch (e) {}
+      // Auto-extract relations/knowledge/secrets/memories from the recent turn's
+      // PROSE (sensor-gated) + emit pulse notifications. Default ON.
+      if (bgUid && ch.autoExtract !== false) setTimeout(() => { autoExtract(chatId, bgUid); }, 2200);
+      else spindle.log.info('[vellum_tracker] autoEx NOT scheduled: bgUid=' + !!bgUid + ' autoExtract=' + ch.autoExtract);
+      if (bgUid && deepEnabled(ch)) setTimeout(async () => {
+        try { const msgs = await readStoredMessages(chatId); if (msgs && msgs.length) await runDeepRecall(chatId, msgs, bgUid); } catch (e) {}
       }, 1800);
     }
   } catch (err) {
