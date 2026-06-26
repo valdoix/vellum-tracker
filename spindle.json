@@ -1,12 +1,12 @@
 {
-  "version": "1.0.3",
+  "version": "1.1.0",
   "name": "VELLUM Tracker",
   "identifier": "vellum_tracker",
   "author": "VELLUM Preset",
   "github": "https://github.com/valdoix/vellum-tracker",
   "homepage": "https://github.com/valdoix/vellum-tracker",
-  "description": "Floating illuminated tracker + long-term Chronicle + auto-summary memory for the VELLUM Living Narrative Engine. Parses <ledger>/[BTS], maintains a persistent Chronicle (arcs, threads, events, shifts), autonomously summarizes older turns into keyworded chapter-memories via background generation, and recalls scene-relevant entries + memories through the interceptor — no lorebook needed. Renders a floating window and a paginated Chronicle tab.",
-  "permissions": ["interceptor", "chats", "chat_mutation", "generation", "ui_panels"],
+  "description": "Floating illuminated tracker + long-term Chronicle + auto-summary memory + Vault (in-app lorebook) for the VELLUM Living Narrative Engine. Parses <ledger>/[BTS], maintains a persistent Chronicle (arcs, threads, events, shifts), autonomously summarizes older turns into keyworded chapter-memories via background generation, recalls scene-relevant entries + memories through the interceptor, and lets you build & manage world books (lorebooks) and promote chronicle entries into them — no separate lorebook UI needed. Renders a floating window plus Chronicle, Cast, and Vault tabs.",
+  "permissions": ["interceptor", "chats", "chat_mutation", "generation", "ui_panels", "world_books"],
   "interceptorTimeoutMs": 15000,
   "entry_backend": "src/backend.js",
   "entry_frontend": "src/frontend.js"

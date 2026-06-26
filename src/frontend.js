@@ -196,6 +196,9 @@ function _setupImpl(ctx) {
   });
   wireCastTab(ctx, castRoot, castBody, () => currentChatId, (id) => { currentChatId = id; });
 
+  // ---- separate Vault tab (in-app lorebook / world books) ----
+  const vault = setupVaultTab(ctx, () => currentChatId);
+
   tabPanel.querySelector('[data-vlc-open]').addEventListener('click', show);
   tabPanel.querySelector('[data-vlc-refresh]').addEventListener('click', () => {
     requestChronicle();
@@ -619,6 +622,9 @@ function _setupImpl(ctx) {
     } else if (p?.type === 'vellum_perms') {
       applyPermBanner(tabPanel, p.granted || []);
       applyPermBanner(castRoot, p.granted || []);
+      if (vault && vault.onPerms) vault.onPerms(p.granted || []);
+    } else if (p?.type === 'vellum_vault' || p?.type === 'vellum_vault_done') {
+      if (vault && vault.onMessage) vault.onMessage(p);
     } else if (p?.type === 'vellum_import_progress') {
       const b = tabPanel.querySelector('[data-vlc-import]');
       if (b) { const stage = { parsing: 'Reading', cast: 'Cast', memory: 'Memories', knowledge: 'Knowledge' }[p.stage] || 'Working'; const prog = (p.chunks && p.chunks > 1) ? (' ' + p.chunk + '/' + p.chunks) : ''; b.textContent = '⏳ ' + stage + prog + '…'; }
@@ -717,6 +723,7 @@ function _setupImpl(ctx) {
         if (castBody) renderCast(castBody, null);
         renderPulsePanel();
         setUnseen(0);
+        if (vault && vault.onChatSwitch) vault.onChatSwitch(id);
       } catch (e) {}
       requestRefresh();
       requestChronicle();
@@ -734,12 +741,14 @@ function _setupImpl(ctx) {
   requestRefresh();
   requestChronicle();
   ctx.sendToBackend({ type: 'check_perms' });
+  if (vault && vault.refresh) vault.refresh();
 
   return () => {
     unsubBackend(); unsubGen(); unsubChat();
     removeStyle();
     try { tab.destroy(); } catch (e) {}
     try { castTab.destroy(); } catch (e) {}
+    try { vault && vault.destroy && vault.destroy(); } catch (e) {}
     try { inputBtn && inputBtn.destroy && inputBtn.destroy(); } catch (e) {}
     win.remove();
     ctx.dom.cleanup();
@@ -2020,6 +2029,196 @@ const CHRONICLE_HTML =
 
 const CAST_ICON_SVG = '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="7" cy="6.5" r="3" stroke="#cda84e" stroke-width="1.4"/><path d="M2 17c0-2.8 2.2-5 5-5s5 2.2 5 5" stroke="#cda84e" stroke-width="1.4" stroke-linecap="round"/><circle cx="14" cy="7" r="2.3" stroke="#cda84e" stroke-width="1.2" opacity=".7"/><path d="M12.5 16.5c0-2 1.4-3.7 3.3-4.1" stroke="#cda84e" stroke-width="1.2" stroke-linecap="round" opacity=".7"/></svg>';
 
+const VAULT_ICON_SVG = '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5h8.5a1.5 1.5 0 0 1 1.5 1.5V16l-2-1.2L11 16l-2-1.2L7 16V5A1.5 1.5 0 0 1 5 3.5Z" stroke="#cda84e" stroke-width="1.4" stroke-linejoin="round"/><path d="M7 6.5h5M7 9h5" stroke="#cda84e" stroke-width="1.2" stroke-linecap="round"/></svg>';
+
+/* ============================================================================
+ * VAULT TAB — in-app lorebook (world books) authoring & management.
+ * Mirrors the Cast/Chronicle tab pattern: a drawer tab with its own root, a
+ * delegated click handler, and a render() driven by `vellum_vault` snapshots
+ * from the backend. All mutation flows through sendToBackend → host world_books.
+ * Returns { refresh, onMessage, onPerms, onChatSwitch, destroy }.
+ * ========================================================================== */
+function setupVaultTab(ctx, getChatId) {
+  let tab;
+  try {
+    tab = ctx.ui.registerDrawerTab({
+      id: 'vellum-vault-tab',
+      title: 'VELLUM Vault',
+      shortName: 'VAULT',
+      description: 'Build & manage lorebooks (world books) and attach them to this chat',
+      keywords: ['vault', 'lorebook', 'world book', 'world info', 'lore', 'vellum'],
+      headerTitle: 'VELLUM Vault',
+      iconSvg: VAULT_ICON_SVG,
+    });
+  } catch (e) { return { refresh() {}, onMessage() {}, onPerms() {}, onChatSwitch() {}, destroy() {} }; }
+
+  const root = document.createElement('div');
+  root.className = 'vlc-root vlt-gilt vls-vellum';
+  root.innerHTML = '<div class="vlc-head"><span class="vlc-head-t">\u2756 Vault</span>'
+    + '<span class="vlc-head-sub">in-app lorebook</span>'
+    + '<button class="vlc-mini-btn" data-vault-refresh title="Refresh">\u27F3</button></div>'
+    + '<div class="vlv-body" data-vault-body><div class="vlc-empty">Loading\u2026</div></div>';
+  tab.root.appendChild(root);
+  const body = root.querySelector('[data-vault-body]');
+
+  let data = null;          // last snapshot {ok, reason, books, attached, activated}
+  let granted = null;       // permission list (null until first check)
+  let expanded = {};        // bookId -> open?
+  let activeBookId = null;  // currently focused book
+
+  function refresh() { ctx.sendToBackend({ type: 'get_vault', chatId: getChatId() }); }
+
+  // ---- rendering ----
+  function entryRow(en) {
+    const keys = (en.key || []).join(', ');
+    const sec = (en.keysecondary || []).join(', ');
+    const tags = [];
+    if (en.constant) tags.push('<span class="vlv-tag t-const">always</span>');
+    if (en.selective && sec) tags.push('<span class="vlv-tag t-sel">selective</span>');
+    if (en.disabled) tags.push('<span class="vlv-tag t-off">off</span>');
+    if (en.vellum) tags.push('<span class="vlv-tag t-vel">VELLUM' + (en.source ? '\u00b7' + escapeHtml(en.source) : '') + '</span>');
+    const fired = data && Array.isArray(data.activated) && data.activated.some((a) => a.id === en.id);
+    if (fired) tags.push('<span class="vlv-tag t-fire">\u25C9 active now</span>');
+    const A = (s) => escapeHtml(String(s || ''));
+    return '<div class="vlv-entry' + (en.disabled ? ' is-off' : '') + '">'
+      + '<div class="vlv-entry-top">'
+        + '<span class="vlv-entry-keys" title="' + A(keys) + '">' + (keys ? A(keys) : (en.constant ? '\u27e8always on\u27e9' : '\u27e8no keywords\u27e9')) + '</span>'
+        + '<span class="vlv-entry-ctl">'
+          + '<button class="vlc-mini-edit" data-vault-entry-edit data-id="' + A(en.id) + '" data-book="' + A(en.bookId) + '" data-key="' + A(keys) + '" data-sec="' + A(sec) + '" data-content="' + A(en.content) + '" data-comment="' + A(en.comment) + '" data-constant="' + (en.constant ? '1' : '') + '" data-selective="' + (en.selective ? '1' : '') + '" data-disabled="' + (en.disabled ? '1' : '') + '" title="Edit">\u270E</button>'
+          + '<button class="vlc-mini-del" data-vault-entry-del data-id="' + A(en.id) + '" title="Delete">\u2715</button>'
+        + '</span>'
+      + '</div>'
+      + (en.comment ? '<div class="vlv-entry-comment">' + A(en.comment) + '</div>' : '')
+      + '<div class="vlv-entry-content">' + A(en.content).slice(0, 400) + (en.content.length > 400 ? '\u2026' : '') + '</div>'
+      + (tags.length ? '<div class="vlv-entry-tags">' + tags.join('') + '</div>' : '')
+      + '</div>';
+  }
+
+  function bookCard(b) {
+    const open = !!expanded[b.id];
+    const A = (s) => escapeHtml(String(s || ''));
+    const badges = [];
+    if (b.attachedToChat) badges.push('<span class="vlv-badge b-att">attached</span>');
+    if (b.global) badges.push('<span class="vlv-badge b-glob">global</span>');
+    if (b.vellum) badges.push('<span class="vlv-badge b-vel">VELLUM</span>');
+    const head = '<div class="vlv-book-head" data-vault-book-toggle data-id="' + A(b.id) + '">'
+      + '<span class="vlv-book-caret">' + (open ? '\u25BE' : '\u25B8') + '</span>'
+      + '<span class="vlv-book-name">' + A(b.name) + '</span>'
+      + '<span class="vlv-book-n">' + (b.entries ? b.entries.length : 0) + '</span>'
+      + badges.join('')
+      + '</div>';
+    if (!open) return '<div class="vlv-book">' + head + '</div>';
+    const ctl = '<div class="vlv-book-ctl">'
+      + '<button class="vlv-act ' + (b.attachedToChat ? 'on' : '') + '" data-vault-attach data-id="' + A(b.id) + '" data-attach="' + (b.attachedToChat ? '' : '1') + '">' + (b.attachedToChat ? '\u2713 attached to chat' : '+ attach to chat') + '</button>'
+      + '<button class="vlv-act" data-vault-entry-add data-id="' + A(b.id) + '">+ entry</button>'
+      + '<button class="vlv-act" data-vault-book-edit data-id="' + A(b.id) + '" data-name="' + A(b.name) + '" data-desc="' + A(b.description) + '">\u270E rename</button>'
+      + '<button class="vlv-act danger" data-vault-book-del data-id="' + A(b.id) + '" data-name="' + A(b.name) + '">\u2715 delete book</button>'
+      + '</div>';
+    const desc = b.description ? '<div class="vlv-book-desc">' + A(b.description) + '</div>' : '';
+    const entries = (b.entries && b.entries.length)
+      ? b.entries.map(entryRow).join('')
+      : '<div class="vlc-empty" style="padding:6px">No entries yet. Hit <b>+ entry</b> to add lore.</div>';
+    return '<div class="vlv-book is-open">' + head + desc + ctl + '<div class="vlv-entries">' + entries + '</div></div>';
+  }
+
+  function render() {
+    if (granted && !granted.includes('world_books')) {
+      body.innerHTML = '<div class="vlc-perm" data-perm-banner="1">\u26A0 Missing permission: <b>world_books</b>. Open the Extensions panel \u2192 VELLUM Tracker and grant it to build & manage lorebooks here.</div>';
+      return;
+    }
+    if (!data) { body.innerHTML = '<div class="vlc-empty">Loading\u2026</div>'; return; }
+    if (!data.ok && data.reason === 'no_permission') {
+      body.innerHTML = '<div class="vlc-perm" data-perm-banner="1">\u26A0 Missing permission: <b>world_books</b>. Grant it in the Extensions panel to use the Vault.</div>';
+      return;
+    }
+    const intro = '<div class="vlv-bar">'
+      + '<button class="vlv-new" data-vault-book-new>+ New lorebook</button>'
+      + '<span class="vlv-hint">Entries inject via the host\u2019s World Info pipeline when their keywords appear. Attach a book to this chat to activate it here.</span>'
+      + '</div>';
+    const books = data.books || [];
+    const list = books.length
+      ? books.map(bookCard).join('')
+      : '<div class="vlc-empty">No lorebooks yet.<br><span style="opacity:.7;font-size:10px">Create one to store world lore, factions, locations, or rules — then attach it to this chat or promote chronicle entries into it.</span></div>';
+    body.innerHTML = intro + '<div class="vlv-books">' + list + '</div>';
+  }
+
+  // ---- form for create/edit entry ----
+  function entryForm(title, vals, onSave) {
+    vlcFormModal(title, [
+      { key: 'key', label: 'Keywords (comma-separated — trigger the entry)', type: 'text', value: vals.key || '', placeholder: 'Thornfield, the castle' },
+      { key: 'content', label: 'Content (injected text)', type: 'textarea', value: vals.content || '', placeholder: 'Thornfield Castle is a ruined keep on the moor\u2026' },
+      { key: 'comment', label: 'Label (for your reference)', type: 'text', value: vals.comment || '', placeholder: 'Thornfield lore' },
+      { key: 'keysecondary', label: 'Secondary keywords (optional, for selective)', type: 'text', value: vals.keysecondary || '' },
+      { key: 'flags', label: 'Options', type: 'checks', value: vals.flags || [], options: [{ value: 'constant', label: 'always on' }, { value: 'selective', label: 'selective (needs 2nd key)' }, { value: 'disabled', label: 'disabled' }] },
+    ], (v) => {
+      const flags = String(v.flags || '').split(',').map((s) => s.trim());
+      onSave({
+        key: v.key, content: v.content, comment: v.comment, keysecondary: v.keysecondary,
+        constant: flags.includes('constant'), selective: flags.includes('selective'), disabled: flags.includes('disabled'),
+      });
+    });
+  }
+
+  // ---- delegated clicks ----
+  body.addEventListener('click', (e) => {
+    const A = (el, n) => el.getAttribute(n) || '';
+    const cid = () => getChatId();
+    let t = e.target.closest('[data-vault-book-toggle]');
+    if (t) { const id = A(t, 'data-id'); expanded[id] = !expanded[id]; render(); return; }
+    t = e.target.closest('[data-vault-refresh]');
+    if (t) { refresh(); return; }
+    t = e.target.closest('[data-vault-book-new]');
+    if (t) {
+      vlcFormModal('New Lorebook', [
+        { key: 'name', label: 'Name', type: 'text', placeholder: 'My World' },
+        { key: 'description', label: 'Description (optional)', type: 'text' },
+        { key: 'flags', label: 'Options', type: 'checks', value: ['attach'], options: [{ value: 'attach', label: 'attach to this chat now' }] },
+      ], (v) => { if (v.name && v.name.trim()) ctx.sendToBackend({ type: 'vault_book_create', chatId: cid(), name: v.name, description: v.description, attach: String(v.flags || '').includes('attach') }); });
+      return;
+    }
+    t = e.target.closest('[data-vault-book-edit]');
+    if (t) {
+      const id = A(t, 'data-id');
+      vlcFormModal('Rename Lorebook', [
+        { key: 'name', label: 'Name', type: 'text', value: A(t, 'data-name') },
+        { key: 'description', label: 'Description', type: 'text', value: A(t, 'data-desc') },
+      ], (v) => ctx.sendToBackend({ type: 'vault_book_update', chatId: cid(), bookId: id, name: v.name, description: v.description }));
+      return;
+    }
+    t = e.target.closest('[data-vault-book-del]');
+    if (t) { const id = A(t, 'data-id'); if (confirm('Delete lorebook \u201c' + A(t, 'data-name') + '\u201d and all its entries?')) ctx.sendToBackend({ type: 'vault_book_delete', chatId: cid(), bookId: id }); return; }
+    t = e.target.closest('[data-vault-attach]');
+    if (t) { ctx.sendToBackend({ type: 'vault_book_attach', chatId: cid(), bookId: A(t, 'data-id'), attach: !!A(t, 'data-attach') }); return; }
+    t = e.target.closest('[data-vault-entry-add]');
+    if (t) { const book = A(t, 'data-id'); entryForm('New Entry', {}, (en) => ctx.sendToBackend({ type: 'vault_entry_create', chatId: cid(), bookId: book, entry: en })); return; }
+    t = e.target.closest('[data-vault-entry-edit]');
+    if (t) {
+      const id = A(t, 'data-id'); const book = A(t, 'data-book');
+      const flags = []; if (A(t, 'data-constant')) flags.push('constant'); if (A(t, 'data-selective')) flags.push('selective'); if (A(t, 'data-disabled')) flags.push('disabled');
+      entryForm('Edit Entry', { key: A(t, 'data-key'), content: A(t, 'data-content'), comment: A(t, 'data-comment'), keysecondary: A(t, 'data-sec'), flags },
+        (en) => ctx.sendToBackend({ type: 'vault_entry_update', chatId: cid(), bookId: book, entryId: id, entry: en }));
+      return;
+    }
+    t = e.target.closest('[data-vault-entry-del]');
+    if (t) { if (confirm('Delete this entry?')) ctx.sendToBackend({ type: 'vault_entry_delete', chatId: cid(), entryId: A(t, 'data-id') }); return; }
+  });
+
+  return {
+    refresh,
+    onMessage(p) {
+      if (p.type === 'vellum_vault') { data = p; render(); }
+      else if (p.type === 'vellum_vault_done') {
+        if (!p.ok && p.reason === 'no_active_chat') { try { ctx.toast && ctx.toast.warning && ctx.toast.warning('Open a chat first to attach/promote.'); } catch (e) {} }
+        // backend re-broadcasts vellum_vault after each op, so render follows.
+      }
+    },
+    onPerms(g) { granted = g; render(); },
+    onChatSwitch() { data = null; render(); refresh(); },
+    destroy() { try { tab.destroy(); } catch (e) {} },
+  };
+}
+
+
 const CAST_HTML =
   '<div class="vlc-head"><div class="vlc-title">The Cast</div>'
   + '<div class="vlc-sub">Characters in the narrative \u2014 present, active, mentioned & your own</div></div>'
@@ -2065,6 +2264,7 @@ function castCard(c, present) {
     + '<div class="vlc-cc-av">' + escapeHtml(castInitials(c.name)) + '</div>'
     + '<div class="vlc-cc-b"><div class="vlc-cc-n">' + yours + escapeHtml(c.name)
     + '<span class="vlc-cc-actions">' + move
+    + '<button class="vlc-cc-edit" data-cc-promote title="Promote to Vault (lorebook)">\u2756</button>'
     + '<button class="vlc-cc-edit" data-cc-edit title="Edit">\u270E</button>'
     + '<button class="vlc-cc-del" data-cc-del title="Remove">\u2715</button></span></div>'
     + ((c.aka && c.aka.length) ? '<div class="vlc-cc-aka">aka ' + escapeHtml(c.aka.join(' \u00B7 ')) + '</div>' : '')
@@ -2246,6 +2446,13 @@ function wireCastTab(ctx, root, body, getChatId, setChatId) {
     const card = e.target.closest('[data-cc-id]');
     if (!card) return;
     const id = card.getAttribute('data-cc-id');
+    if (e.target.closest('[data-cc-promote]')) {
+      const btn = e.target.closest('[data-cc-promote]');
+      ctx.sendToBackend({ type: 'vault_promote', chatId: getChatId(), kind: 'cast', id });
+      const prev = btn.textContent; btn.textContent = '\u2713'; btn.disabled = true;
+      setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 2500);
+      return;
+    }
     if (e.target.closest('[data-cc-del]')) {
       ctx.sendToBackend({ type: 'cast_delete', chatId: getChatId(), id });
     } else if (e.target.closest('[data-cc-edit]')) {
@@ -2933,4 +3140,44 @@ const VELLUM_CSS = [
   ".vlc-row-ctl{flex:none;margin-left:auto;display:inline-flex;gap:3px;align-items:center}",
   ".vlc-add-btn{margin-left:8px;font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid2,#8fa67e);background:rgba(143,166,126,.14);border:1px solid rgba(143,166,126,.3);border-radius:6px;padding:3px 8px;cursor:pointer;vertical-align:middle}",
   ".vlc-add-btn:hover{background:rgba(143,166,126,.28)}",
+  /* ---- Vault (in-app lorebook) ---- */
+  ".vlv-body{padding:8px 10px 18px;overflow-y:auto}",
+  ".vlv-bar{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}",
+  ".vlv-new{align-self:flex-start;font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid,#cda84e);background:rgba(205,168,78,.16);border:1px solid rgba(205,168,78,.34);border-radius:7px;padding:5px 11px;cursor:pointer}",
+  ".vlv-new:hover{background:rgba(205,168,78,.3)}",
+  ".vlv-hint{font-size:9.5px;line-height:1.5;opacity:.6}",
+  ".vlv-books{display:flex;flex-direction:column;gap:8px}",
+  ".vlv-book{border:1px solid rgba(205,168,78,.18);border-radius:9px;background:linear-gradient(165deg,rgba(28,25,20,.5),rgba(22,20,16,.4));overflow:hidden}",
+  ".vlv-book.is-open{border-color:rgba(205,168,78,.34)}",
+  ".vlv-book-head{display:flex;align-items:center;gap:7px;padding:8px 10px;cursor:pointer;user-select:none}",
+  ".vlv-book-head:hover{background:rgba(205,168,78,.06)}",
+  ".vlv-book-caret{flex:none;color:var(--vsolid,#cda84e);font-size:10px;width:10px}",
+  ".vlv-book-name{font-family:'Cormorant Garamond',Georgia,serif;font-size:14px;color:#e7d6ad;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".vlv-book-n{flex:none;font:600 9px/1 'JetBrains Mono',monospace;background:rgba(205,168,78,.16);color:var(--vsolid,#cda84e);border-radius:8px;padding:2px 7px}",
+  ".vlv-badge{flex:none;font:600 8px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;border-radius:6px;padding:2px 6px}",
+  ".vlv-badge.b-att{background:rgba(143,166,126,.2);color:#a9c089;border:1px solid rgba(143,166,126,.4)}",
+  ".vlv-badge.b-glob{background:rgba(127,168,201,.18);color:#9bc0e6;border:1px solid rgba(127,168,201,.36)}",
+  ".vlv-badge.b-vel{background:rgba(205,168,78,.16);color:var(--vsolid,#cda84e);border:1px solid rgba(205,168,78,.34)}",
+  ".vlv-book-desc{padding:0 12px 6px;font-size:11px;opacity:.7;line-height:1.5}",
+  ".vlv-book-ctl{display:flex;flex-wrap:wrap;gap:5px;padding:2px 10px 8px}",
+  ".vlv-act{font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.4px;color:#cdbfa0;background:rgba(205,168,78,.1);border:1px solid rgba(205,168,78,.24);border-radius:6px;padding:4px 8px;cursor:pointer}",
+  ".vlv-act:hover{background:rgba(205,168,78,.22)}",
+  ".vlv-act.on{background:rgba(143,166,126,.22);color:#a9c089;border-color:rgba(143,166,126,.4)}",
+  ".vlv-act.danger{color:#e09090;border-color:rgba(201,106,106,.34)}",
+  ".vlv-act.danger:hover{background:rgba(201,106,106,.2)}",
+  ".vlv-entries{display:flex;flex-direction:column;gap:6px;padding:2px 10px 10px}",
+  ".vlv-entry{border:1px solid rgba(205,168,78,.14);border-left:3px solid rgba(205,168,78,.4);border-radius:0 7px 7px 0;background:rgba(20,18,14,.4);padding:7px 9px}",
+  ".vlv-entry.is-off{opacity:.5}",
+  ".vlv-entry-top{display:flex;align-items:center;gap:6px}",
+  ".vlv-entry-keys{flex:1;font:600 10px/1.3 'JetBrains Mono',monospace;color:var(--vsolid,#cda84e);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".vlv-entry-ctl{flex:none;display:inline-flex;gap:3px}",
+  ".vlv-entry-comment{font-size:10px;opacity:.6;margin-top:2px;font-style:italic}",
+  ".vlv-entry-content{font-size:11px;line-height:1.5;color:#cdc3ad;margin-top:4px;white-space:pre-wrap;word-break:break-word}",
+  ".vlv-entry-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}",
+  ".vlv-tag{font:600 8px/1 'JetBrains Mono',monospace;letter-spacing:.4px;text-transform:uppercase;border-radius:5px;padding:2px 5px;opacity:.85}",
+  ".vlv-tag.t-const{color:#9bc0e6;border:1px solid rgba(127,168,201,.34)}",
+  ".vlv-tag.t-sel{color:#b48ed0;border:1px solid rgba(180,142,208,.34)}",
+  ".vlv-tag.t-off{color:#e09090;border:1px solid rgba(201,106,106,.34)}",
+  ".vlv-tag.t-vel{color:var(--vsolid,#cda84e);border:1px solid rgba(205,168,78,.34)}",
+  ".vlv-tag.t-fire{color:#a9c089;background:rgba(143,166,126,.18);border:1px solid rgba(143,166,126,.4)}",
 ].join("\n");
