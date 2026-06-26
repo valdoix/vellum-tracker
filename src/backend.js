@@ -357,9 +357,13 @@ async function resolveUserName(chatId) {
   return null;
 }
 
-function broadcast(chatId, parsed, btsRaw, chArg, userName) {
+function broadcast(chatId, parsed, btsRaw, chArg, userName, userId) {
   let rapport = [];
   try { const ch = chArg || chronicleByChat.get(chatId); if (ch) { rapport = computeRapport(ch, userName); } } catch (e) {}
+  // Operator-scoped extensions need a userId to route sendToFrontend to the
+  // user's window/tabs — without it the message is dropped (this is why the
+  // window/cast stopped syncing while pulse, which passes userId, kept working).
+  const uid = userId || _lastUserId;
   spindle.sendToFrontend({
     type: 'vellum_tracker_update',
     chatId,
@@ -367,7 +371,7 @@ function broadcast(chatId, parsed, btsRaw, chArg, userName) {
     bts: btsRaw,
     rapport,
     updatedAt: Date.now(),
-  });
+  }, uid);
 }
 
 /* ============================================================================
@@ -3151,7 +3155,8 @@ function applyRelations(ch, list, nc) {
 
 function broadcastChronicle(chatId, ch, userId) {
   const msg = { type: 'vellum_chronicle', chatId, chronicle: ch, updatedAt: Date.now() };
-  if (userId) spindle.sendToFrontend(msg, userId); else spindle.sendToFrontend(msg);
+  const uid = userId || _lastUserId; // operator-scoped extensions need a userId to route
+  if (uid) spindle.sendToFrontend(msg, uid); else spindle.sendToFrontend(msg);
 }
 
 // Resolve a usable chat id: trust the one the frontend sent, else ask the host
@@ -3782,10 +3787,10 @@ async function handle(chatId, content, userId) {
   // Broadcast the live window state FIRST and unconditionally — this must never
   // be blocked by chat-var sync, chronicle load, or persona resolution (any of
   // which can throw/stall live). Rapport is best-effort on top.
-  broadcast(chatId, ledger, btsRaw);
+  broadcast(chatId, ledger, btsRaw, null, null, userId);
   try { await syncChatVars(chatId, ledger, btsRaw); } catch (e) { spindle.log.warn('[vellum_tracker] syncChatVars: ' + (e && e.message)); }
   let chForRapport = null, userName = null;
-  try { chForRapport = await loadChronicle(chatId); userName = await resolveUserName(chatId); broadcast(chatId, ledger, btsRaw, chForRapport, userName); } catch (e) { spindle.log.warn('[vellum_tracker] rapport broadcast: ' + (e && e.message)); }
+  try { chForRapport = await loadChronicle(chatId); userName = await resolveUserName(chatId); broadcast(chatId, ledger, btsRaw, chForRapport, userName, userId); } catch (e) { spindle.log.warn('[vellum_tracker] rapport broadcast: ' + (e && e.message)); }
 
   // Fold this turn into the long-term chronicle (only when the state is new).
   try {
@@ -3806,11 +3811,11 @@ async function handle(chatId, content, userId) {
       decayRelations(ch, ch.turns); // relationships fade slightly when not reinforced
       await saveChronicle(chatId, ch);
       _prewarmCache.delete(chatId); // chronicle changed → next interceptor re-scores
-      broadcastChronicle(chatId, ch);
+      broadcastChronicle(chatId, ch, userId);
       // Re-broadcast the live window with rapport recomputed from the JUST-FOLDED
       // relations (the early broadcast ran before foldTurn applied this turn's
       // narrative score deltas, so the window would otherwise lag a turn).
-      broadcast(chatId, ledger, btsRaw, ch, userName);
+      broadcast(chatId, ledger, btsRaw, ch, userName, userId);
       // After the live state is saved, opportunistically archive older turns in
       // the background (non-blocking — the user's generation already finished).
       if (userId) setTimeout(() => { maybeSummarize(chatId, userId); }, 1500);
