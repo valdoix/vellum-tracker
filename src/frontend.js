@@ -572,9 +572,9 @@ function _setupImpl(ctx) {
       if (win._livingBtn) { win._livingBtn.textContent = _livingOn ? 'ON' : 'OFF'; win._livingBtn.classList.toggle('on', _livingOn); }
     } else if (p?.type === 'vellum_chronicle') {
       chronicleData = p.chronicle;
-      renderChronicle(chronicleBody, p.chronicle);
+      try { renderChronicle(chronicleBody, p.chronicle); } catch (e) { try { console.warn('[vellum] renderChronicle failed:', e); } catch (e2) {} }
       castData = p.chronicle;
-      renderCast(castBody, p.chronicle);
+      try { renderCast(castBody, p.chronicle); } catch (e) { try { console.warn('[vellum] renderCast failed:', e); } catch (e2) {} }
     } else if (p?.type === 'vellum_injection') {
       _lastInjection = p.injection;
       const host = chronicleBody && chronicleBody.querySelector('[data-vlc-inj]');
@@ -2331,6 +2331,20 @@ function graphLayout(model, factions) {
   return { pos, W, H };
 }
 
+// Defensive wrapper so a graph-render failure can NEVER block the rest of the
+// cast tab (relations list, journal). The graph is the most computation-heavy
+// part of the render; if it throws on some data shape, degrade to a small
+// notice instead of losing the whole host.innerHTML assignment (which is what
+// made the Relations section appear "stale" — the throw aborted the rebuild).
+function castGraphSafe(ch) {
+  try { return castGraphHtml(ch); }
+  catch (e) {
+    _graph = null;
+    try { console.warn('[vellum] graph render failed:', e); } catch (e2) {}
+    return '<div class="vlc-empty" style="padding:8px">Graph unavailable for this data.<br><span style="opacity:.6;font-size:10px">The relations list above is unaffected.</span></div>';
+  }
+}
+
 function castGraphHtml(ch) {
   const model = graphModel(ch);
   if (!model.nodes.length || !model.edges.length) {
@@ -2545,7 +2559,7 @@ function renderCast(host, ch) {
       + relationsHtml(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="graph"><h3 class="vlc-h">\u25c9 Relationship Graph <span class="vlc-h-n">' + ((ch.relations || []).length) + '</span></h3>'
-      + castGraphHtml(ch) + '</section>'
+      + castGraphSafe(ch) + '</section>'
     + '<div class="vlc-break"></div>'
     + '<section data-grp="journal"><h3 class="vlc-h">\uD83D\uDCD6 Memory Journal <span class="vlc-h-n">' + Object.keys(ch.memJournal || {}).length + '</span></h3>'
       + '<div class="vlc-lore-bar"><button class="vlc-btn" data-scan-mem>\uD83D\uDCD6 Scan memories</button></div>'
