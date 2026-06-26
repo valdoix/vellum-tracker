@@ -658,6 +658,55 @@ function foldTurn(ch, turn, day, led, bts) {
             }
           }
         } catch (eRel) {}
+      } else if (/^know[\s:\u2192]/i.test(line)) {
+        // know→Name: fact | knows|believes|suspects|wrong|unaware [| source]
+        try {
+          const m = line.match(/^know[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
+          if (m) {
+            const who = canonName(m[1].trim(), null);
+            const rest = m[2].split('|').map((x) => x.trim());
+            const fact = rest[0];
+            const REL = new Set(['knows', 'believes', 'suspects', 'wrong', 'unaware']);
+            let reliability = 'knows', source = '';
+            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase(); if (REL.has(sl)) reliability = sl; else if (seg) source = seg; }
+            if (who && fact && !isIncidentalName(who)) {
+              const r = applyKnowResult(ch, { knowledge: [{ who, fact, reliability, truth: reliability === 'wrong' ? 'false' : 'unknown', source }], secrets: [] }, null, { pulse: true });
+              void r;
+            }
+          }
+        } catch (eK) {}
+      } else if (/^secret[\s:\u2192]/i.test(line)) {
+        // secret→Keeper: the secret | from: Name | minor|major|explosive
+        try {
+          const m = line.match(/^secret[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
+          if (m) {
+            const keeper = canonName(m[1].trim(), null);
+            const rest = m[2].split('|').map((x) => x.trim());
+            const secret = rest[0];
+            const DG = new Set(['minor', 'major', 'explosive']);
+            let from = '', danger = 'major';
+            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase().replace(/^from[:\s]*/i, ''); if (DG.has(sl)) danger = sl; else if (/^from[:\s]/i.test(seg)) from = seg.replace(/^from[:\s]*/i, '').trim(); else if (seg && !DG.has(seg.toLowerCase())) from = seg; }
+            if (keeper && secret && !isIncidentalName(keeper)) {
+              applyKnowResult(ch, { knowledge: [], secrets: [{ secret, keeper, from, method: 'omission', exposure: '', danger }] }, null, { pulse: true });
+            }
+          }
+        } catch (eS) {}
+      } else if (/^mem[\s:\u2192]/i.test(line)) {
+        // mem→Name: a memorable beat | weight [| about:Name]
+        try {
+          const m = line.match(/^mem[\s:\u2192]+([^:|\u2192]+?)\s*[:\u2192]\s*(.+)$/i);
+          if (m) {
+            const who = canonName(m[1].trim(), null);
+            const rest = m[2].split('|').map((x) => x.trim());
+            const memory = rest[0];
+            const W = new Set(['trivial', 'minor', 'significant', 'defining']);
+            let weight = 'minor', about = '';
+            for (const seg of rest.slice(1)) { const sl = seg.toLowerCase(); if (W.has(sl)) weight = sl; else if (/^about[:\s]/i.test(seg)) about = canonName(seg.replace(/^about[:\s]*/i, '').trim(), null); }
+            if (who && memory && !isIncidentalName(who)) {
+              applyMemList(ch, [{ who, about, memory, kind: 'observation', weight, sentiment: 'neutral', day }], null, { pulse: true });
+            }
+          }
+        } catch (eM) {}
       } else if (/^world\b/i.test(line)) {
         const t = line.replace(/^world[:\s]*/i, '').trim();
         if (t) pushLog(ch.events, { turn, day, text: t }, 0);
