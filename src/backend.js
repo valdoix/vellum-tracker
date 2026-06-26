@@ -2731,9 +2731,9 @@ function applyLivingRelations(ch, list, nc) {
 const SENSOR = {
   knowledge: /\b(realiz\w+|understood|understands|learn(?:s|ed|t)?|discover\w+|figured? out|deduc\w+|infer\w+|overheard|overhears|notic\w+|recogniz\w+|found out|came to (?:know|understand)|knew|knows|believ\w+|suspect\w+|assum\w+|wrong(?:ly)?|mistaken|unaware|ignorant|in the dark|never knew|had no idea|the truth|a lie|deceiv\w+)\b/i,
   secret: /\b(secret\w*|conceal\w+|hid(?:e|es|den|ing|s)?|hiding|kept? (?:it|this|that|them) from|behind .{0,20}\bback|in secret|covertly|privately|told no one|no one (?:knew|knows|must know)|swore .{0,20}to secrecy|confess\w+|reveal\w+|expos\w+|admitt\w+|disguis\w+|forg\w+ identity|undercover|cover story)\b/i,
-  memory: /\b(promis\w+|vow\w+|swore|swears|betray\w+|first time|never before|never forget|always remember|would remember|couldn't forget|for the first time|finally|broke down|wept|confess\w+|kissed|the moment|something (?:shifted|changed|broke)|gave .{0,20}\b(gift|ring|token)|saved (?:his|her|their|my) life|chose (?:him|her|them|you)|turning point)\b/i,
-  // strong cross-cutting cue that something significant happened at all
-  significant: /\b(for the first time|never|finally|the truth|secret|promise|betray\w+|confess\w+|reveal\w+|realiz\w+|vow\w+|swore|chose|sacrific\w+)\b/i,
+  memory: /\b(promis\w+|vow\w+|swore|swears|betray\w+|first time|never before|never forget|always remember|would remember|couldn'?t forget|for the first time|finally|broke down|wept|cried|crying|tears|trembl\w+|shaking|whisper\w+|confess\w+|admit\w+|kissed?|embrac\w+|held (?:him|her|them|each other)|the moment|something (?:shifted|changed|broke|softened)|let (?:him|her|them|down) (?:his|her|their|my)?\s*guard|without (?:his|her|their|my) (?:armor|mask)|for the first time|gave .{0,20}\b(gift|ring|token)|saved (?:his|her|their|my) life|chose (?:him|her|them|you)|turning point|truly (?:saw|seen)|teach me|i (?:love|need|trust|forgive) you|forgav\w+|apolog\w+)\b/i,
+  // strong cross-cutting cue that something significant/emotional happened at all
+  significant: /\b(for the first time|never|finally|the truth|secret|promise|betray\w+|confess\w+|reveal\w+|realiz\w+|vow\w+|swore|chose|sacrific\w+|cried|wept|tears|trembl\w+|whisper\w+|kissed?|forgav\w+|i (?:love|trust|need) you)\b/i,
 };
 // Returns { fire, kinds:Set } — which extractor categories the prose justifies.
 function revealSensor(text) {
