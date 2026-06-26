@@ -139,6 +139,12 @@ function _setupImpl(ctx) {
       if (castData) renderCast(castBody, castData);
       return;
     }
+    const sortB = e.target.closest('[data-sort]');
+    if (sortB) {
+      _sortDir = sortB.getAttribute('data-sort') === 'asc' ? 'asc' : 'desc';
+      if (castData) renderCast(castBody, castData);
+      return;
+    }
     const A = (el, n) => el.getAttribute(n) || '';
     // Memory-journal add/edit (these rows live in the cast body).
     let mb = e.target.closest('[data-mj-add]');
@@ -1048,6 +1054,10 @@ function btsHtml(raw) {
     if (/^(time|clock|elapsed|duration)\s*:/i.test(line)) { cur = null; lastCat = null; timeNotes.push(line.replace(/^(time|clock|elapsed|duration)\s*:\s*/i, '').trim()); continue; }
 
     if (/^\+?thread\b/i.test(line) || /^thread→/i.test(line)) { cur = null; lastCat = null; threads.push(line.replace(/^\+?thread[:→\s]*/i, '').trim()); continue; }
+    // know→/secret→/mem→ are tracker-extraction lines (folded into the Knowledge,
+    // Secrets, and Memory Journal tabs) — they are NOT backstage display content,
+    // so skip them here instead of mis-rendering them as actor cards on stage.
+    if (/^(know|secret|mem)[\s:→]/i.test(line)) { cur = null; lastCat = null; continue; }
     if (/^rel→/i.test(line)) { cur = null; lastCat = null; rels.push(line.replace(/^rel→\s*/i, '').trim()); continue; }
     if (/^rel\w+→/i.test(line)) { cur = null; lastCat = null; rels.push(line.replace(/^rel/i, '').trim()); continue; }
     if (/^world\b/i.test(line)) { cur = null; lastCat = null; world.push(line.replace(/^world[:\s]*/i, '').trim()); continue; }
@@ -1259,6 +1269,7 @@ let _hideInfo = { covered: 0, memories: 0 };
 // Active category filters (persist across re-renders).
 let _knowFilter = 'all';   // all | knows | believes | suspects | wrong | unaware
 let _secFilter = 'all';    // all | minor | major | explosive
+let _sortDir = 'desc';     // newest-first (desc) or oldest-first (asc) by reveal/happen turn
 const _mjFilter = {};      // per-character key -> weight filter (all|defining|significant|minor|trivial)
 let _relFilter = 'all';    // all | familial | romantic | alliance | rivalry | social | neutral
 let _memTree = null;       // last vellum_memtree view { arcs, unassigned, index, builtAt, chapters }
@@ -1314,7 +1325,15 @@ function knowledgeHtml(ch) {
   }
   // Count helper for filter chips.
   const countBy = (arr, field) => arr.reduce((acc, x) => { const v = x[field] || ''; acc[v] = (acc[v] || 0) + 1; return acc; }, {});
-  let html = '';
+  // Sort by reveal/happen turn (then add-order), honoring the global direction.
+  const sortByWhen = (arr) => arr.slice().sort((a, b) => {
+    const ta = (a.turn || a.lastTurn || 0), tb = (b.turn || b.lastTurn || 0);
+    return _sortDir === 'asc' ? (ta - tb) : (tb - ta);
+  });
+  const sortBar = '<div class="vlc-sortbar"><span class="vlc-sort-l">Sort</span>'
+    + '<button class="vlc-fchip' + (_sortDir === 'desc' ? ' on' : '') + '" data-sort="desc">Newest \u2193</button>'
+    + '<button class="vlc-fchip' + (_sortDir === 'asc' ? ' on' : '') + '" data-sort="asc">Oldest \u2191</button></div>';
+  let html = sortBar;
   if (knAll.length) {
     const relCls = { knows: 'k-knows', believes: 'k-believes', suspects: 'k-suspects', wrong: 'k-wrong', unaware: 'k-unaware' };
     const relLbl = { knows: 'knows', believes: 'believes', suspects: 'suspects', wrong: 'WRONGLY believes', unaware: 'unaware of' };
@@ -1324,7 +1343,7 @@ function knowledgeHtml(ch) {
       '<button class="vlc-fchip' + (_knowFilter === r ? ' on' : '') + '" data-know-filter="' + r + '">'
       + (r === 'all' ? 'All' : escapeHtml(relLbl[r] || r)) + ' <span class="vlc-fchip-n">' + (r === 'all' ? knAll.length : cnt[r]) + '</span></button>'
     ).join('');
-    const kn = _knowFilter === 'all' ? knAll : knAll.filter((k) => k.reliability === _knowFilter);
+    const kn = sortByWhen(_knowFilter === 'all' ? knAll : knAll.filter((k) => k.reliability === _knowFilter));
     html += '<div class="vlc-know-h">What characters know</div>';
     html += '<div class="vlc-fbar" data-know-fbar>' + chips + '</div>';
     html += kn.length ? '<div class="vlc-know-grid">' + kn.map((k) => {
@@ -1352,7 +1371,7 @@ function knowledgeHtml(ch) {
       '<button class="vlc-fchip' + (_secFilter === d ? ' on' : '') + '" data-sec-filter="' + d + '">'
       + (d === 'all' ? 'All' : escapeHtml(d)) + ' <span class="vlc-fchip-n">' + (d === 'all' ? secAll.length : cnt[d]) + '</span></button>'
     ).join('');
-    const sec = _secFilter === 'all' ? secAll : secAll.filter((x) => x.danger === _secFilter);
+    const sec = sortByWhen(_secFilter === 'all' ? secAll : secAll.filter((x) => x.danger === _secFilter));
     html += '<div class="vlc-know-h" style="margin-top:12px">Secrets in play</div>';
     html += '<div class="vlc-fbar" data-sec-fbar>' + chips + '</div>';
     html += sec.length ? '<div class="vlc-sec-grid">' + sec.map((x) => {
@@ -1386,10 +1405,13 @@ function memJournalHtml(ch) {
   });
   const wCls = { trivial: 'w-trivial', minor: 'w-minor', significant: 'w-sig', defining: 'w-def' };
   const sCls = { positive: 's-pos', negative: 's-neg', neutral: 's-neu', complex: 's-cx' };
+  const mjSortBar = '<div class="vlc-sortbar"><span class="vlc-sort-l">Sort</span>'
+    + '<button class="vlc-fchip' + (_sortDir === 'desc' ? ' on' : '') + '" data-sort="desc">Newest \u2193</button>'
+    + '<button class="vlc-fchip' + (_sortDir === 'asc' ? ' on' : '') + '" data-sort="asc">Oldest \u2191</button></div>';
   const W_ORDER = ['defining', 'significant', 'minor', 'trivial'];
-  return keys.map((k) => {
+  const body = keys.map((k) => {
     const c = mj[k];
-    const all = (c.entries || []).slice().sort((a, b) => (b.turn || 0) - (a.turn || 0));
+    const all = (c.entries || []).slice().sort((a, b) => { const ta = (a.turn || 0), tb = (b.turn || 0); return _sortDir === 'asc' ? (ta - tb) : (tb - ta); });
     const cnt = all.reduce((acc, e) => { const w = e.weight || 'minor'; acc[w] = (acc[w] || 0) + 1; return acc; }, {});
     const active = _mjFilter[k] || 'all';
     const chips = ['all'].concat(W_ORDER.filter((w) => cnt[w])).map((w) =>
@@ -1409,6 +1431,7 @@ function memJournalHtml(ch) {
     const bar = (W_ORDER.filter((w) => cnt[w]).length > 1) ? ('<div class="vlc-fbar" data-mj-fbar>' + chips + '</div>') : '';
     return '<details class="vlc-mj" open><summary class="vlc-mj-sum"><span class="vlc-mj-name">' + escapeHtml(c.name || k) + '</span><span class="vlc-h-n">' + all.length + '</span><button class="vlc-add-btn" data-mj-add data-who="' + escapeHtml(c.name || k) + '">+ Add</button></summary><div class="vlc-mj-body">' + bar + rows + '</div></details>';
   }).join('');
+  return mjSortBar + body;
 }
 
 
@@ -1753,6 +1776,10 @@ function wireChronicleControls(host) {
   // Secret danger filter chips.
   host.querySelectorAll('[data-sec-filter]').forEach((btn) => {
     btn.addEventListener('click', () => { _secFilter = btn.getAttribute('data-sec-filter') || 'all'; renderChronicle(); });
+  });
+  // Sort direction (knowledge + secrets): newest/oldest by reveal turn.
+  host.querySelectorAll('[data-sort]').forEach((btn) => {
+    btn.addEventListener('click', () => { _sortDir = btn.getAttribute('data-sort') === 'asc' ? 'asc' : 'desc'; renderChronicle(); });
   });
 
   // ---- manual CRUD across all chronicle types (delegated; inline-form driven) ----
@@ -2691,6 +2718,8 @@ const VELLUM_CSS = [
   ".vlc-perm b{color:#f0d8a8}",
   /* CATEGORY FILTER CHIPS (knowledge / secrets / memory journal) */
   ".vlc-fbar{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0 9px}",
+  ".vlc-sortbar{display:flex;align-items:center;gap:5px;margin:2px 0 10px}",
+  ".vlc-sort-l{font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:rgba(205,168,78,.5);margin-right:2px}",
   ".vlc-fchip{font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase;color:var(--vsolid,#cda84e);background:rgba(var(--vacc,205,168,78),.08);border:1px solid rgba(var(--vacc,205,168,78),.25);border-radius:20px;padding:5px 9px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;transition:background .15s,border-color .15s}",
   ".vlc-fchip:hover{background:rgba(var(--vacc,205,168,78),.16)}",
   ".vlc-fchip.on{color:#1a1610;background:var(--vsolid,#cda84e);border-color:var(--vsolid,#cda84e)}",

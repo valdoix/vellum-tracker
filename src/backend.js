@@ -993,7 +993,8 @@ async function loadChronicle(chatId) {
   if (!Array.isArray(ch.presentIds)) ch.presentIds = [];
   if (typeof ch.deepRecall !== 'boolean') ch.deepRecall = false;
   if (typeof ch.hideSummarized !== 'boolean') ch.hideSummarized = false;
-  if (typeof ch.living !== 'boolean') ch.living = false; // auto-update the trackers each turn
+  if (typeof ch.living !== 'boolean') ch.living = false; // legacy toggle (superseded by autoExtract)
+  if (typeof ch.autoExtract !== 'boolean') ch.autoExtract = true; // prose-driven auto-extraction (default ON)
   if (!Array.isArray(ch.pulse)) ch.pulse = [];           // activity log / notifications
   if (typeof ch.pulseSeen !== 'number') ch.pulseSeen = 0; // count marked-seen
   if (!ch.memJournal || typeof ch.memJournal !== 'object') ch.memJournal = {};
@@ -2659,7 +2660,7 @@ async function knowExtract(turns, nc, userId) {
   return parseKnowJson(raw);
 }
 
-﻿const LIVING_SYS = "You are the living-state tracker for an ongoing roleplay. Read the RECENT excerpt and report ONLY what CHANGED or is newly revealed in it \u2014 not the whole history. Output STRICT JSON only: {\"relations\":[{\"a\":\"Name\",\"b\":\"Name\",\"dAffection\":<int -40..40>,\"dTrust\":<int -40..40>,\"reason\":\"why, one clause\"}],\"knowledge\":[{\"who\":\"Name\",\"fact\":\"one clause\",\"reliability\":\"knows|believes|suspects|wrong|unaware\",\"truth\":\"true|false|unknown\",\"source\":\"brief\"}],\"secrets\":[{\"secret\":\"one clause\",\"keeper\":\"Name\",\"from\":\"Name(s)\",\"method\":\"lie|omission|misdirection|disguise\",\"exposure\":\"brief\",\"danger\":\"minor|major|explosive\"}],\"memories\":[{\"who\":\"Name\",\"about\":\"Name\",\"memory\":\"one vivid sentence in their POV\",\"kind\":\"interaction|promise|betrayal|gift|shared|wound|observation\",\"weight\":\"trivial|minor|significant|defining\",\"sentiment\":\"positive|negative|neutral|complex\"}]}. Rules: use ONLY the real names provided \u2014 never placeholders; only NAMED significant characters. relations: dAffection/dTrust are the CHANGE this excerpt caused to how A feels about B, positive for warming/earning trust, negative for hurt/betrayal, 0 if unchanged \u2014 omit pairs with no change. Only report knowledge/secrets/memories that are NEW in this excerpt. Keep every list short. If nothing changed, return empty arrays. No prose outside the JSON.";
+﻿const LIVING_SYS = "You are the LIVING-STATE EXTRACTOR for a roleplay. You read the RECENT NARRATIVE PROSE (the BTS/ledger blocks are stripped out \u2014 you must infer everything from the story text itself) and surface what it newly establishes. Output STRICT JSON only: {\"relations\":[{\"a\":\"Name\",\"b\":\"Name\",\"dAffection\":<int -40..40>,\"dTrust\":<int -40..40>,\"reason\":\"why, one clause\"}],\"knowledge\":[{\"who\":\"Name\",\"fact\":\"one clause\",\"reliability\":\"knows|believes|suspects|wrong|unaware\",\"truth\":\"true|false|unknown\",\"source\":\"how they learned it\"}],\"secrets\":[{\"secret\":\"one clause\",\"keeper\":\"Name\",\"from\":\"Name(s)\",\"method\":\"lie|omission|misdirection|disguise\",\"exposure\":\"how it might surface\",\"danger\":\"minor|major|explosive\"}],\"memories\":[{\"who\":\"Name\",\"about\":\"Name\",\"memory\":\"one vivid sentence from WHO'S point of view\",\"kind\":\"interaction|promise|betrayal|gift|shared|wound|observation\",\"weight\":\"trivial|minor|significant|defining\",\"sentiment\":\"positive|negative|neutral|complex\"}]}. EXTRACTION RULES: use ONLY real character names that appear in the prose \u2014 never {{user}}/{{char}}/placeholders, never unnamed figures (a guard, a servant). KNOWLEDGE: extract when a character learns, realizes, infers, deduces, overhears, or comes to wrongly believe something; truth is the ACTUAL state regardless of belief (wrong+false for a mistaken belief). SECRETS: extract when someone starts concealing something, or a kept secret is exposed/revealed this excerpt. MEMORIES: extract genuine TURNING POINTS a character would personally carry \u2014 a promise, betrayal, confession, gift, wound, first kiss, a vow, a moment of being truly seen; write each from that character's POV; fill weight AND sentiment AND kind for every entry. RELATIONS: dAffection/dTrust are the CHANGE this excerpt caused to how A feels toward B (warmth + trust); positive for warming/earning trust, negative for hurt/betrayal; omit pairs that did not move. Be GENEROUS but TRUE \u2014 capture every real reveal/turning-point you find (do not under-report), but invent nothing the prose does not support. Empty arrays are fine for categories with no new material. No prose outside the JSON.";
 function parseLivingJson(text) {
   let t = String(text || "").replace(/<think[\s\S]*?<\/think>/gi, "").replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
   let obj = null;
@@ -2719,23 +2720,70 @@ function applyLivingRelations(ch, list, nc) {
 // The Living pass: one combined LLM call over the RECENT window that returns
 // deltas for relations + new knowledge/secrets/memories. Throttled and gated by
 // the per-chat `living` toggle. Runs in the background after a turn.
+
+// ============================================================================
+// REVEAL SENSOR (#B) — a free, lexical pre-pass that decides WHETHER a turn's
+// prose likely contains extractable material, and which KINDS. Lets the LLM
+// extractor fire only on turns that earn it, so prose-driven auto-extraction
+// can be always-on without a flat per-turn generation cost.
+// Errs toward firing: a wasted cheap call beats a missed reveal.
+// ============================================================================
+const SENSOR = {
+  knowledge: /\b(realiz\w+|understood|understands|learn(?:s|ed|t)?|discover\w+|figured? out|deduc\w+|infer\w+|overheard|overhears|notic\w+|recogniz\w+|found out|came to (?:know|understand)|knew|knows|believ\w+|suspect\w+|assum\w+|wrong(?:ly)?|mistaken|unaware|ignorant|in the dark|never knew|had no idea|the truth|a lie|deceiv\w+)\b/i,
+  secret: /\b(secret\w*|conceal\w+|hid(?:e|es|den|ing|s)?|hiding|kept? (?:it|this|that|them) from|behind .{0,20}\bback|in secret|covertly|privately|told no one|no one (?:knew|knows|must know)|swore .{0,20}to secrecy|confess\w+|reveal\w+|expos\w+|admitt\w+|disguis\w+|forg\w+ identity|undercover|cover story)\b/i,
+  memory: /\b(promis\w+|vow\w+|swore|swears|betray\w+|first time|never before|never forget|always remember|would remember|couldn't forget|for the first time|finally|broke down|wept|confess\w+|kissed|the moment|something (?:shifted|changed|broke)|gave .{0,20}\b(gift|ring|token)|saved (?:his|her|their|my) life|chose (?:him|her|them|you)|turning point)\b/i,
+  // strong cross-cutting cue that something significant happened at all
+  significant: /\b(for the first time|never|finally|the truth|secret|promise|betray\w+|confess\w+|reveal\w+|realiz\w+|vow\w+|swore|chose|sacrific\w+)\b/i,
+};
+// Returns { fire, kinds:Set } — which extractor categories the prose justifies.
+function revealSensor(text) {
+  const t = String(text || '');
+  if (t.length < 40) return { fire: false, kinds: new Set() };
+  const kinds = new Set();
+  if (SENSOR.knowledge.test(t)) kinds.add('knowledge');
+  if (SENSOR.secret.test(t)) kinds.add('secret');
+  if (SENSOR.memory.test(t)) kinds.add('memory');
+  // relations are detected separately (emotional/relational shift is common);
+  // always allow the relation channel through when ANY signal fires or when the
+  // text is substantial dialogue/interaction.
+  const fire = kinds.size > 0 || SENSOR.significant.test(t);
+  return { fire, kinds, relations: true };
+}
+
+// The auto-extractor (#C+#B+#A): a prose-driven post-turn pass that reconciles
+// with whatever BTS lines the model emitted. Reads the RECENT NARRATIVE (BTS
+// stripped), gated by the reveal sensor so it only spends a generation when the
+// turn earns it. Reuses the same dedup/tombstone applies as BTS + manual scans,
+// so the two sources cover each other with zero double-adds.
 const livingBusy = new Set();
-async function runLivingUpdate(chatId, userId) {
+async function autoExtract(chatId, userId, opts) {
+  const o = opts || {};
   if (!chatId || livingBusy.has(chatId)) return;
   if (!hasPerm('generation') || !(spindle.generate && (spindle.generate.raw || spindle.generate.quiet))) return;
   livingBusy.add(chatId);
   try {
     const ch = await loadChronicle(chatId);
-    if (!ch.living) return;
+    if (ch.autoExtract === false) return; // user disabled (default ON)
     let msgs; try { msgs = await readStoredMessages(chatId); } catch (e) { return; }
     if (!msgs || !msgs.length) return;
     const nc = await resolveNameContext(chatId, msgs);
     const turns = assistantTurns(msgs);
-    // recent window only — the living pass is about CHANGE, not full history
-    const recent = turns.slice(-8);
-    const excerpt = sampleHistory(recent, { maxTurns: 8, headN: 1, tailN: 7, charBudget: 9000, nameCtx: nc });
+    if (!turns.length) return;
+
+    // Reveal sensor: scan the newest turn's PROSE (BTS/ledger stripped). Skip the
+    // LLM call entirely on quiet turns — unless forced (manual / catch-up).
+    const newestProse = cleanForSummary(turns[turns.length - 1].ai || '');
+    const sensed = revealSensor(newestProse);
+    if (!o.force && !sensed.fire) {
+      spindle.log.info('[vellum_tracker] auto-extract: quiet turn, skipped (sensor)');
+      return;
+    }
+
+    // recent window — extraction is about what JUST happened, not full history
+    const recent = turns.slice(-6);
+    const excerpt = sampleHistory(recent, { maxTurns: 6, headN: 1, tailN: 5, charBudget: 9000, nameCtx: nc });
     if (!excerpt.trim()) return;
-    // give the model the current relationship scores so deltas are grounded
+    // ground relation deltas in the current scores
     let relCtx = '';
     if (ch.relations && ch.relations.length) {
       relCtx = '\n\nCurrent relationship scores (affection/trust, -100..100):\n' + ch.relations.slice(0, 24).map((r) => {
@@ -2743,10 +2791,12 @@ async function runLivingUpdate(chatId, userId) {
         return '- ' + na + ' \u2192 ' + nb + ': aff ' + (r.affection || 0) + ', trust ' + (r.trust || 0) + ' (' + r.sentiment + ')';
       }).join('\n');
     }
+    // tell the model which channels the sensor flagged, to focus attention
+    const focus = sensed.kinds && sensed.kinds.size ? ('\n\nThe prose appears to contain: ' + Array.from(sensed.kinds).join(', ') + '. Extract those especially, plus any relationship shifts.') : '';
     const sys = LIVING_SYS + (namesBlock(nc) ? ('\n\n' + namesBlock(nc)).trimEnd() : '');
     let raw = '';
-    try { raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Recent excerpt:\n\n' + excerpt + relCtx }], { temperature: 0.2, max_tokens: 1600 }, userId); }
-    catch (e) { spindle.log.warn('[vellum_tracker] living gen: ' + (e && e.message)); return; }
+    try { raw = await internalGenerate([{ role: 'system', content: sys }, { role: 'user', content: 'Recent narrative:\n\n' + excerpt + relCtx + focus }], { temperature: 0.2, max_tokens: 1800 }, userId); }
+    catch (e) { spindle.log.warn('[vellum_tracker] auto-extract gen: ' + (e && e.message)); return; }
     const res = parseLivingJson(raw);
     if (!res) return;
     const before = (ch.pulse || []).length;
@@ -2757,13 +2807,15 @@ async function runLivingUpdate(chatId, userId) {
     if (rN || kr.addedK || kr.addedS || mN || newPulses.length) {
       await saveChronicle(chatId, ch);
       broadcastChronicle(chatId, ch, userId);
-      if (newPulses.length) spindle.sendToFrontend({ type: 'vellum_pulse', chatId, events: newPulses, unseen: unseenPulse(ch) }, userId);
-      spindle.log.info('[vellum_tracker] living: +' + rN + ' rel, +' + kr.addedK + 'k/' + kr.addedS + 's, +' + mN + ' mem');
+      if (newPulses.length) spindle.sendToFrontend({ type: 'vellum_pulse', chatId, events: newPulses, unseen: unseenPulse(ch) }, userId || _lastUserId);
+      spindle.log.info('[vellum_tracker] auto-extract: +' + rN + ' rel, +' + kr.addedK + 'k/' + kr.addedS + 's, +' + mN + ' mem');
     }
   } catch (err) {
-    spindle.log.warn('[vellum_tracker] runLivingUpdate: ' + (err && err.message));
+    spindle.log.warn('[vellum_tracker] autoExtract: ' + (err && err.message));
   } finally { livingBusy.delete(chatId); }
 }
+// Back-compat alias (older call sites / the run_living handler).
+const runLivingUpdate = autoExtract;
 
 // Fold a parsed knowledge/secrets result into the chronicle. Returns counts.
 function applyKnowResult(ch, res, nc, opts) {
@@ -3864,7 +3916,7 @@ async function handle(chatId, content, userId) {
       }, 2600);
       // Living tracker: auto-update relations/knowledge/secrets/memories from the
       // recent turn and emit pulse notifications (opt-in, background, throttled).
-      if (userId && ch.living) setTimeout(() => { runLivingUpdate(chatId, userId); }, 2200);
+      if (userId && ch.autoExtract !== false) setTimeout(() => { autoExtract(chatId, userId); }, 2200);
       if (userId && deepEnabled(ch)) setTimeout(async () => {
         try { const msgs = await readStoredMessages(chatId); if (msgs && msgs.length) await runDeepRecall(chatId, msgs, userId); } catch (e) {}
       }, 1800);
@@ -4019,15 +4071,15 @@ spindle.onFrontendMessage(async (payload, userId) => {
     }
     if (payload?.type === 'set_living' || payload?.type === 'get_living') {
       const chatId = await resolveChatId(payload.chatId, userId);
-      if (!chatId) { spindle.sendToFrontend({ type: 'vellum_living', enabled: false }, userId); return; }
+      if (!chatId) { spindle.sendToFrontend({ type: 'vellum_living', enabled: true }, userId); return; }
       const ch = await loadChronicle(chatId);
-      if (payload.type === 'set_living') { ch.living = !!payload.enabled; await saveChronicle(chatId, ch); }
-      spindle.sendToFrontend({ type: 'vellum_living', enabled: !!ch.living }, userId);
+      if (payload.type === 'set_living') { ch.autoExtract = !!payload.enabled; ch.living = !!payload.enabled; await saveChronicle(chatId, ch); }
+      spindle.sendToFrontend({ type: 'vellum_living', enabled: ch.autoExtract !== false }, userId);
       return;
     }
     if (payload?.type === 'run_living') {
       const chatId = await resolveChatId(payload.chatId, userId);
-      if (chatId) { const ch = await loadChronicle(chatId); if (!ch.living) { ch.living = true; await saveChronicle(chatId, ch); } await runLivingUpdate(chatId, userId); }
+      if (chatId) { await autoExtract(chatId, userId, { force: true }); }
       return;
     }
     if (payload?.type === 'get_memtree') {
