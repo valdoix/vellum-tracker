@@ -364,6 +364,7 @@ function broadcast(chatId, parsed, btsRaw, chArg, userName, userId) {
   // user's window/tabs — without it the message is dropped (this is why the
   // window/cast stopped syncing while pulse, which passes userId, kept working).
   const uid = userId || _lastUserId;
+  try { spindle.log.info('[vellum_tracker] broadcast window: time="' + ((parsed && parsed.time) || '') + '" loc="' + ((parsed && parsed.location) || '') + '" present="' + ((parsed && parsed.present) || '') + '"'); } catch (e) {}
   spindle.sendToFrontend({
     type: 'vellum_tracker_update',
     chatId,
